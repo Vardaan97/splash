@@ -1,6 +1,8 @@
 #include "model/Runtime.hpp"
 #include "AwakeClock.hpp"
 #include "model/QwenState.hpp"
+#include "model/Qwen4Exp.hpp"
+#include "metal/abi/Qwen4.h"
 #include "model/QwenTarget.hpp"
 #include "model/RuntimeArenas.hpp"
 
@@ -20,6 +22,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <list>
@@ -296,6 +299,11 @@ struct Runtime::Impl {
     // its lane's draft rings may hold such rows, so the lane returns them
     // cleared (QwenStateStorage::clearDraftRings).
     bool resultInvalid = false;
+    // Every token the model has read or will read before the pending one:
+    // the prompt (with any replayed generation) and the emitted output.
+    // Qwen3.8-Flash-Next hashes its PLE n-grams from it, and a target
+    // without a draft proposes its continuations from it.
+    std::vector<uint32_t> tokens;
   };
 
   struct DecodeLaneResult final {
@@ -363,7 +371,22 @@ struct Runtime::Impl {
   ModelTelemetry counters;
   ops::Sampling sampling;
   QwenTarget targetModel;
-  DFlashDraft draftModel;
+  // Null for a target without a DFlash2 draft (LoadedModel::hasDraft),
+  // whose proposals the MTP head drafts or the CPU looks up in the
+  // request's own tokens.
+  std::unique_ptr<DFlashDraft> draftModel;
+  // Where Qwen3.8-Flash-Next's QSA index tensors sit in the KV extents, per
+  // full-attention layer (kv::PageStorage::indexPlacement).
+  std::vector<ops::QsaIndex> qsaIndex;
+  // Proposals the MTP head drafts per cycle (SPLASH_MTP_DRAFTS, 1 to 7); the
+  // later ones repeat the last.
+  uint32_t mtpDraftSteps = mtpDraftStepsFromEnvironment();
+  static uint32_t mtpDraftStepsFromEnvironment() {
+    const char *value = std::getenv("SPLASH_MTP_DRAFTS");
+    if (!value || !*value) return 3;
+    const long steps = std::strtol(value, nullptr, 10);
+    return static_cast<uint32_t>(std::clamp<long>(steps, 1, kDraftProposalTokens));
+  }
   ops::AneFfn *aneFfn;
   explicit Impl(RuntimeContext value)
       : backend(value.backend),
@@ -380,7 +403,9 @@ struct Runtime::Impl {
                                             value.backend, operators);
                         },
                         value.model.target)),
-        draftModel(value.model.draft, value.backend, operators),
+        draftModel(value.model.hasDraft()
+                       ? std::make_unique<DFlashDraft>(value.model.draft, value.backend, operators)
+                       : nullptr),
         aneFfn(value.aneFfn) {
     if (states.layout() != model.stateLayout(states.layout().target.format) ||
         kvPages.layout() != model.targetKvLayout(kvPages.layout().format)) {
@@ -391,6 +416,11 @@ struct Runtime::Impl {
     decodeArena = std::make_unique<DecodeArena>(backend, geometry, operators);
     penaltyTable =
         decodeArena->batchSlice(DecodeTensor::PenaltyState, kLaneCount);
+    if (geometry.target.qwen4())
+      for (uint32_t layer = 0; layer < geometry.target.kvLayout.attentionLayers; ++layer) {
+        const kv::PageStorage::IndexPlacement placement = kvPages.indexPlacement(layer);
+        qsaIndex.push_back({placement.keysOffset, placement.pooledOffset});
+      }
     preparePolicyPipelines();
   }
 
@@ -570,7 +600,8 @@ struct Runtime::Impl {
 
   // A resident request returns its lane's buffers to the pool.
   void releaseLane(Request &entry) {
-    if (entry.resultInvalid)
+    // A target without a DFlash2 draft writes no rings.
+    if (entry.resultInvalid && draftModel)
       states.clearDraftRings(entry.stateLane);
     states.releaseLane(entry.stateLane, entry.id);
     pageTableBindings[entry.stateLane] = {};
@@ -811,12 +842,15 @@ struct Runtime::Impl {
                      uint32_t draftRows, MetalBuffer targetCos,
                      MetalBuffer targetSin, MetalBuffer draftCos,
                      MetalBuffer draftSin) const {
+    // Without a draft model nothing reads the draft tables (the MTP head
+    // uses the target's), and the arena sizes them for the null draft.
     ops::RoPE::addTables(
         graph, std::move(targetPositions), std::move(draftPositions),
         prefillArena->get(PrefillTensor::TargetInverseFrequencies),
         prefillArena->get(PrefillTensor::DraftInverseFrequencies),
         std::move(targetCos), std::move(targetSin), std::move(draftCos),
-        std::move(draftSin), {targetRows, draftRows}, kPrefillRows);
+        std::move(draftSin), {targetRows, draftModel ? draftRows : 0u},
+        kPrefillRows);
   }
 
   // A constrained lane keeps its final prompt row, which prefill leaves at
@@ -984,6 +1018,10 @@ struct Runtime::Impl {
       else if (token != budget.end[entry.thinking->endSelected++])
         throw std::logic_error("thinking went past its budget");
     }
+    // The previous anchor and every selection before the new one are now
+    // read (Request::tokens).
+    if (entry.pendingToken) entry.tokens.push_back(*entry.pendingToken);
+    entry.tokens.insert(entry.tokens.end(), tokens.begin(), tokens.end() - 1);
     entry.pendingToken = tokens.back();
   }
 
@@ -1311,6 +1349,10 @@ struct Runtime::Impl {
             ropePosition(*sequence.entry, item.logicalPosition + localRow);
         std::copy(rotary.begin(), rotary.end(), targetPositions + row * 3);
       }
+      if (geometry.target.qwen4())
+        plePromptRows(*sequence.entry, item.logicalPosition, item.inputTokens,
+                      contents<uint32_t>(prefillArena->get(PrefillTensor::PleIndices), "PLE rows") +
+                          uint64_t{sequence.rowBegin} * geometry.target.pleHeads());
       for (const DispatchDraftCaptureSpan &capture : sequence.captures) {
         for (uint32_t row = capture.absoluteBegin; row < capture.absoluteEnd;
              ++row) {
@@ -1331,8 +1373,8 @@ struct Runtime::Impl {
     ops::RoPE::addDraftRangeTables(graph, p(PrefillTensor::DraftInverseFrequencies),
                                    p(PrefillTensor::DraftRopeCos), p(PrefillTensor::DraftRopeSin),
                                    rebuild.rows, rebuild.begin, kPrefillRows);
-    draftModel.addContextRebuild(graph, draftPrefillBuffers(*prefillArena), states.window(lane),
-                                 states.draft(lane), rebuild.rows, rebuild.begin);
+    draftModel->addContextRebuild(graph, draftPrefillBuffers(*prefillArena), states.window(lane),
+                                  states.draft(lane), rebuild.rows, rebuild.begin);
   }
 
   // A state captured inside a command takes the context rows the command
@@ -1341,7 +1383,7 @@ struct Runtime::Impl {
   // overwrite them. A state at the command's end takes the lane's window.
   void addRaggedDraftContext(CommandGraph &graph,
                              const RaggedPrefillBatch &batch) {
-    if (!batch.capturedRows)
+    if (!batch.capturedRows || !draftModel)
       return;
     std::array<DFlashPrefillSpan, kLaneCount * 2> spans{};
     uint32_t spanCount = 0;
@@ -1368,8 +1410,8 @@ struct Runtime::Impl {
                  draft.absoluteBegin, state.reservation->buffers().window->buffer()});
       }
     }
-    draftModel.addContextPrefill(graph, draftPrefillBuffers(*prefillArena), batch.capturedRows,
-                                 std::span(spans).first(spanCount), windowCaptures);
+    draftModel->addContextPrefill(graph, draftPrefillBuffers(*prefillArena), batch.capturedRows,
+                                  std::span(spans).first(spanCount), windowCaptures);
   }
 
   // What a ragged prefill command leaves its completion, by lane, indexed
@@ -1400,8 +1442,9 @@ struct Runtime::Impl {
     // and the draft RoPE tables before this chunk's rows do. Once the window
     // is full, this chunk's window store and ring writes reuse the slots of
     // the oldest restored positions, so the rebuild comes before them too.
+    // Without a draft (MTP) nothing reads the rings.
     for (const RaggedPrefillSequence &sequence : batch.sequences)
-      if (const auto &rebuild = sequence.entry->draftRebuild)
+      if (const auto &rebuild = sequence.entry->draftRebuild; rebuild && draftModel)
         addDraftRebuild(graph, sequence.entry->stateLane, *rebuild);
 
     addRopeTables(graph, p(PrefillTensor::TargetPositions), batch.rows,
@@ -1462,6 +1505,17 @@ struct Runtime::Impl {
         stateCaptures[lane].push_back({capture.row, cell.convolutionLayers, cell.recurrentLayers});
       }
       destination.stateCaptures = stateCaptures[lane];
+      destination.pleHistoryIn = in.auxiliary;
+      destination.pleHistoryOut = out.auxiliary;
+      if (geometry.target.qwen4()) {
+        // Each sequence's records from its own slice of the block buffer.
+        const MetalBuffer blocks = prefillArena->get(PrefillTensor::QsaBlocks);
+        const uint64_t begin = (uint64_t{sequence.rowBegin} / 4 + 2 * lane) * sizeof(Qwen4QsaBlock);
+        auto *records = reinterpret_cast<Qwen4QsaBlock *>(contents<uint8_t>(blocks, "QSA blocks") + begin);
+        destination.qsaBlockCount = qsaBlockRecords(*sequence.entry, sequence.item->logicalPosition,
+                                                    sequence.item->tokenCount, records);
+        destination.qsaBlocks = backend.view(blocks, begin, blocks.sizeBytes() - begin);
+      }
       destination.captureCount = sequence.captures.size();
       for (uint32_t index = 0; index < sequence.captures.size(); ++index) {
         const DispatchDraftCaptureSpan &capture = sequence.captures[index];
@@ -1474,6 +1528,8 @@ struct Runtime::Impl {
       }
     }
     QwenTargetPrefillBuffers buffers = prefillBuffers(*prefillArena);
+    buffers.hyper = prefillArena->hyper();
+    bindQsa(buffers.hyper, kQsaPrefillScoreRows);
     const MetalBuffer finalHidden = targetModel.addPrefill(
         graph, std::move(buffers),
         std::span(modelSequences).first(batch.sequences.size()), batch.rows,
@@ -1524,6 +1580,96 @@ struct Runtime::Impl {
     return outputs;
   }
 
+  // Qwen3.8-Flash-Next's PLE rows of a token at `position` whose
+  // predecessors `before(position - s)` returns (llama.cpp qwen4exp.cpp
+  // llm_graph_input_qwen4exp_ple): the 2- to n-gram hashes of the token and
+  // its predecessors, an EOS or the sequence start cutting the window there,
+  // each n-gram's heads taking its hash modulo their row counts. The products
+  // stay below 2^63 (the multipliers are bounded by the vocabulary), so the
+  // unsigned hash equals the reference's signed one.
+  template <class Before>
+  void pleRows(uint64_t position, uint32_t token, Before before, uint32_t *out) const {
+    const Qwen4ExpWeights &weights = *targetModel.qwen4();
+    const Qwen4ExpLayout &layout = weights.layout;
+    const uint32_t eos = layout.pleEosToken;
+    std::array<uint64_t, 4> context{token, eos, eos, eos};
+    bool cut = false;
+    for (uint32_t back = 1; back < layout.pleNgram; ++back) {
+      const std::optional<uint32_t> previous = position >= back ? before(position - back) : std::nullopt;
+      cut = cut || !previous || *previous == eos;
+      context[back] = cut ? eos : *previous;
+    }
+    for (uint32_t gram = 2; gram <= layout.pleNgram; ++gram) {
+      uint64_t mixed = context[0] * weights.pleHash.multipliers[0];
+      for (uint32_t j = 1; j < gram; ++j) mixed ^= context[j] * weights.pleHash.multipliers[j];
+      for (uint32_t g = 0; g < layout.pleHeadsPerNgram; ++g) {
+        const uint32_t head = (gram - 2) * layout.pleHeadsPerNgram + g;
+        out[head] = static_cast<uint32_t>(mixed % weights.pleHash.headVocabularies[head] +
+                                          weights.pleHash.headOffsets[head]);
+      }
+    }
+  }
+
+  // The PLE rows of `rows` input tokens from `position` on of a request into
+  // `out`; positions before them come from the request's tokens.
+  void plePromptRows(const Request &entry, uint64_t position, std::span<const uint32_t> input,
+                     uint32_t *out) const {
+    const uint32_t heads = geometry.target.pleHeads();
+    for (uint32_t row = 0; row < input.size(); ++row)
+      pleRows(position + row, input[row],
+              [&](uint64_t at) -> std::optional<uint32_t> {
+                if (at >= position) return input[at - position];
+                if (at < entry.tokens.size()) return entry.tokens[at];
+                return std::nullopt;
+              },
+              out + uint64_t{row} * heads);
+  }
+
+  // The QSA blocks whose last token is one of `rows` rows from `position`,
+  // as Qwen4QsaBlock records: their first token's position and RoPE position.
+  uint32_t qsaBlockRecords(const Request &entry, uint64_t position, uint32_t rows, Qwen4QsaBlock *out) const {
+    uint32_t count = 0;
+    for (uint64_t last = position; last < position + rows; ++last) {
+      if (last % QWEN4_QSA_BLOCK != QWEN4_QSA_BLOCK - 1) continue;
+      const uint64_t first = last + 1 - QWEN4_QSA_BLOCK;
+      const std::array<uint32_t, 3> rope = ropePosition(entry, first);
+      out[count++] = {static_cast<uint32_t>(first), {rope[0], rope[1], rope[2]}};
+    }
+    return count;
+  }
+
+  // QSA buffers shared by a step's graphs.
+  void bindQsa(QwenHyperBuffers &hyper, uint32_t scoreRows) const {
+    hyper.inverseFrequencies = prefillArena->get(PrefillTensor::TargetInverseFrequencies);
+    hyper.qsaIndex = qsaIndex;
+    hyper.qsaScoreRows = scoreRows;
+    hyper.qsaMaskWords = qsaMaskWords(geometry.target.maximumContextTokens);
+  }
+
+  // A target without a draft proposes, after the anchor, the tokens that
+  // followed the latest earlier occurrence of the request's last few tokens
+  // (prompt lookup), the mask token where it has none; acceptance then
+  // checks them as it checks a draft's.
+  std::array<uint32_t, kDraftProposalTokens> lookupProposals(const Request &entry, uint32_t anchor) const {
+    std::array<uint32_t, kDraftProposalTokens> proposals;
+    proposals.fill(geometry.target.maskToken);
+    const std::vector<uint32_t> &tokens = entry.tokens;
+    const size_t length = tokens.size() + 1;
+    const auto at = [&](size_t index) { return index < tokens.size() ? tokens[index] : anchor; };
+    for (size_t match = std::min<size_t>(4, length - 1); match >= 1; --match) {
+      // The latest start i < length - match whose match tokens equal the suffix.
+      for (size_t start = length - match; start-- > 0;) {
+        bool same = true;
+        for (size_t k = 0; k < match && same; ++k) same = at(start + k) == at(length - match + k);
+        if (!same) continue;
+        const size_t next = start + match;
+        for (uint32_t i = 0; i < kDraftProposalTokens && next + i < length; ++i) proposals[i] = at(next + i);
+        return proposals;
+      }
+    }
+    return proposals;
+  }
+
   void prepareDecodeLane(Request &entry, const ModelBatchItem &item,
                          uint32_t lane) {
     if (!entry.resident || !entry.promptComplete || !entry.pendingToken) {
@@ -1541,6 +1687,45 @@ struct Runtime::Impl {
     draftInput[0] = *entry.pendingToken;
     std::fill(draftInput + 1, draftInput + kDecodeRows,
               geometry.target.maskToken);
+    std::array<uint32_t, kDecodeRows> rowTokens{};
+    rowTokens.fill(geometry.target.maskToken);
+    rowTokens[0] = *entry.pendingToken;
+    if (!draftModel) {
+      // Proposals in the draft's buffers: each one a certain draw (its
+      // sparse candidates the token alone, at probability one). The MTP head
+      // writes the tokens on the GPU (QwenTarget::addMtpDraft); otherwise
+      // the CPU looks them up.
+      const bool mtp = targetModel.hasMtp();
+      const auto proposals = lookupProposals(entry, *entry.pendingToken);
+      std::copy(proposals.begin(), proposals.end(), rowTokens.begin() + 1);
+      auto *proposed = contents<uint32_t>(decodeArena->get(lane, DecodeTensor::ProposedTokens), "proposals");
+      auto *candidates = contents<uint32_t>(decodeArena->get(lane, DecodeTensor::Candidates), "candidates");
+      auto *probabilities =
+          contents<float>(decodeArena->get(lane, DecodeTensor::ProposalProbs), "proposal probabilities");
+      for (uint32_t i = 0; i < kDraftProposalTokens; ++i) {
+        if (!mtp) proposed[i] = proposals[i];
+        constexpr uint32_t kCandidates = 16;
+        for (uint32_t c = 0; c < kCandidates; ++c) {
+          candidates[i * kCandidates + c] = c ? geometry.target.vocabularySize : proposals[i];
+          probabilities[i * kCandidates + c] = c ? 0.0F : 1.0F;
+        }
+      }
+      if (mtp) {
+        // The GPU hashes the PLE rows of the drafted tokens (encodeVerifyInputs)
+        // from the two tokens before the anchor.
+        auto *before = contents<uint32_t>(decodeArena->get(lane, DecodeTensor::PlePrior), "PLE prior tokens");
+        const uint64_t position = item.logicalPosition;
+        for (uint32_t back = 1; back <= 2; ++back)
+          before[back - 1] = position >= back && position - back < entry.tokens.size()
+                                 ? entry.tokens[position - back]
+                                 : QWEN4_PLE_NONE;
+      }
+    }
+    if (geometry.target.qwen4() && !targetModel.hasMtp()) {
+      // The PLE rows of the anchor and the proposals the step verifies.
+      plePromptRows(entry, item.logicalPosition, rowTokens,
+                    contents<uint32_t>(decodeArena->get(lane, DecodeTensor::PleIndices), "PLE rows"));
+    }
 
     auto *positions =
         contents<uint32_t>(decodeArena->get(lane, DecodeTensor::Positions),
@@ -1622,7 +1807,7 @@ struct Runtime::Impl {
     buffers.ropeSin = d(DecodeTensor::DraftRopeSin);
     buffers.gateScratch = decodeArena->gateScratch();
     bindDraftRings(entries, buffers.persistentKeys, buffers.persistentValues);
-    draftModel.addDecode(graph, std::move(buffers),
+    draftModel->addDecode(graph, std::move(buffers),
                          targetModel.vocabularyProjection(),
                          std::span(cacheLengths).first(lanes));
     std::array<uint32_t, kLaneCount> anchors{};
@@ -1634,7 +1819,7 @@ struct Runtime::Impl {
       anchors[lane] = *entry.pendingToken;
       policies[lane] = samplingPolicy(entry);
     }
-    draftModel.addSelection(
+    draftModel->addSelection(
         graph,
         {d(DecodeTensor::Logits), d(DecodeTensor::TopPartialIds),
          d(DecodeTensor::TopPartialValues), d(DecodeTensor::Candidates),
@@ -1646,9 +1831,12 @@ struct Runtime::Impl {
                                d(DecodeTensor::ProposedTokens));
   }
 
+  // The target's verify forward or, with `mtpDraft`, the MTP head's draft
+  // steps over the same rows (QwenTarget::addMtpDraft).
   void encodeTargetVerifyBatchForward(CommandGraph &graph,
                                       std::span<Request *const> entries,
-                                      std::span<const ModelBatchItem> items) {
+                                      std::span<const ModelBatchItem> items,
+                                      bool mtpDraft = false) {
     if (entries.empty() || entries.size() > kLaneCount ||
         entries.size() != items.size()) {
       throw std::invalid_argument("invalid target verify batch");
@@ -1689,6 +1877,8 @@ struct Runtime::Impl {
     buffers.chunkKeys = chunkKeys;
     buffers.chunkValues = chunkValues;
     buffers.moe = decodeArena->moeScratch(storage);
+    buffers.hyper = decodeArena->hyper(storage);
+    bindQsa(buffers.hyper, kDecodeRows);
     for (uint32_t lane = 0; lane < lanes; ++lane)
       chunks[lane] = ops::PagedAttention::verifyParams(
           items[lane].logicalPosition,
@@ -1699,6 +1889,15 @@ struct Runtime::Impl {
           decodeArena->get(entry.stateLane, DecodeTensor::PageTable);
       buffers.currentGdnStates[lane] = states.current(entry.stateLane).stateBase;
       buffers.nextGdnStates[lane] = states.next(entry.stateLane).stateBase;
+      buffers.pleHistories[lane] = states.current(entry.stateLane).auxiliary;
+      if (geometry.target.qwen4()) {
+        const MetalBuffer blocks = decodeArena->get(lane, DecodeTensor::QsaBlocks);
+        buffers.qsaBlocks[lane] = blocks;
+        buffers.qsaBlockCounts[lane] = lane < lanes
+            ? qsaBlockRecords(entry, items[lane].logicalPosition, kDecodeRows,
+                              reinterpret_cast<Qwen4QsaBlock *>(contents<uint8_t>(blocks, "QSA blocks")))
+            : 0;
+      }
     }
     for (uint32_t lane = 0; lane < lanes; ++lane) {
       const uint32_t stateLane = entries[lane]->stateLane;
@@ -1713,8 +1912,29 @@ struct Runtime::Impl {
       chunkValues[layer] = decodeArena->attentionBatchSlice(
           DecodeTensor::ChunkValuesBase, layer, storage);
     }
+    if (mtpDraft) {
+      buffers.anchors = d(DecodeTensor::DraftInputTokens);
+      buffers.proposals = d(DecodeTensor::ProposedTokens);
+      buffers.candidates = d(DecodeTensor::Candidates);
+      buffers.proposalsPerLane = kDraftProposalTokens;
+      buffers.candidatesPerProposal = 16;
+      targetModel.addMtpDraft(graph, std::move(buffers), kvPages.layers(), std::span(chunks).first(lanes), lanes,
+                              mtpDraftSteps);
+      return;
+    }
     targetModel.addVerify(graph, std::move(buffers), kvPages.layers(),
                           std::span(chunks).first(lanes), lanes);
+  }
+
+  // The verify rows' tokens, their PLE rows (on the GPU when the MTP head
+  // drafted the proposals) and embeddings.
+  void encodeVerifyInputs(CommandGraph &graph, uint32_t width) {
+    encodeBatchVerifyInput(graph, width);
+    if (targetModel.hasMtp())
+      targetModel.addPleHash(graph, decodeArena->batchSlice(DecodeTensor::InputTokens, width),
+                             decodeArena->batchSlice(DecodeTensor::PlePrior, width),
+                             decodeArena->batchSlice(DecodeTensor::PleIndices, width), width);
+    encodeBatchEmbedding(graph, DecodeTensor::InputTokens, DecodeTensor::Hidden0, width);
   }
 
   void encodeTargetVerifyBatchPolicy(CommandGraph &graph,
@@ -1764,7 +1984,7 @@ struct Runtime::Impl {
     buffers.ropeSin = d(DecodeTensor::DraftRopeSin);
     buffers.retainedCounts = d(DecodeTensor::RetainedCount);
     bindDraftRings(entries, buffers.persistentKeys, buffers.persistentValues);
-    draftModel.addContextCommit(graph, std::move(buffers),
+    draftModel->addContextCommit(graph, std::move(buffers),
                                 std::span(startPositions).first(lanes));
   }
 
@@ -1814,6 +2034,34 @@ struct Runtime::Impl {
         graph, decodeArena->batchSlice(DecodeTensor::DraftInputTokens, lanes),
         decodeArena->batchSlice(DecodeTensor::ProposedTokens, lanes),
         decodeArena->batchSlice(DecodeTensor::InputTokens, lanes), lanes);
+  }
+
+  // Qwen3.8-Flash-Next's commit after acceptance (QwenTarget::addStateCommit):
+  // each lane's PLE history and MTP streams after its retained rows. Other
+  // targets commit nothing: their GDN state folds the retained rows into the
+  // lane's next step.
+  void encodeTargetStateCommit(CommandGraph &graph,
+                               std::span<Request *const> lanes) {
+    if (!geometry.target.qwen4())
+      return;
+    if (lanes.empty() || lanes.size() > kLaneCount)
+      throw std::invalid_argument("invalid target state commit batch");
+    const uint32_t width = static_cast<uint32_t>(lanes.size());
+    std::array<MetalBuffer, kLaneCount> pleHistoriesIn;
+    std::array<MetalBuffer, kLaneCount> pleHistoriesOut;
+    for (uint32_t lane = 0; lane < kLaneCount; ++lane) {
+      Request *entry = lanes[std::min(lane, width - 1)];
+      if (!entry)
+        throw std::invalid_argument("empty target state commit lane");
+      pleHistoriesIn[lane] = states.current(entry->stateLane).auxiliary;
+      pleHistoriesOut[lane] = states.next(entry->stateLane).auxiliary;
+    }
+    targetModel.addStateCommit(
+        graph,
+        {decodeArena->batchSlice(DecodeTensor::RetainedCount, width),
+         decodeArena->batchSlice(DecodeTensor::PleConvolution, width), pleHistoriesIn, pleHistoriesOut,
+         decodeArena->batchSlice(DecodeTensor::HyperStreams, width)},
+        width);
   }
 
   // A stop token or the last budgeted token needs no target work of its own:
@@ -1962,9 +2210,7 @@ struct Runtime::Impl {
 
         CommandGraph target;
         const uint32_t width = static_cast<uint32_t>(lanes_.size());
-        impl_.encodeBatchVerifyInput(target, width);
-        impl_.encodeBatchEmbedding(target, DecodeTensor::InputTokens,
-                                   DecodeTensor::Hidden0, width);
+        impl_.encodeVerifyInputs(target, width);
         impl_.encodeTargetVerifyBatchForward(
             target, {entries.data(), lanes_.size()}, items_);
         submit(target);
@@ -2008,8 +2254,10 @@ struct Runtime::Impl {
                                               {entries.data(), lanes_.size()});
           impl_.encodeBatchAcceptance(commit, {entries.data(), lanes_.size()},
                                       {maximumRetained.data(), lanes_.size()});
-          impl_.encodeDraftStateCommitBatch(
-              commit, {entries.data(), lanes_.size()}, items_);
+          impl_.encodeTargetStateCommit(commit, {entries.data(), lanes_.size()});
+          if (impl_.draftModel)
+            impl_.encodeDraftStateCommitBatch(
+                commit, {entries.data(), lanes_.size()}, items_);
           submit(commit);
           stage_ = Stage::Commit;
         }
@@ -2159,6 +2407,7 @@ StateAdmission Runtime::resume(const ModelRequest &request) {
     entry.stateLane = *admission.lane;
     entry.resident = true;
     entry.promptTokens = static_cast<uint32_t>(request.prompt.size());
+    entry.tokens.assign(request.prompt.begin(), request.prompt.end());
     entry.images = std::move(images);
     entry.restoredTokens = request.restoredTokens;
     impl_->bindPenalties(entry, request.prompt);
@@ -2177,6 +2426,7 @@ StateAdmission Runtime::beginAt(const ModelRequest &request, uint32_t stateLane)
   Impl::Request entry;
   entry.id = request.id;
   entry.promptTokens = static_cast<uint32_t>(request.prompt.size());
+  entry.tokens.assign(request.prompt.begin(), request.prompt.end());
   entry.maxNewTokens = request.maxNewTokens;
   entry.sampling = request.sampling;
   entry.constraint = request.constraint;
@@ -2580,22 +2830,28 @@ Runtime::decodeAsync(const BatchPlan &plan,
       impl_->decodeArena->batchSlice(DecodeTensor::RopeSin, width),
       impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeCos, width),
       impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeSin, width));
-  impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::DraftInputTokens,
-                              DecodeTensor::DraftHidden0, width);
-  impl_->encodeDraftBatchGraph(commandGraph, entries,
-                               {logicalPositions.data(), width});
+  // Without a draft the MTP head drafts the proposals or the CPU wrote them
+  // (prepareDecodeLane).
+  if (impl_->draftModel) {
+    impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::DraftInputTokens,
+                                DecodeTensor::DraftHidden0, width);
+    impl_->encodeDraftBatchGraph(commandGraph, entries,
+                                 {logicalPositions.data(), width});
+  } else if (impl_->targetModel.hasMtp()) {
+    impl_->encodeTargetVerifyBatchForward(commandGraph, entries, items, true);
+  }
   if (constrained) {
     return std::make_unique<Impl::ConstrainedDecodeTicket>(
         *impl_, std::move(lanes), items, commandGraph, std::move(completion));
   }
-  impl_->encodeBatchVerifyInput(commandGraph, width);
-  impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::InputTokens,
-                              DecodeTensor::Hidden0, width);
+  impl_->encodeVerifyInputs(commandGraph, width);
   impl_->encodeTargetVerifyBatchForward(commandGraph, entries, items);
   impl_->encodeTargetVerifyBatchPolicy(commandGraph, entries);
   impl_->encodeBatchAcceptance(commandGraph, entries,
                                {maximumRetained.data(), width});
-  impl_->encodeDraftStateCommitBatch(commandGraph, entries, items);
+  impl_->encodeTargetStateCommit(commandGraph, entries);
+  if (impl_->draftModel)
+    impl_->encodeDraftStateCommitBatch(commandGraph, entries, items);
 
   std::vector<ModelBatchItem> copiedItems(items.begin(), items.end());
   Impl *impl = impl_.get();
