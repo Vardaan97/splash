@@ -86,10 +86,18 @@ using namespace gguf_reference;
 
 // K = 1024 on the hidden side (16 spans, four 256-input coefficient units)
 // and 512 on the intermediate side, as the 35B's experts.
-constexpr uint32_t kHidden = 1024;
-constexpr uint32_t kIntermediate = 512;
-constexpr uint32_t kExperts = 16;
-constexpr uint32_t kTopK = 4;
+// gguf-moe-e512 builds the test at Qwen3.8-Flash-Next's routing: 512
+// experts, top 10, a 640-wide intermediate.
+#ifndef GGUF_MOE_HIDDEN
+#define GGUF_MOE_HIDDEN 1024
+#define GGUF_MOE_INTERMEDIATE 512
+#define GGUF_MOE_EXPERTS 16
+#define GGUF_MOE_TOP_K 4
+#endif
+constexpr uint32_t kHidden = GGUF_MOE_HIDDEN;
+constexpr uint32_t kIntermediate = GGUF_MOE_INTERMEDIATE;
+constexpr uint32_t kExperts = GGUF_MOE_EXPERTS;
+constexpr uint32_t kTopK = GGUF_MOE_TOP_K;
 constexpr uint32_t kRoutes = kTopK + 1;
 constexpr uint32_t kMaximumRows = 263;
 
@@ -408,22 +416,35 @@ std::vector<Fmt> tileFormats(MoeGgufTile tile) {
   return formats;
 }
 
+// The first of `formats` from index i on, cyclically, whose column unit
+// divides rows of K values: a GGUF stores no 256-value blocks in rows of 640
+// (Qwen3.8-Flash-Next's expert down projections take 32-value blocks), and
+// preparation takes PQ2_0's 128-value blocks and the MLX affine formats'
+// groups of 64 and 128 only in rows of whole superblocks.
+Fmt fitting(const std::vector<Fmt> &formats, size_t i, uint32_t K) {
+  for (size_t j = 0; j < formats.size(); ++j) {
+    const Fmt g = formats[(i + j) % formats.size()];
+    if (K % quant_column_unit(kQuantFormats[g].block_elements) == 0) return g;
+  }
+  throw std::logic_error("no format fits the row");
+}
+
 // The model of format f that `tile` runs: gate, up and down in f and the next
 // two formats the tile takes, cyclically, and the shared expert's in the three
-// after them; with oneGateUp, up in the gate's formats, which the staged tile
-// runs in one pass.
+// after them, each the next that fits its rows; with oneGateUp, up in the
+// gate's formats, which the staged tile runs in one pass.
 Model makeModel(MetalBackend &backend, int f, bool oneGateUp, MoeGgufTile tile = MoeGgufTile::Staged) {
   const std::vector<Fmt> formats = tileFormats(tile);
   const size_t first = std::find(formats.begin(), formats.end(), Fmt(f)) - formats.begin();
+  const uint32_t n[3] = {kIntermediate, kIntermediate, kHidden}, k[3] = {kHidden, kHidden, kIntermediate};
   Model m;
-  for (size_t i = 0; i < m.formats.size(); ++i) m.formats[i] = formats[(first + i) % formats.size()];
+  for (size_t i = 0; i < m.formats.size(); ++i) m.formats[i] = fitting(formats, first + i, k[i % 3]);
   if (oneGateUp) {
     m.formats[1] = m.formats[0];
     m.formats[4] = m.formats[3];
   }
   m.router = floating(backend, kExperts, kHidden, 0.05f);
   m.sharedGate = floating(backend, 1, kHidden, 0.05f);
-  const uint32_t n[3] = {kIntermediate, kIntermediate, kHidden}, k[3] = {kHidden, kHidden, kIntermediate};
   for (int p = 0; p < 3; ++p) {
     m.routed[p] = quantized(backend, m.formats[p], kExperts * n[p], k[p]);
     m.shared[p] = quantized(backend, m.formats[3 + p], n[p], k[p]);
@@ -530,7 +551,8 @@ void checkInPlaceGrouping(const MoeScratch &scratch, const MoePlan &plan, const 
       require(untouched(groupedRoutes + uint64_t{tile} * tileRows, uint64_t{tileRows} * sizeof(uint32_t)),
               label + ": the in-place grouping wrote a routed tile's grouped routes");
   }
-  const uint64_t scoreBytes = uint64_t{rows} * SPLASH_MOE_EXPERT_SLOTS * 4;
+  // The router's scores (routerWidth: 512 for Qwen3.8-Flash-Next's experts).
+  const uint64_t scoreBytes = uint64_t{rows} * MoeShape{kHidden, kExperts, kTopK, kIntermediate}.routerWidth() * 4;
   require(untouched(groupedInput + scoreBytes, scratch.groupedInput.sizeBytes() - scoreBytes),
           label + ": an in-place plan gathered its rows");
 }
@@ -564,7 +586,8 @@ void checkGrouping(const MoeScratch &scratch, const MoePlan &plan, const std::st
   uint32_t occupied = 0;
   for (const uint32_t count : routes) occupied += (count + tileRows - 1) / tileRows;
   require(tileCount == occupied, label + ": tile count differs from per-expert occupancy");
-  const uint64_t rowBytes = uint64_t{kHidden} * 2, scoreBytes = uint64_t{rows} * SPLASH_MOE_EXPERT_SLOTS * 4;
+  const uint64_t rowBytes = uint64_t{kHidden} * 2,
+                 scoreBytes = uint64_t{rows} * MoeShape{kHidden, kExperts, kTopK, kIntermediate}.routerWidth() * 4;
   for (uint32_t tile = 0; tile < tileCount; ++tile) {
     const uint32_t live = tiles[tile].rows;
     require(live > 0 && live <= tileRows, label + ": invalid tile live row count");
