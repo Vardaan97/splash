@@ -296,6 +296,13 @@ struct Runtime::Impl {
     // Qwen3.8-Flash-Next hashes its PLE n-grams from it, and a target
     // without a draft proposes its continuations from it.
     std::vector<uint32_t> tokens;
+    // The MTP head's proposals (mtpStepsFor): the steps the cycle in flight
+    // drafts, and decayed counts of the proposals the target accepted and
+    // of those it judged (a cycle judges its proposals up to the first it
+    // rejects). The prior is a rate of 0.8 worth five proposals.
+    uint32_t mtpDrafted = 0;
+    float mtpAccepted = 4.0F;
+    float mtpJudged = 5.0F;
   };
 
   struct DecodeLaneResult final {
@@ -367,14 +374,46 @@ struct Runtime::Impl {
   // Where Qwen3.8-Flash-Next's QSA index tensors sit in the KV extents, per
   // full-attention layer (kv::PageStorage::indexPlacement).
   std::vector<ops::QsaIndex> qsaIndex;
-  // Proposals the MTP head drafts per cycle (SPLASH_MTP_DRAFTS, 1 to 7); the
-  // later ones repeat the last.
-  uint32_t mtpDraftSteps = mtpDraftStepsFromEnvironment();
-  static uint32_t mtpDraftStepsFromEnvironment() {
+  // Proposals the MTP head drafts per cycle: at most SPLASH_MTP_DRAFTS (1 to
+  // 7, default 7), fewer while a lane's proposals are rejected
+  // (mtpStepsFor); SPLASH_MTP_ADAPTIVE=0 always drafts SPLASH_MTP_DRAFTS
+  // (default 3). The later proposals repeat the last.
+  bool mtpAdaptive = mtpAdaptiveFromEnvironment();
+  uint32_t mtpDraftSteps = mtpDraftStepsFromEnvironment(mtpAdaptive);
+  static bool mtpAdaptiveFromEnvironment() {
+    const char *value = std::getenv("SPLASH_MTP_ADAPTIVE");
+    return !value || std::string_view(value) != "0";
+  }
+  static uint32_t mtpDraftStepsFromEnvironment(bool adaptive) {
     const char *value = std::getenv("SPLASH_MTP_DRAFTS");
-    if (!value || !*value) return 3;
+    if (!value || !*value) return adaptive ? kDraftProposalTokens : 3;
     const long steps = std::strtol(value, nullptr, 10);
     return static_cast<uint32_t>(std::clamp<long>(steps, 1, kDraftProposalTokens));
+  }
+  // A step drafts proposal k, which the target keeps only when it accepts
+  // the k - 1 before it too: at a lane's acceptance rate r, with chance
+  // about r^k. The verify rows cost the same with any number of proposals,
+  // and a step costs about a tenth of the time a cycle spends per token, so
+  // a lane drafts while r^k stays at least that tenth, and at least two.
+  static constexpr float kMtpWorthwhile = 0.1F;
+  // How much of a lane's acceptance counts survives each cycle.
+  static constexpr float kMtpDecay = 0.8F;
+  uint32_t mtpStepsFor(const Request &entry) const {
+    if (!mtpAdaptive) return mtpDraftSteps;
+    const float rate = entry.mtpAccepted / entry.mtpJudged;
+    uint32_t steps = 1;
+    for (float reach = rate * rate; steps < mtpDraftSteps && reach >= kMtpWorthwhile; reach *= rate) ++steps;
+    return std::max(steps, std::min(2U, mtpDraftSteps));
+  }
+  // The outcome of the proposals a lane's cycle drafted: `accepted`
+  // proposals in a row, counted past the drafted ones when a repeat of the
+  // last was accepted too.
+  static void countMtpOutcome(Request &entry, uint32_t accepted) {
+    if (!entry.mtpDrafted) return;
+    const uint32_t kept = std::min(accepted, entry.mtpDrafted);
+    entry.mtpAccepted = kMtpDecay * entry.mtpAccepted + static_cast<float>(kept);
+    entry.mtpJudged = kMtpDecay * entry.mtpJudged + static_cast<float>(kept < entry.mtpDrafted ? kept + 1 : kept);
+    entry.mtpDrafted = 0;
   }
   ops::AneFfn *aneFfn;
   explicit Impl(RuntimeContext value)
@@ -1796,8 +1835,12 @@ struct Runtime::Impl {
       buffers.candidates = d(DecodeTensor::Candidates);
       buffers.proposalsPerLane = kDraftProposalTokens;
       buffers.candidatesPerProposal = 16;
+      // The batch drafts as deep as its deepest lane wants.
+      uint32_t steps = 1;
+      for (uint32_t lane = 0; lane < lanes; ++lane) steps = std::max(steps, mtpStepsFor(*entries[lane]));
+      for (uint32_t lane = 0; lane < lanes; ++lane) entries[lane]->mtpDrafted = steps;
       targetModel.addMtpDraft(graph, std::move(buffers), kvPages.layers(), std::span(chunks).first(lanes), lanes,
-                              mtpDraftSteps);
+                              steps);
       return;
     }
     targetModel.addVerify(graph, std::move(buffers), kvPages.layers(),
@@ -1973,6 +2016,7 @@ struct Runtime::Impl {
       if (laneResult.accepted > kDraftProposalTokens)
         throw std::runtime_error(
             "target accepted more than the draft proposed");
+      countMtpOutcome(*laneResult.request, laneResult.accepted);
       // The retained target tokens end with the next anchor. A non-finite
       // target row can also accept a sentinel draft proposal as an interior
       // token, so every retained token is checked.
