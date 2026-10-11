@@ -243,8 +243,10 @@ struct MoeBuffers final {
 struct MoE final {
   [[nodiscard]] static MoePlan prefillPlan(MoeShape shape, uint32_t rows, MoeConfig config);
   [[nodiscard]] static MoePlan decodePlan(MoeShape shape, uint32_t lanes, MoeConfig config);
+  // With `firstRow`, a decode plan's lanes route their rows before it to no
+  // expert (MoeGroupParams::first_row); those rows' outputs are not theirs.
   static void add(metal::CommandGraph &graph, const MoeBuffers &buffers,
-                  const BlockMoeWeights &weights, const MoePlan &plan);
+                  const BlockMoeWeights &weights, const MoePlan &plan, uint32_t firstRow = 0);
 };
 
 } // namespace splash::ops

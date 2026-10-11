@@ -220,10 +220,12 @@ struct QwenHyperBuffers final {
   uint32_t qsaScoreRows = 0;
   uint32_t qsaMaskWords = 0;
   // The MTP head: its fp32 streams, its eh projection's bf16 inputs (rows of
-  // streams * 2 * hidden) and a draft step's tokens.
+  // streams * 2 * hidden) and a draft step's tokens. Decode only: the draft
+  // rows' streams as the step that drafted from each row left them.
   metal::MetalBuffer mtpStreams;
   metal::MetalBuffer mtpInput;
   metal::MetalBuffer mtpTokens;
+  metal::MetalBuffer mtpHistory;
 };
 
 struct QwenTargetPrefillBuffers final {
@@ -436,9 +438,10 @@ private:
                                const QwenAttentionWeights &mixer, uint32_t attentionLayer) const;
   // The MTP head over each lane's rows: its inputs (`embedding` rows paired
   // with the carried streams and `history`), its attention block (writing
-  // its KV) and, when `full`, its FFN, its head mix and logits.
+  // its KV) and, when `full`, its FFN, its head mix and logits. Each lane's
+  // rows before `firstRow` route to no expert (ops::MoE::add).
   void addQwen4MtpVerify(VerifyStep &step, const Qwen4ExpWeights &weights, metal::MetalBuffer embedding,
-                         metal::MetalBuffer history, uint32_t limit, bool full) const;
+                         metal::MetalBuffer history, uint32_t limit, bool full, uint32_t firstRow = 0) const;
   // A state cell's carried MTP streams within its auxiliary state.
   [[nodiscard]] metal::MetalBuffer mtpCarried(const metal::MetalBuffer &auxiliary) const;
 

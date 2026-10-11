@@ -146,7 +146,13 @@ kernel void moe_route_select_f32_e512(
 // In place (a plan whose rows fill one tile) each expert gets one tile of the
 // plan's rows: a route's grouped row is its expert tile's row of the route's
 // own row, and the routed tiles' grouped routes go unwritten, as no gather
-// reads them. Experts threads (256, or 512 for Qwen3.8-Flash-Next).
+// reads them. The routes of a lane's rows before params.first_row are left
+// out, and their route rows name the row's shared expert row. Experts threads
+// (256, or 512 for Qwen3.8-Flash-Next).
+inline bool moe_route_dropped(uint row, constant MoeGroupParams &params) {
+  return params.first_row && row % params.lane_rows < params.first_row;
+}
+
 template <uint Experts>
 inline void moe_group_routes_phase(
     device const uint *selected, device MoeTileDescriptor *tiles, device MoeTileCount *tile_count,
@@ -160,7 +166,7 @@ inline void moe_group_routes_phase(
   atomic_store_explicit(&cursors[thread_index], 0u, memory_order_relaxed);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   for (uint route = thread_index; route < routes; route += Experts) {
-    if (route % routes_per_row != params.top_k) {
+    if (route % routes_per_row != params.top_k && !moe_route_dropped(route / routes_per_row, params)) {
       atomic_fetch_add_explicit(&counts[selected[route]], 1u,
                                 memory_order_relaxed);
     }
@@ -195,6 +201,10 @@ inline void moe_group_routes_phase(
   for (uint route = thread_index; route < routes; route += Experts) {
     if (route % routes_per_row == params.top_k)
       continue;
+    if (moe_route_dropped(route / routes_per_row, params)) {
+      route_rows[route] = routed_tiles * params.tile_rows + route / routes_per_row;
+      continue;
+    }
     uint expert = selected[route];
     if (params.in_place) {
       route_rows[route] = tile_offsets[expert] * params.tile_rows + route / routes_per_row;
