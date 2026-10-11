@@ -214,6 +214,10 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   };
   const uint64_t r = kDecodeRows;
   putHyper<DecodeTensor>(geometry, r, put);
+  // The MTP draft's rows' streams, each kept from the step that drafted
+  // from it (QwenTarget::addMtpDraft).
+  if (geometry.target.qwen4() && geometry.target.mtpLayers)
+    put(DecodeTensor::MtpHistory, bytesFor<float>(r * geometry.target.streamWidth()));
   put(DecodeTensor::Hidden0,
       bytesFor<uint16_t>(r * geometry.target.hiddenSize));
   put(DecodeTensor::Hidden1,

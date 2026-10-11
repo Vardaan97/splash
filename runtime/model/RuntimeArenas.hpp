@@ -338,6 +338,7 @@ enum class DecodeTensor : uint32_t {
   MtpStreams,
   MtpInput,
   MtpTokens,
+  MtpHistory,
   PlePrior,
   // One tensor per ops::kMoeScratchFields entry, in its order (moeScratchTensor).
   MoeScratch,
@@ -484,6 +485,7 @@ public:
     h.mtpStreams = batchSlice(DecodeTensor::MtpStreams, lanes);
     h.mtpInput = batchSlice(DecodeTensor::MtpInput, lanes);
     h.mtpTokens = batchSlice(DecodeTensor::MtpTokens, lanes);
+    h.mtpHistory = batchSlice(DecodeTensor::MtpHistory, lanes);
     return h;
   }
   [[nodiscard]] ops::LinearScratch linearScratch() const { return linearScratch_; }

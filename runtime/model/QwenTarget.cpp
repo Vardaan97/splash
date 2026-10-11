@@ -984,7 +984,7 @@ metal::MetalBuffer QwenTarget::mtpCarried(const metal::MetalBuffer &auxiliary) c
 }
 
 void QwenTarget::addQwen4MtpVerify(VerifyStep &step, const Qwen4ExpWeights &weights, metal::MetalBuffer embedding,
-                                   metal::MetalBuffer history, uint32_t limit, bool full) const {
+                                   metal::MetalBuffer history, uint32_t limit, bool full, uint32_t firstRow) const {
   constexpr uint32_t laneRows = ExecutionLimits::targetVerifyRows;
   const Qwen4MtpWeights &mtp = *weights.mtp;
   const QwenTargetVerifyBuffers &b = step.buffers;
@@ -1009,7 +1009,7 @@ void QwenTarget::addQwen4MtpVerify(VerifyStep &step, const Qwen4ExpWeights &weig
   if (!full) return;
   ops::Qwen4::addCombine(step.graph, h.mtpStreams, h.branch, h.weights, hs, rows);
   addQwen4VerifyMix(step, mtp.block.ffnHyper, h.mtpStreams, b.normalized);
-  ops::MoE::add(step.graph, {b.normalized, h.zeros, h.branch, b.moe}, mtp.block.ffn, *step.moe);
+  ops::MoE::add(step.graph, {b.normalized, h.zeros, h.branch, b.moe}, mtp.block.ffn, *step.moe, firstRow);
   ops::Qwen4::addCombine(step.graph, h.mtpStreams, h.branch, h.weights, hs, rows);
   addQwen4VerifyMix(step, mtp.head, h.mtpStreams, b.finalHidden);
   addDecodeProjection(step.graph, linear, b.finalHidden, weights.logitsProjection, b.logits, step.lanes, b.linearScratch);
@@ -1037,16 +1037,24 @@ void QwenTarget::addMtpDraft(metal::CommandGraph &graph, QwenTargetVerifyBuffers
   const QwenHyperBuffers &h = buffers.hyper;
   // Step j reads rows 0..j-1 (the anchor and the proposals so far, each with
   // the streams of the row before) and drafts proposal j - 1 from row j - 1.
-  // The rows before it recompute what the steps before wrote; the later rows
-  // repeat it, so they route to its experts.
+  // The rows before it rewrite the KV and index keys the steps before wrote,
+  // from the streams each of those steps kept of its row (h.mtpHistory), so
+  // they need no experts; the later rows repeat row j - 1, so they route to
+  // its experts.
+  const uint32_t width = geometry_.streamWidth();
   for (uint32_t j = 1; j <= steps; ++j) {
     ops::Qwen4::addMtpTokens(graph, buffers.anchors, buffers.proposals, h.mtpTokens, lanes, laneRows,
                              buffers.proposalsPerLane, j);
     ops::Embedding::add(graph, h.mtpTokens, weightsBase_.tokenEmbedding, buffers.hidden[1], step.rows);
-    addQwen4MtpVerify(step, *weights, buffers.hidden[1], h.mtpStreams, j, true);
+    addQwen4MtpVerify(step, *weights, buffers.hidden[1], h.mtpHistory, j, true, j - 1);
     ops::Qwen4::addMtpArgmax(graph, buffers.logits, buffers.proposals, buffers.candidates, lanes, laneRows,
                              geometry_.vocabularySize, buffers.proposalsPerLane, buffers.candidatesPerProposal,
                              j - 1, j == steps);
+    if (j < steps)
+      for (uint32_t lane = 0; lane < lanes; ++lane)
+        ops::Qwen4::addMtpCarry(graph, rowsOf<float>(backend_, h.mtpStreams, lane * laneRows, j, width),
+                                rowsOf<float>(backend_, h.mtpHistory, lane * laneRows + j - 1, 1, width), {},
+                                hyperShape(geometry_), j);
   }
 }
 
