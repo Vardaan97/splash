@@ -431,11 +431,15 @@ private:
   // Qwen3.8-Flash-Next's graphs (QwenTarget.cpp addQwen4*).
   [[nodiscard]] metal::MetalBuffer addQwen4Prefill(PrefillStep &step, const Qwen4ExpWeights &weights) const;
   void addQwen4Verify(VerifyStep &step, const Qwen4ExpWeights &weights) const;
-  void addQwen4VerifyMix(VerifyStep &step, const Qwen4HyperWeights &hyper, metal::MetalBuffer streams,
-                         metal::MetalBuffer output) const;
+  // A mix into `output`; its projections read the tables its norm and low
+  // step write, and with `next`, the decode projection that reads `output`
+  // first takes the table the mix writes (the returned input).
+  ops::PreparedInput addQwen4VerifyMix(VerifyStep &step, const Qwen4HyperWeights &hyper, metal::MetalBuffer streams,
+                                       metal::MetalBuffer output, const ops::Projection *next = nullptr) const;
   // A full-attention block over the step's rows into hyper.branch.
   void addQwen4VerifyAttention(VerifyStep &step, const Qwen4ExpLayerWeights &layer,
-                               const QwenAttentionWeights &mixer, uint32_t attentionLayer) const;
+                               const QwenAttentionWeights &mixer, uint32_t attentionLayer,
+                               ops::PreparedInput input = {}) const;
   // The MTP head over each lane's rows: its inputs (`embedding` rows paired
   // with the carried streams and `history`), its attention block (writing
   // its KV) and, when `full`, its FFN, its head mix and logits. Each lane's

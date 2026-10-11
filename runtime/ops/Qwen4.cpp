@@ -4,7 +4,9 @@
 
 #include <algorithm>
 #include <stdexcept>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace splash::ops {
 namespace {
@@ -35,29 +37,56 @@ void Qwen4::addInit(metal::CommandGraph &graph, metal::MetalBuffer embedding, me
             {rows, groups(shape.hidden), 1}, {kThreads, 1, 1});
 }
 
-void Qwen4::addNorm(metal::CommandGraph &graph, metal::MetalBuffer streams, const NormWeights &norm,
-                    metal::MetalBuffer inject, metal::MetalBuffer normalized, metal::MetalBuffer weights,
-                    HyperShape shape, uint32_t rows) {
+PreparedInput Qwen4::addNorm(metal::CommandGraph &graph, metal::MetalBuffer streams, const NormWeights &norm,
+                             metal::MetalBuffer inject, metal::MetalBuffer normalized, metal::MetalBuffer weights,
+                             HyperShape shape, uint32_t rows, LinearScratch scratch, LinearInput layout) {
   requireShape(shape);
   const bool injects = static_cast<bool>(inject);
   // A mix without injection binds its norm in the unused slots.
-  graph.add("qwen4_hyper_norm",
-            {std::move(streams), norm.buffer, injects ? inject : norm.buffer, std::move(normalized),
-             injects ? weights : norm.buffer},
+  std::vector<metal::MetalBuffer> bindings{std::move(streams), norm.buffer, injects ? inject : norm.buffer, normalized,
+                                           injects ? weights : norm.buffer};
+  if (layout == LinearInput::Plain) {
+    graph.add("qwen4_hyper_norm", std::move(bindings), hyperParams(shape, rows, injects), {rows, 1, 1},
+              {kThreads, 1, 1});
+    return {};
+  }
+  requireTableScratch(scratch, layout, shape.width(), rows);
+  bindings.insert(bindings.end(), {scratch.input, scratch.sums});
+  graph.add(std::string("qwen4_hyper_norm") + tableSuffix(layout), std::move(bindings),
             hyperParams(shape, rows, injects), {rows, 1, 1}, {kThreads, 1, 1});
+  return {std::move(normalized), layout};
 }
 
-void Qwen4::addLow(metal::CommandGraph &graph, metal::MetalBuffer low, HyperShape shape, uint32_t rows) {
+PreparedInput Qwen4::addLow(metal::CommandGraph &graph, metal::MetalBuffer low, HyperShape shape, uint32_t rows,
+                            LinearScratch scratch, LinearInput layout) {
   requireShape(shape);
-  graph.add("qwen4_hyper_low", {std::move(low)}, hyperParams(shape, rows), {groups(rows * shape.rank), 1, 1},
-            {kThreads, 1, 1});
+  if (layout == LinearInput::Plain) {
+    graph.add("qwen4_hyper_low", {std::move(low)}, hyperParams(shape, rows), {groups(rows * shape.rank), 1, 1},
+              {kThreads, 1, 1});
+    return {};
+  }
+  requireTableScratch(scratch, layout, shape.rank, rows);
+  graph.add(std::string("qwen4_hyper_low") + tableSuffix(layout), {low, scratch.input, scratch.sums},
+            hyperParams(shape, rows), {rows, 1, 1}, {kThreads, 1, 1});
+  return {std::move(low), layout};
 }
 
-void Qwen4::addMix(metal::CommandGraph &graph, metal::MetalBuffer normalized, metal::MetalBuffer gate,
-                   metal::MetalBuffer mixed, HyperShape shape, uint32_t rows) {
+PreparedInput Qwen4::addMix(metal::CommandGraph &graph, metal::MetalBuffer normalized, metal::MetalBuffer gate,
+                            metal::MetalBuffer mixed, HyperShape shape, uint32_t rows, LinearScratch scratch,
+                            LinearInput layout) {
   requireShape(shape);
-  graph.add("qwen4_hyper_mix", {std::move(normalized), std::move(gate), std::move(mixed)},
-            hyperParams(shape, rows), {rows, groups(shape.hidden), 1}, {kThreads, 1, 1});
+  if (layout == LinearInput::Plain) {
+    graph.add("qwen4_hyper_mix", {std::move(normalized), std::move(gate), std::move(mixed)},
+              hyperParams(shape, rows), {rows, groups(shape.hidden), 1}, {kThreads, 1, 1});
+    return {};
+  }
+  // Each threadgroup writes whole spans of its 256 values.
+  if (shape.hidden % kThreads) throw std::invalid_argument("a mix table takes whole threadgroups of values");
+  requireTableScratch(scratch, layout, shape.hidden, rows);
+  graph.add(std::string("qwen4_hyper_mix") + tableSuffix(layout),
+            {std::move(normalized), std::move(gate), mixed, scratch.input, scratch.sums}, hyperParams(shape, rows),
+            {rows, groups(shape.hidden), 1}, {kThreads, 1, 1});
+  return {std::move(mixed), layout};
 }
 
 void Qwen4::addCombine(metal::CommandGraph &graph, metal::MetalBuffer streams, metal::MetalBuffer branch,
