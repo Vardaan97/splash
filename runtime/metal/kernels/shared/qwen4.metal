@@ -1,5 +1,6 @@
 #include "metal/abi/KernelABI.h"
 #include "metal/abi/Qwen4.h"
+#include "metal/kernels/common/gguf_sgmatrix.h"
 
 #include <metal_stdlib>
 
@@ -37,17 +38,25 @@ inline void reduce_streams(thread float (&values)[kStreams], uint streams, threa
 // weights (the GGUF stores 1 + w) into bf16 rows of streams * hidden, and,
 // when it injects, the injection weights 2 sigmoid(inject(normalized) /
 // streams) of the block's output into each stream.
-kernel void qwen4_hyper_norm(device const float *streams [[buffer(0)]],
-                             device const float *norm [[buffer(1)]],
-                             device const float *inject [[buffer(2)]],
-                             device bfloat *normalized [[buffer(3)]],
-                             device float *weights [[buffer(4)]],
-                             constant Qwen4HyperParams &p [[buffer(5)]],
-                             uint row [[threadgroup_position_in_grid]],
-                             uint tid [[thread_index_in_threadgroup]],
-                             uint lane [[thread_index_in_simdgroup]],
-                             uint sg [[simdgroup_index_in_threadgroup]]) {
-  threadgroup float scratch[kSimdgroups * kStreams];
+// A row's bf16 values as the register-tile projection that reads them takes
+// them (gguf_sg::Table16, as decode_linear_gguf_prepare writes it), read back
+// from `values` after the threadgroup wrote them: a simdgroup per 64-value
+// span.
+inline void qwen4_table16_row(device const bfloat *values, device bfloat *table, device float *sums, uint width,
+                              uint row, uint lane, uint sg) {
+  threadgroup_barrier(mem_flags::mem_device);
+  for (uint g = sg; g < width / 64; g += kSimdgroups) {
+    const uint k = g * 64 + 2 * lane;
+    gguf_sg::Table16::write(table + ulong(row / 8) * width * 8, sums + ulong(row / 8) * gguf_sg::Table16::sums_per_tile(width),
+                            width, g, row % 8, lane, values[k], values[k + 1]);
+  }
+}
+
+template <bool Table>
+inline void qwen4_hyper_norm_row(device const float *streams, device const float *norm, device const float *inject,
+                                 device bfloat *normalized, device float *weights, device bfloat *table,
+                                 device float *table_sums, constant Qwen4HyperParams &p, uint row, uint tid, uint lane,
+                                 uint sg, threadgroup float *scratch) {
   if (row >= p.rows) return;
   const uint width = p.streams * p.hidden;
   device const float *x = streams + ulong(row) * width;
@@ -70,9 +79,42 @@ kernel void qwen4_hyper_norm(device const float *streams [[buffer(0)]],
       if (p.inject)
         for (uint j = 0; j < p.streams; ++j) dots[j] += inject[ulong(j) * width + c] * v;
     }
+  if (Table) qwen4_table16_row(out, table, table_sums, width, row, lane, sg);
   if (!p.inject) return;
   reduce_streams(dots, p.streams, scratch, lane, sg);
   if (tid < p.streams) weights[row * p.streams + tid] = 2.0f * sigmoid_of(dots[tid] / p.streams);
+}
+
+kernel void qwen4_hyper_norm(device const float *streams [[buffer(0)]],
+                             device const float *norm [[buffer(1)]],
+                             device const float *inject [[buffer(2)]],
+                             device bfloat *normalized [[buffer(3)]],
+                             device float *weights [[buffer(4)]],
+                             constant Qwen4HyperParams &p [[buffer(5)]],
+                             uint row [[threadgroup_position_in_grid]],
+                             uint tid [[thread_index_in_threadgroup]],
+                             uint lane [[thread_index_in_simdgroup]],
+                             uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float scratch[kSimdgroups * kStreams];
+  qwen4_hyper_norm_row<false>(streams, norm, inject, normalized, weights, nullptr, nullptr, p, row, tid, lane, sg,
+                              scratch);
+}
+
+// The norm with the down projection's table (decode rows, whole lanes).
+kernel void qwen4_hyper_norm_table16(device const float *streams [[buffer(0)]],
+                                     device const float *norm [[buffer(1)]],
+                                     device const float *inject [[buffer(2)]],
+                                     device bfloat *normalized [[buffer(3)]],
+                                     device float *weights [[buffer(4)]],
+                                     device bfloat *table [[buffer(5)]],
+                                     device float *sums [[buffer(6)]],
+                                     constant Qwen4HyperParams &p [[buffer(7)]],
+                                     uint row [[threadgroup_position_in_grid]],
+                                     uint tid [[thread_index_in_threadgroup]],
+                                     uint lane [[thread_index_in_simdgroup]],
+                                     uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float scratch[kSimdgroups * kStreams];
+  qwen4_hyper_norm_row<true>(streams, norm, inject, normalized, weights, table, sums, p, row, tid, lane, sg, scratch);
 }
 
 // silu(low / streams) of the mix's low-rank projection, in place.
@@ -81,6 +123,25 @@ kernel void qwen4_hyper_low(device bfloat *low [[buffer(0)]],
                             uint index [[thread_position_in_grid]]) {
   if (index >= p.rows * p.rank) return;
   low[index] = bfloat(silu_of(float(low[index]) / p.streams));
+}
+
+// The same values into the up projection's table alone (decode rows, whole
+// lanes): a threadgroup per row, a simdgroup per 64-value span.
+kernel void qwen4_hyper_low_table16(device const bfloat *low [[buffer(0)]],
+                                    device bfloat *table [[buffer(1)]],
+                                    device float *sums [[buffer(2)]],
+                                    constant Qwen4HyperParams &p [[buffer(3)]],
+                                    uint row [[threadgroup_position_in_grid]],
+                                    uint lane [[thread_index_in_simdgroup]],
+                                    uint sg [[simdgroup_index_in_threadgroup]]) {
+  if (row >= p.rows) return;
+  device const bfloat *x = low + ulong(row) * p.rank;
+  for (uint g = sg; g < p.rank / 64; g += kSimdgroups) {
+    const uint k = g * 64 + 2 * lane;
+    gguf_sg::Table16::write(table + ulong(row / 8) * p.rank * 8,
+                            sums + ulong(row / 8) * gguf_sg::Table16::sums_per_tile(p.rank), p.rank, g, row % 8, lane,
+                            bfloat(silu_of(float(x[k]) / p.streams)), bfloat(silu_of(float(x[k + 1]) / p.streams)));
+  }
 }
 
 // The block's input: the mean over the streams of the normalized streams
@@ -98,6 +159,37 @@ kernel void qwen4_hyper_mix(device const bfloat *normalized [[buffer(0)]],
   for (uint s = 0; s < p.streams; ++s)
     sum += float(normalized[base + s * p.hidden]) * sigmoid_of(float(gate[base + s * p.hidden]));
   mixed[ulong(row) * p.hidden + d] = bfloat(sum / p.streams);
+}
+
+// The mix with the next projection's table (decode rows, whole lanes, hidden
+// a multiple of the threadgroup): the threadgroup's 256 values are four
+// 64-value spans, which its first four simdgroups write.
+kernel void qwen4_hyper_mix_table16(device const bfloat *normalized [[buffer(0)]],
+                                    device const bfloat *gate [[buffer(1)]],
+                                    device bfloat *mixed [[buffer(2)]],
+                                    device bfloat *table [[buffer(3)]],
+                                    device float *sums [[buffer(4)]],
+                                    constant Qwen4HyperParams &p [[buffer(5)]],
+                                    uint2 group [[threadgroup_position_in_grid]],
+                                    uint tid [[thread_index_in_threadgroup]],
+                                    uint lane [[thread_index_in_simdgroup]],
+                                    uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup bfloat values[kRowThreads];
+  const uint row = group.x, d = group.y * kRowThreads + tid;
+  if (row >= p.rows) return;
+  const ulong base = ulong(row) * p.streams * p.hidden + d;
+  float sum = 0.0f;
+  for (uint s = 0; s < p.streams; ++s)
+    sum += float(normalized[base + s * p.hidden]) * sigmoid_of(float(gate[base + s * p.hidden]));
+  const bfloat value = bfloat(sum / p.streams);
+  mixed[ulong(row) * p.hidden + d] = value;
+  values[tid] = value;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sg >= kRowThreads / 64) return;
+  const uint k = sg * 64 + 2 * lane;
+  gguf_sg::Table16::write(table + ulong(row / 8) * p.hidden * 8,
+                          sums + ulong(row / 8) * gguf_sg::Table16::sums_per_tile(p.hidden), p.hidden,
+                          group.y * (kRowThreads / 64) + sg, row % 8, lane, values[k], values[k + 1]);
 }
 
 // Every stream plus the block's output scaled by the stream's injection weight.

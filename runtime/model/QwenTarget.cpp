@@ -868,24 +868,34 @@ metal::MetalBuffer QwenTarget::addQwen4Prefill(PrefillStep &step, const Qwen4Exp
   return b.hidden[1];
 }
 
-void QwenTarget::addQwen4VerifyMix(VerifyStep &step, const Qwen4HyperWeights &hyper, metal::MetalBuffer streams,
-                                   metal::MetalBuffer output) const {
+ops::PreparedInput QwenTarget::addQwen4VerifyMix(VerifyStep &step, const Qwen4HyperWeights &hyper,
+                                                 metal::MetalBuffer streams, metal::MetalBuffer output,
+                                                 const ops::Projection *next) const {
   const QwenHyperBuffers &h = step.buffers.hyper;
+  const ops::LinearScratch scratch = step.buffers.linearScratch;
   const ops::Linear &linear = operators_.linear();
   const ops::HyperShape hs = hyperShape(geometry_);
-  const auto project = [&](metal::MetalBuffer input, const ops::Projection &projection, metal::MetalBuffer out) {
-    addDecodeProjection(step.graph, linear, std::move(input), projection, std::move(out), step.lanes, step.buffers.linearScratch);
+  const auto layout = [&](const ops::Projection &projection) {
+    return linear.decodePlan(projection, step.lanes).input();
   };
-  ops::Qwen4::addNorm(step.graph, std::move(streams), hyper.norm, hyper.inject, h.normalized, h.weights, hs,
-                      step.rows);
-  project(h.normalized, hyper.down, h.low);
-  ops::Qwen4::addLow(step.graph, h.low, hs, step.rows);
-  project(h.low, hyper.up, h.gate);
-  ops::Qwen4::addMix(step.graph, h.normalized, h.gate, std::move(output), hs, step.rows);
+  const auto project = [&](metal::MetalBuffer input, const ops::Projection &projection, metal::MetalBuffer out,
+                           ops::PreparedInput prepared) {
+    addDecodeProjection(step.graph, linear, std::move(input), projection, std::move(out), step.lanes, scratch,
+                        std::move(prepared));
+  };
+  ops::PreparedInput prepared = ops::Qwen4::addNorm(step.graph, std::move(streams), hyper.norm, hyper.inject,
+                                                    h.normalized, h.weights, hs, step.rows, scratch,
+                                                    layout(hyper.down));
+  project(h.normalized, hyper.down, h.low, std::move(prepared));
+  prepared = ops::Qwen4::addLow(step.graph, h.low, hs, step.rows, scratch, layout(hyper.up));
+  project(h.low, hyper.up, h.gate, std::move(prepared));
+  return ops::Qwen4::addMix(step.graph, h.normalized, h.gate, std::move(output), hs, step.rows, scratch,
+                            next ? layout(*next) : ops::LinearInput::Plain);
 }
 
 void QwenTarget::addQwen4VerifyAttention(VerifyStep &step, const Qwen4ExpLayerWeights &layer,
-                                         const QwenAttentionWeights &mixer, uint32_t attentionLayer) const {
+                                         const QwenAttentionWeights &mixer, uint32_t attentionLayer,
+                                         ops::PreparedInput input) const {
   constexpr uint32_t laneRows = ExecutionLimits::targetVerifyRows;
   constexpr uint32_t indexWidth = QWEN4_QSA_HEADS * QWEN4_QSA_DIMENSION;
   const QwenTargetVerifyBuffers &b = step.buffers;
@@ -896,7 +906,7 @@ void QwenTarget::addQwen4VerifyAttention(VerifyStep &step, const Qwen4ExpLayerWe
     addDecodeProjection(step.graph, linear, std::move(input), projection, std::move(output), step.lanes, b.linearScratch, std::move(prepared));
   };
   const uint32_t topBlocks = qwen4()->layout.indexerTopBlocks;
-  project(b.normalized, mixer.inputProjection, b.fullPacked);
+  project(b.normalized, mixer.inputProjection, b.fullPacked, std::move(input));
   const Qwen4IndexerWeights &indexer = *layer.indexer;
   addIndexerProjection(step.graph, linear, b.normalized, indexer.query, h.indexerQuery, step.rows);
   addIndexerProjection(step.graph, linear, b.normalized, indexer.key, h.indexerKey, step.rows);
@@ -969,13 +979,14 @@ void QwenTarget::addQwen4Verify(VerifyStep &step, const Qwen4ExpWeights &weights
             rowsOf<float>(backend_, h.pleGated, lane * laneRows, laneRows, ps.width()),
             rowsOf<float>(backend_, h.streams, lane * laneRows, laneRows, ps.width()), ps, laneRows);
     }
-    addQwen4VerifyMix(step, layer.mixerHyper, h.streams, b.normalized);
     std::visit(
         [&](const auto &mixer) {
           using Mixer = std::remove_cvref_t<decltype(mixer)>;
+          ops::PreparedInput input =
+              addQwen4VerifyMix(step, layer.mixerHyper, h.streams, b.normalized, &mixer.inputProjection);
           if constexpr (std::is_same_v<Mixer, QwenGdnWeights>) {
             const uint32_t gdnLayer = step.gdnLayer++;
-            project(b.normalized, mixer.inputProjection, b.gdnPacked);
+            project(b.normalized, mixer.inputProjection, b.gdnPacked, std::move(input));
             const ops::PreparedInput hidden = ops::GDN::addDecode(
                 step.graph,
                 {b.gdnPacked, mixer.convolutionWeights, b.currentGdnStates, b.nextGdnStates, b.gdnTape,
@@ -985,7 +996,7 @@ void QwenTarget::addQwen4Verify(VerifyStep &step, const Qwen4ExpWeights &weights
                 mixer.outputHeadOrder, linear.decodePlan(mixer.outputProjection, step.lanes).input());
             project(b.gdnHidden, mixer.outputProjection, h.branch, hidden);
           } else {
-            addQwen4VerifyAttention(step, layer, mixer, step.attentionLayer++);
+            addQwen4VerifyAttention(step, layer, mixer, step.attentionLayer++, std::move(input));
           }
         },
         layer.mixer);
@@ -995,8 +1006,8 @@ void QwenTarget::addQwen4Verify(VerifyStep &step, const Qwen4ExpWeights &weights
     ops::Qwen4::addCombine(step.graph, h.streams, h.branch, h.weights, hs, rows);
   }
   requireLayerPartition(geometry_, step.gdnLayer, step.attentionLayer);
-  addQwen4VerifyMix(step, weights.finalHyper, h.streams, b.finalHidden);
-  project(b.finalHidden, weights.logitsProjection, b.logits);
+  project(b.finalHidden, weights.logitsProjection, b.logits,
+          addQwen4VerifyMix(step, weights.finalHyper, h.streams, b.finalHidden, &weights.logitsProjection));
   // The MTP head's KV at the step's rows: row r pairs the trunk's streams of
   // the position before with the row's token. The head reads them as its
   // context at the next steps; the rows past each lane's accepted ones are
@@ -1030,15 +1041,18 @@ void QwenTarget::addQwen4MtpVerify(VerifyStep &step, const Qwen4ExpWeights &weig
                           b.linearScratch);
   ops::Qwen4::addMtpWiden(step.graph, h.gate, h.mtpStreams, hs, rows);
   const uint32_t attentionLayer = geometry_.kvLayout.attentionLayers - geometry_.mtpLayers;
-  addQwen4VerifyMix(step, mtp.block.mixerHyper, h.mtpStreams, b.normalized);
-  addQwen4VerifyAttention(step, mtp.block, std::get<QwenAttentionWeights>(mtp.block.mixer), attentionLayer);
+  const QwenAttentionWeights &attention = std::get<QwenAttentionWeights>(mtp.block.mixer);
+  addQwen4VerifyAttention(
+      step, mtp.block, attention, attentionLayer,
+      addQwen4VerifyMix(step, mtp.block.mixerHyper, h.mtpStreams, b.normalized, &attention.inputProjection));
   if (!full) return;
   ops::Qwen4::addCombine(step.graph, h.mtpStreams, h.branch, h.weights, hs, rows);
   addQwen4VerifyMix(step, mtp.block.ffnHyper, h.mtpStreams, b.normalized);
   ops::MoE::add(step.graph, {b.normalized, h.zeros, h.branch, b.moe}, mtp.block.ffn, *step.moe, firstRow);
   ops::Qwen4::addCombine(step.graph, h.mtpStreams, h.branch, h.weights, hs, rows);
-  addQwen4VerifyMix(step, mtp.head, h.mtpStreams, b.finalHidden);
-  addDecodeProjection(step.graph, linear, b.finalHidden, weights.logitsProjection, b.logits, step.lanes, b.linearScratch);
+  addDecodeProjection(step.graph, linear, b.finalHidden, weights.logitsProjection, b.logits, step.lanes,
+                      b.linearScratch,
+                      addQwen4VerifyMix(step, mtp.head, h.mtpStreams, b.finalHidden, &weights.logitsProjection));
 }
 
 void QwenTarget::addMtpDraft(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,

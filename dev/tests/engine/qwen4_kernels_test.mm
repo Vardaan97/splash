@@ -188,6 +188,70 @@ void hyperTest(MetalBackend &backend) {
   check(okI, "hyper init: every stream the embedding");
 }
 
+// The table variants (norm, low and mix into a register-tile projection's
+// Table16 table): bit for bit the plain kernel's output followed by the
+// projection's own decode_linear_gguf_prepare, over two lanes of eight rows.
+void hyperTableTest(MetalBackend &backend) {
+  std::mt19937 rng(11);
+  const uint32_t lanes = 2, rows = 8 * lanes, hidden = 512, streams = 4, rank = 64, width = hidden * streams;
+  const ops::HyperShape shape{hidden, streams, rank};
+  const auto table = [&](uint32_t k) {
+    ops::LinearScratch s;
+    s.input = scratch(backend, ops::tableBytes(k, rows));
+    s.sums = scratch(backend, ops::tableSumsBytes(ops::LinearInput::Table16, k, rows));
+    std::memset(s.input.contents(), 0, s.input.sizeBytes());
+    std::memset(s.sums.contents(), 0, s.sums.sizeBytes());
+    return s;
+  };
+  const auto prepare = [&](CommandGraph &graph, const MetalBuffer &input, const ops::LinearScratch &s, uint32_t k) {
+    graph.add("decode_linear_gguf_prepare", {input, s.input, s.sums}, k, {k / 32, lanes, 1}, {128, 1, 1});
+  };
+  const auto same = [](const MetalBuffer &a, const MetalBuffer &b) {
+    return a.sizeBytes() == b.sizeBytes() && !std::memcmp(a.contents(), b.contents(), a.sizeBytes());
+  };
+  const auto x = randoms(rng, rows * width, 1.5f);
+  std::vector<float> normPlus = randoms(rng, width, 0.3f);
+  for (float &v : normPlus) v += 1.0f;
+  const NormWeights nw{upload(backend, normPlus), true};
+  const MetalBuffer xs = upload(backend, x), inject = upload(backend, randoms(rng, streams * width, 0.02f));
+  MetalBuffer normalized = scratch(backend, rows * width * 2), weights = scratch(backend, rows * streams * 4);
+  MetalBuffer normalizedT = scratch(backend, rows * width * 2), weightsT = scratch(backend, rows * streams * 4);
+  const ops::LinearScratch normRef = table(width), normGot = table(width);
+  CommandGraph norm;
+  ops::Qwen4::addNorm(norm, xs, nw, inject, normalized, weights, shape, rows);
+  prepare(norm, normalized, normRef, width);
+  const ops::PreparedInput prepared =
+      ops::Qwen4::addNorm(norm, xs, nw, inject, normalizedT, weightsT, shape, rows, normGot, ops::LinearInput::Table16);
+  run(backend, norm);
+  check(prepared.layout == ops::LinearInput::Table16 && prepared.source.sameView(normalizedT),
+        "hyper norm table: names its output and table layout");
+  check(same(normalized, normalizedT) && same(weights, weightsT), "hyper norm table: output and weights as the plain norm's");
+  check(same(normRef.input, normGot.input) && same(normRef.sums, normGot.sums),
+        "hyper norm table: table and sums as the prepare's");
+
+  const std::vector<uint16_t> low = bf16s(randoms(rng, rows * rank, 2.0f));
+  MetalBuffer lowPlain = upload(backend, low), lowTable = upload(backend, low);
+  const ops::LinearScratch lowRef = table(rank), lowGot = table(rank);
+  CommandGraph lows;
+  ops::Qwen4::addLow(lows, lowPlain, shape, rows);
+  prepare(lows, lowPlain, lowRef, rank);
+  ops::Qwen4::addLow(lows, lowTable, shape, rows, lowGot, ops::LinearInput::Table16);
+  run(backend, lows);
+  check(same(lowRef.input, lowGot.input) && same(lowRef.sums, lowGot.sums), "hyper low table: table and sums as the prepare's");
+  check(download<uint16_t>(lowTable, rows * rank) == low, "hyper low table: leaves its input as it was");
+
+  const MetalBuffer gate = upload(backend, bf16s(randoms(rng, rows * width, 1.0f)));
+  MetalBuffer mixed = scratch(backend, rows * hidden * 2), mixedT = scratch(backend, rows * hidden * 2);
+  const ops::LinearScratch mixRef = table(hidden), mixGot = table(hidden);
+  CommandGraph mix;
+  ops::Qwen4::addMix(mix, normalized, gate, mixed, shape, rows);
+  prepare(mix, mixed, mixRef, hidden);
+  ops::Qwen4::addMix(mix, normalized, gate, mixedT, shape, rows, mixGot, ops::LinearInput::Table16);
+  run(backend, mix);
+  check(same(mixed, mixedT), "hyper mix table: output as the plain mix's");
+  check(same(mixRef.input, mixGot.input) && same(mixRef.sums, mixGot.sums), "hyper mix table: table and sums as the prepare's");
+}
+
 void pleTest(MetalBackend &backend) {
   std::mt19937 rng(11);
   const uint32_t rows = 7, hidden = 256, streams = 4, taps = 4, dilation = 3, width = hidden * streams;
@@ -569,6 +633,7 @@ int main(int argc, const char *argv[]) {
       if (argc != 2) throw std::runtime_error("usage: qwen4-kernels METALLIB");
       MetalBackend backend(argv[1]);
       hyperTest(backend);
+      hyperTableTest(backend);
       pleTest(backend);
       qsaTest(backend);
       mtpTest(backend);
