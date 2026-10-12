@@ -362,11 +362,14 @@ public:
       metal::CommandGraph &graph, QwenTargetPrefillBuffers buffers,
       std::span<const QwenTargetPrefillSequence> sequences, uint32_t rows,
       std::span<const SplashKvLayer> kvLayers, ops::AneFfn *aneFfn = nullptr) const;
+  // With `liveRows`, Qwen3.8-Flash-Next's verify routes each lane's rows from
+  // it on to no expert (ops::MoE::add lastRow): the rows past the proposals
+  // its MTP head drafted, which only repeat the last one.
   void addVerify(
       metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
       std::span<const SplashKvLayer> kvLayers,
       std::span<const kv::ChunkedPrefillParams> chunks,
-      uint32_t lanes) const;
+      uint32_t lanes, uint32_t liveRows = 0) const;
   // The final norm and LM head over `lanes` lanes of targetVerifyRows rows,
   // as verify ends: one sweep of the vocabulary projection for every lane.
   void addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden,
