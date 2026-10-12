@@ -47,6 +47,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -748,17 +749,22 @@ std::vector<uint16_t> runPlan(MetalBackend &backend, const Model &m, Buffers &b,
   return result;
 }
 
-// A decode plan's run whose lanes route their rows before `firstRow` to no
-// expert (MoE::add firstRow, an MTP draft step): the tiles hold no route of
-// such a row, each of their routed routes reads the row's shared expert row,
-// and every later row's output is `full`'s, bit for bit.
-void checkFirstRow(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan &plan, uint32_t firstRow,
-                   const std::vector<uint16_t> &full, const std::string &label) {
+// A decode plan's run whose lanes route their rows before `firstRow`, and
+// from `lastRow` on when it is set, to no expert (MoE::add firstRow, an MTP
+// draft step; lastRow, a verify's rows past the drafted proposals): the tiles
+// hold no route of such a row, each of their routed routes reads the row's
+// shared expert row, and every live row's output is `full`'s, bit for bit.
+void checkLiveRows(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan &plan, uint32_t firstRow,
+                   uint32_t lastRow, const std::vector<uint16_t> &full, const std::string &label) {
   const uint32_t rows = plan.rows(), tileRows = plan.tileRows();
+  const auto live = [&](uint32_t row) {
+    const uint32_t r = row % SPLASH_TARGET_VERIFY_ROWS;
+    return r >= firstRow && (!lastRow || r < lastRow);
+  };
   allocate(backend, b, plan);
   std::memset(b.moe.output.contents(), 0, b.moe.output.sizeBytes());
   CommandGraph graph;
-  MoE::add(graph, b.moe, m.weights, plan, firstRow);
+  MoE::add(graph, b.moe, m.weights, plan, firstRow, lastRow);
   static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
   const auto *routeRows = static_cast<const uint32_t *>(b.moe.scratch.routeRows.contents());
   const auto *groupedRoutes = static_cast<const uint32_t *>(b.moe.scratch.groupedRoutes.contents());
@@ -768,20 +774,20 @@ void checkFirstRow(MetalBackend &backend, const Model &m, Buffers &b, const MoeP
   while (routedTiles < tileCount && tiles[routedTiles].expert != kExperts) ++routedTiles;
   for (uint32_t tile = 0; tile < routedTiles && !plan.rowsInPlace(); ++tile)
     for (uint32_t row = 0; row < tiles[tile].rows; ++row)
-      require(groupedRoutes[uint64_t{tile} * tileRows + row] / kRoutes % SPLASH_TARGET_VERIFY_ROWS >= firstRow,
-              label + ": a tile holds a route of a row before the first");
+      require(live(groupedRoutes[uint64_t{tile} * tileRows + row] / kRoutes),
+              label + ": a tile holds a route of a row that routes to no expert");
   for (uint32_t route = 0; route < rows * kRoutes; ++route) {
     const uint32_t row = route / kRoutes;
-    if (row % SPLASH_TARGET_VERIFY_ROWS < firstRow && route % kRoutes != kTopK)
+    if (!live(row) && route % kRoutes != kTopK)
       require(routeRows[route] == routedTiles * tileRows + row,
               label + ": a dropped route does not read its row's shared expert row");
   }
   const auto *output = static_cast<const uint16_t *>(b.moe.output.contents());
   for (uint32_t row = 0; row < rows; ++row)
-    if (row % SPLASH_TARGET_VERIFY_ROWS >= firstRow)
+    if (live(row))
       require(std::equal(output + uint64_t{row} * kHidden, output + uint64_t{row + 1} * kHidden,
                          full.begin() + uint64_t{row} * kHidden),
-              label + ": row " + std::to_string(row) + " differs from the run without a first row");
+              label + ": row " + std::to_string(row) + " differs from the run that routes every row");
 }
 
 // Each buffer a register decode plan and a staged 32-row prefill plan reach,
@@ -868,9 +874,12 @@ int moe(MetalBackend &backend) {
               runPlan(backend, m, b, plan, tile == MoeGgufTile::Staged, oneGateUp, products, stats, label);
           // A row's result depends on its own routes only, not on the lanes it
           // is batched with (the tile rows of one expert are independent),
-          // nor on the rows before it that route to no expert.
-          for (const uint32_t firstRow : {1u, 4u, 7u})
-            checkFirstRow(backend, m, b, plan, firstRow, rows, label + " first row " + std::to_string(firstRow));
+          // nor on the rows before or after it that route to no expert.
+          const std::pair<uint32_t, uint32_t> ranges[] = {{1, 0}, {4, 0}, {7, 0}, {0, 2}, {0, 5}, {1, 4}};
+          for (const auto &[firstRow, lastRow] : ranges)
+            checkLiveRows(backend, m, b, plan, firstRow, lastRow, rows,
+                          label + " rows " + std::to_string(firstRow) + ".." +
+                              std::to_string(lastRow ? lastRow : SPLASH_TARGET_VERIFY_ROWS));
           if (widest.empty()) widest = rows;
           else if (!std::equal(rows.begin(), rows.end(), widest.begin())) {
             printf("  %s: rows differ from the four-lane dispatch FAIL\n", label.c_str());

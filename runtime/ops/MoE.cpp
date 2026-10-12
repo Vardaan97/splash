@@ -151,13 +151,16 @@ MoePlan::MoePlan(MoeShape shape, uint32_t rows, MoeConfig config,
 }
 
 void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
-              const BlockMoeWeights &weights, const MoePlan &plan, uint32_t firstRow) {
+              const BlockMoeWeights &weights, const MoePlan &plan, uint32_t firstRow, uint32_t lastRow) {
   const MoeShape shape = plan.shape();
   const uint32_t rows = plan.rows();
   const uint32_t tileRows = plan.tileRows();
   validate(weights, shape);
   if (firstRow && (firstRow >= SPLASH_TARGET_VERIFY_ROWS || rows % SPLASH_TARGET_VERIFY_ROWS))
     throw std::invalid_argument("invalid MoE first row");
+  if (lastRow && (lastRow > SPLASH_TARGET_VERIFY_ROWS || lastRow <= firstRow || rows % SPLASH_TARGET_VERIFY_ROWS))
+    throw std::invalid_argument("invalid MoE last row");
+  if (lastRow == SPLASH_TARGET_VERIFY_ROWS) lastRow = 0;
   const uint32_t tiles = plan.maximumTiles();
   const MoeWorkspace &required = plan.workspace();
   const uint64_t hiddenRows = uint64_t{rows} * shape.hiddenSize * sizeof(uint16_t);
@@ -190,7 +193,7 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
   const MoeGroupParams group{rows, shape.expertsPerToken, tileRows, shape.experts,
                              shape.expertIntermediateSize / (oneGateUp ? GGUF_STAGED_COLUMNS : GGUF_TILE_COLUMNS),
                              shape.hiddenSize / GGUF_TILE_COLUMNS, plan.rowsInPlace(),
-                             firstRow ? SPLASH_TARGET_VERIFY_ROWS : 0, firstRow};
+                             (firstRow || lastRow) ? SPLASH_TARGET_VERIFY_ROWS : 0, firstRow, lastRow};
   graph.add(wide ? "moe_group_routes_e512" : "moe_group_routes",
             {scratch.selectedExperts, scratch.tileDescriptors,
              scratch.tileCount, scratch.groupedRoutes, scratch.routeRows},

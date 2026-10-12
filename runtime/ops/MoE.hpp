@@ -241,8 +241,11 @@ struct MoE final {
   [[nodiscard]] static MoePlan decodePlan(MoeShape shape, uint32_t lanes, MoeConfig config);
   // With `firstRow`, a decode plan's lanes route their rows before it to no
   // expert (MoeGroupParams::first_row); those rows' outputs are not theirs.
+  // With `lastRow`, the lanes' rows from it on route to no expert either
+  // (MoeGroupParams::last_row).
   static void add(metal::CommandGraph &graph, const MoeBuffers &buffers,
-                  const BlockMoeWeights &weights, const MoePlan &plan, uint32_t firstRow = 0);
+                  const BlockMoeWeights &weights, const MoePlan &plan, uint32_t firstRow = 0,
+                  uint32_t lastRow = 0);
 };
 
 } // namespace splash::ops
