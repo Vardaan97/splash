@@ -68,6 +68,19 @@ id<MTLBuffer> makeBuffer(id<MTLDevice> device, uint64_t bytes) {
   return result;
 }
 
+// Instrumented by shader validation, the kv2_g12 verify split computes wrong
+// results on Apple10 (M5 Max, in the metallib built for macOS 26.4); it is
+// exact uninstrumented and on Apple9. The repro and its narrowing are in
+// incoai/splash#253 (issuecomment-6128217072 and the comments after it).
+// Until Metal fixes it, its pipelines leave validation off there. Metal settles
+// a function's instrumentation at the first pipeline built from it in the
+// process, whatever later descriptors ask for, so every pipeline of it comes
+// through makePipeline.
+bool shaderValidationExcluded(id<MTLDevice> device, const std::string &name) {
+  return name == "verify_attention_q8_split_kv2_g12" &&
+         [device supportsFamily:MTLGPUFamilyApple10];
+}
+
 id<MTLComputePipelineState>
 makePipeline(id<MTLDevice> device, id<MTLLibrary> library,
              const std::string &name) {
@@ -75,9 +88,16 @@ makePipeline(id<MTLDevice> device, id<MTLLibrary> library,
       [library newFunctionWithName:[NSString stringWithUTF8String:name.c_str()]];
   if (!function)
     throw std::runtime_error("missing Metal kernel: " + name);
+  MTLComputePipelineDescriptor *descriptor = [MTLComputePipelineDescriptor new];
+  descriptor.computeFunction = function;
+  if (shaderValidationExcluded(device, name))
+    descriptor.shaderValidation = MTLShaderValidationDisabled;
   NSError *error = nil;
   id<MTLComputePipelineState> result =
-      [device newComputePipelineStateWithFunction:function error:&error];
+      [device newComputePipelineStateWithDescriptor:descriptor
+                                            options:MTLPipelineOptionNone
+                                         reflection:nil
+                                              error:&error];
   if (!result)
     throw std::runtime_error(error.localizedDescription.UTF8String);
   return result;
@@ -417,7 +437,10 @@ Pipelines makePipelines(id<MTLDevice> device, id<MTLLibrary> library,
       device, library, std::string("prefill_attention_reduce") + shape.suffix);
   const uint64_t scratch = result.split.staticThreadgroupMemoryLength;
   std::cout << "pipeline=" << result.splitName << " threadgroup_bytes=" << scratch
-            << (shaderValidationEnabled() ? " (instrumented by shader validation)" : "")
+            << (!shaderValidationEnabled() ? ""
+                : shaderValidationExcluded(device, result.splitName)
+                    ? " (as reported under shader validation; this pipeline runs uninstrumented)"
+                    : " (instrumented by shader validation)")
             << '\n';
   require(scratch == result.prefillSplit.staticThreadgroupMemoryLength,
           "verify tile left the shared score/probability footprint");
