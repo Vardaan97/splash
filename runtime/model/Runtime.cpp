@@ -392,10 +392,11 @@ struct Runtime::Impl {
   }
   // A step drafts proposal k, which the target keeps only when it accepts
   // the k - 1 before it too: at a lane's acceptance rate r, with chance
-  // about r^k. The verify rows cost the same with any number of proposals,
-  // and a step costs about a tenth of the time a cycle spends per token, so
-  // a lane drafts while r^k stays at least that tenth, and at least two.
-  static constexpr float kMtpWorthwhile = 0.1F;
+  // about r^k. Each proposal costs a draft step, and since the verify routes
+  // only its live rows to experts (verifyLiveRows), its row's experts in the
+  // verify too, so a lane drafts while r^k stays at least 0.3, and at least
+  // two: all seven at r = 0.9, five at 0.8 and two at 0.6.
+  static constexpr float kMtpWorthwhile = 0.3F;
   // How much of a lane's acceptance counts survives each cycle.
   static constexpr float kMtpDecay = 0.8F;
   uint32_t mtpStepsFor(const Request &entry) const {
