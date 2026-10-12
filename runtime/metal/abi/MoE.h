@@ -45,7 +45,9 @@ static_assert(sizeof(MoeTileDescriptor) == 8,
 // the plan's rows in place, and the gate/up pass reads them without a gather.
 // With `first_row`, the rows of each `lane_rows` rows before it route to no
 // expert: their routed outputs read their shared expert's row (an MTP draft
-// step's rows that only repeat a step before, QwenTarget::addMtpDraft).
+// step's rows that only repeat a step before, QwenTarget::addMtpDraft). With
+// `last_row`, those from it on route to no expert either (a verify's rows
+// past the proposals the MTP head drafted, QwenTarget::addVerify liveRows).
 struct MoeGroupParams {
   uint32_t rows;
   uint32_t top_k;
@@ -56,10 +58,11 @@ struct MoeGroupParams {
   uint32_t in_place;
   uint32_t lane_rows;
   uint32_t first_row;
+  uint32_t last_row;
 };
 
-static_assert(sizeof(MoeGroupParams) == 36,
-              "MoE grouping parameters are 36 bytes on both sides");
+static_assert(sizeof(MoeGroupParams) == 40,
+              "MoE grouping parameters are 40 bytes on both sides");
 
 // What the grouping writes besides the tiles: their count, which every pass
 // over them reads first, and the grids (column tiles, tiles, 1) of the

@@ -417,6 +417,20 @@ struct Runtime::Impl {
     for (float reach = rate * rate; steps < mtpDraftSteps && reach >= kMtpWorthwhile; reach *= rate) ++steps;
     return std::max(steps, std::min(2U, mtpDraftSteps));
   }
+  // The rows of each lane a verify after the MTP head's draft routes to
+  // Qwen3.8-Flash-Next's experts: the anchor and the drafted proposals. The
+  // rows past them only repeat the last proposal, so they route to no expert
+  // (QwenTarget::addVerify liveRows) and no token is kept from them. 0 when
+  // every row routes: a lane without drafted proposals, or a full verify.
+  uint32_t verifyLiveRows(std::span<Request *const> entries) const {
+    if (!targetModel.qwen4()) return 0;
+    uint32_t rows = 0;
+    for (const Request *entry : entries) {
+      if (!entry->mtpDrafted) return 0;
+      rows = std::max(rows, entry->mtpDrafted + 1);
+    }
+    return rows < kDecodeRows ? rows : 0;
+  }
   // The outcome of the proposals a lane's cycle drafted: `accepted`
   // proposals in a row, counted past the drafted ones when a repeat of the
   // last was accepted too.
@@ -1983,7 +1997,7 @@ struct Runtime::Impl {
       return;
     }
     targetModel.addVerify(graph, std::move(buffers), kvPages.layers(),
-                          std::span(chunks).first(lanes), lanes);
+                          std::span(chunks).first(lanes), lanes, verifyLiveRows(entries.first(lanes)));
   }
 
   // The verify rows' tokens, their PLE rows (on the GPU when the MTP head
@@ -2929,6 +2943,12 @@ Runtime::decodeAsync(const BatchPlan &plan,
                                  {logicalPositions.data(), width});
   } else if (impl_->targetModel.hasMtp()) {
     impl_->encodeTargetVerifyBatchForward(commandGraph, entries, items, true);
+    if (const uint32_t liveRows = impl_->verifyLiveRows(entries)) {
+      for (uint32_t lane = 0; lane < width; ++lane) {
+        lanes[lane].maximumRetained = std::min(lanes[lane].maximumRetained, liveRows);
+        maximumRetained[lane] = lanes[lane].maximumRetained;
+      }
+    }
   }
   if (constrained) {
     return std::make_unique<Impl::ConstrainedDecodeTicket>(

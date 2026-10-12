@@ -307,6 +307,8 @@ struct QwenTarget::VerifyStep {
   std::optional<ops::MoePlan> moe{};
   uint32_t gdnLayer = 0;
   uint32_t attentionLayer = 0;
+  // The rows of each lane that route to experts (0: all; addVerify).
+  uint32_t liveRows = 0;
 };
 
 metal::MetalBuffer QwenTarget::addPrefill(
@@ -467,7 +469,7 @@ void QwenTarget::addPrefillFfn(PrefillStep &step, uint32_t, const Qwen3_6MoeLaye
 void QwenTarget::addVerify(
     metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
     std::span<const SplashKvLayer> kvLayers,
-    std::span<const kv::ChunkedPrefillParams> chunks, uint32_t lanes) const {
+    std::span<const kv::ChunkedPrefillParams> chunks, uint32_t lanes, uint32_t liveRows) const {
   if (!lanes || lanes > ExecutionLimits::maximumBatchWidth || chunks.size() != lanes ||
       kvLayers.size() != geometry_.kvLayout.attentionLayers ||
       buffers.chunkKeys.size() != geometry_.kvLayout.attentionLayers ||
@@ -482,6 +484,7 @@ void QwenTarget::addVerify(
                   operators_.verifyAttention(lanes, geometry_.attentionQueryHeads, geometry_.kvLayout,
                                              std::span(histories).first(lanes))};
   if (geometry_.ffnKind == QwenFfnKind::SparseMoe) step.moe = operators_.moeDecode(geometry_.moeShape(), lanes);
+  step.liveRows = liveRows;
   // Qwen3.8-Flash-Next's verify ends with its own head: its final mix, which
   // the vocabulary projection reads without a norm, and its MTP head's KV.
   if (const Qwen4ExpWeights *qwen4Weights = qwen4()) {
@@ -1002,7 +1005,7 @@ void QwenTarget::addQwen4Verify(VerifyStep &step, const Qwen4ExpWeights &weights
         layer.mixer);
     ops::Qwen4::addCombine(step.graph, h.streams, h.branch, h.weights, hs, rows);
     addQwen4VerifyMix(step, layer.ffnHyper, h.streams, b.normalized);
-    ops::MoE::add(step.graph, {b.normalized, h.zeros, h.branch, b.moe}, layer.ffn, *step.moe);
+    ops::MoE::add(step.graph, {b.normalized, h.zeros, h.branch, b.moe}, layer.ffn, *step.moe, 0, step.liveRows);
     ops::Qwen4::addCombine(step.graph, h.streams, h.branch, h.weights, hs, rows);
   }
   requireLayerPartition(geometry_, step.gdnLayer, step.attentionLayer);
