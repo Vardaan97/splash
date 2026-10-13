@@ -45,8 +45,11 @@ struct SparseRowTable final {
   void validate() const;
 };
 
-// The widest row a store takes; staging and scratch are sized by it.
+// The widest row a store takes.
 inline constexpr uint32_t kSparseRowMaximumBytes = 64 << 10;
+// The most ids a stage's scratch is sized for (a 2,048-row prefill chunk's
+// 16 PLE rows each); a larger stage grows it.
+inline constexpr uint32_t kSparseRowStageRows = 1u << 15;
 
 // How a store reads its source. Production stores read a WeightSource's file
 // (openRowReader); tests inject failures and delays.
@@ -71,8 +74,9 @@ public:
 [[nodiscard]] std::unique_ptr<RowReader> openRowReader(int descriptor, const std::filesystem::path &path);
 
 struct SparseRowStoreOptions final {
-  // The host bytes the cache holds in all: its rows, ids, recency links and
-  // index (cacheRowsFor).
+  // The cache and working-memory reservation (committedBytes): workingBytes
+  // and, in the rest, rows with their ids, recency links and index. This is
+  // not a bound on all host allocations (see workingBytes).
   uint64_t cacheBytes = 0;
   // Reader threads besides the staging thread.
   uint32_t readers = 16;
@@ -103,7 +107,7 @@ struct SparseRowLatency final {
 struct SparseRowStats final {
   std::string table;
   uint64_t tableBytes = 0;
-  uint64_t cacheBytes = 0;    // committed host bytes of the cache
+  uint64_t cacheBytes = 0;    // cache and working-memory reservation
   uint64_t cacheCapacityRows = 0;
   uint64_t cachedRows = 0;
   // Per SparseRowUse: stages, row ids they took, distinct rows, cache hits
@@ -139,10 +143,15 @@ public:
   [[nodiscard]] static uint64_t cacheRowsFor(uint64_t cacheBytes, uint32_t rowBytes) noexcept;
   // The committed bytes of a cache of `rows` rows.
   [[nodiscard]] static uint64_t cacheBytesFor(uint64_t rows, uint32_t rowBytes) noexcept;
+  // Reservation beside the cache: prefetch row payloads and stage scratch
+  // for kSparseRowStageRows ids. Larger stages grow the scratch. This does
+  // not count prefetch dedupe scratch, excess vector capacity, job/queue
+  // metadata, allocator overhead or reader thread stacks.
+  [[nodiscard]] static uint64_t workingBytes(uint32_t rowBytes, uint32_t prefetchRows) noexcept;
 
   // Allocates the cache now. Throws std::invalid_argument when the table is
   // invalid, ends past the reader's file, or no row fits in
-  // options.cacheBytes.
+  // options.cacheBytes beside the working memory.
   SparseRowStore(SparseRowTable table, std::unique_ptr<RowReader> reader, SparseRowStoreOptions options);
   // Stops the readers; a read in progress finishes first.
   ~SparseRowStore();
@@ -150,8 +159,8 @@ public:
   SparseRowStore &operator=(const SparseRowStore &) = delete;
 
   [[nodiscard]] const SparseRowTable &table() const noexcept;
-  // The host bytes the store holds: its cache, the prefetch bound's buffers
-  // and its readers' scratch.
+  // Cache bytes plus the fixed working-memory reservation, at most
+  // options.cacheBytes; not the store's measured allocation high-water mark.
   [[nodiscard]] uint64_t committedBytes() const noexcept;
 
   // Stages the rows of `ids` (any order, repeats allowed): row u of `rows`

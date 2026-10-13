@@ -156,6 +156,16 @@ uint64_t SparseRowStore::cacheBytesFor(uint64_t rows, uint32_t rowBytes) noexcep
   return rows * perRow + indexBuckets(rows) * sizeof(uint32_t);
 }
 
+uint64_t SparseRowStore::workingBytes(uint32_t rowBytes, uint32_t prefetchRows) noexcept {
+  // A prefetched row's bytes, id and destination; a stage's dedupe map (three
+  // words in each of twice as many buckets), distinct and missing ids, and
+  // its read job's id and destination per row.
+  const uint64_t prefetch = uint64_t{prefetchRows} * (uint64_t{rowBytes} + sizeof(uint32_t) + sizeof(uint8_t *));
+  const uint64_t stage = uint64_t{kSparseRowStageRows} * (6 * sizeof(uint32_t) + 2 * sizeof(uint32_t) +
+                                                          sizeof(uint32_t) + sizeof(uint8_t *));
+  return prefetch + stage;
+}
+
 uint64_t SparseRowStore::cacheRowsFor(uint64_t cacheBytes, uint32_t rowBytes) noexcept {
   if (!rowBytes) return 0;
   // Slot numbers are 32-bit, one of them reserved.
@@ -248,7 +258,8 @@ struct SparseRowStore::Impl {
   }
 
   void allocate(uint64_t cacheBytes) {
-    capacity = cacheRowsFor(cacheBytes, table.rowBytes);
+    const uint64_t working = workingBytes(table.rowBytes, options.prefetchRows);
+    capacity = cacheBytes > working ? cacheRowsFor(cacheBytes - working, table.rowBytes) : 0;
     if (!capacity) throw std::invalid_argument("the row cache holds no row of " + table.name);
     const uint64_t bucketCount = indexBuckets(capacity);
     bucketMask = bucketCount - 1;
@@ -520,7 +531,7 @@ const SparseRowTable &SparseRowStore::table() const noexcept { return impl_->tab
 
 uint64_t SparseRowStore::committedBytes() const noexcept {
   return cacheBytesFor(impl_->capacity, impl_->table.rowBytes) +
-         uint64_t{impl_->options.prefetchRows} * (impl_->table.rowBytes + sizeof(uint32_t) + sizeof(uint8_t *));
+         workingBytes(impl_->table.rowBytes, impl_->options.prefetchRows);
 }
 
 SparseRowStageResult SparseRowStore::stage(std::span<const uint32_t> ids, std::span<uint8_t> rows,
@@ -698,7 +709,7 @@ SparseRowStats SparseRowStore::stats() const {
   SparseRowStats result;
   result.table = s.table.name;
   result.tableBytes = s.table.rows * s.table.rowBytes;
-  result.cacheBytes = cacheBytesFor(s.capacity, s.table.rowBytes);
+  result.cacheBytes = cacheBytesFor(s.capacity, s.table.rowBytes) + workingBytes(s.table.rowBytes, s.options.prefetchRows);
   result.cacheCapacityRows = s.capacity;
   {
     const std::lock_guard lock(s.cacheMutex);
