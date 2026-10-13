@@ -579,6 +579,13 @@ kernel void qwen4_mtp_widen(device const bfloat *projected [[buffer(0)]],
   streams[index] = float(projected[(ulong(s) * p.rows + row) * p.hidden + d]);
 }
 
+// Match target selection: NaN and -inf have no selectable token; +inf
+// remains selectable. Use bits so the test survives Metal fast math.
+inline bool qwen4_unselectable_logit(float value) {
+  const uint bits = as_type<uint>(value);
+  return (bits & 0x7fffffffu) > 0x7f800000u || bits == 0xff800000u;
+}
+
 // One threadgroup per lane: the argmax of the lane's logits row p.row, over
 // p.vocabulary logits: the tokens themselves or, Mapped, the logits of a
 // draft vocabulary's tokens, ascending, of which `tokens` names each. Ties
@@ -593,6 +600,7 @@ inline void qwen4_mtp_argmax_row(device const float *logits, device uint *propos
   uint id = 0xffffffffu;
   for (uint v = tid; v < p.vocabulary; v += threads) {
     const float value = x[v];
+    if (qwen4_unselectable_logit(value)) continue;
     if (value > best) {
       best = value;
       id = v;
@@ -619,7 +627,7 @@ inline void qwen4_mtp_argmax_row(device const float *logits, device uint *propos
       best = best_values[g];
       id = best_ids[g];
     }
-  // No finite logit drafts token 0, as without a draft vocabulary.
+  // No selectable logit drafts token 0, as without a draft vocabulary.
   if (id >= p.vocabulary) id = 0;
   else if (Mapped) id = tokens[id];
   const uint end = p.last ? p.proposals : p.row + 1;
@@ -663,6 +671,7 @@ kernel void qwen4_mtp_argmax_mapped(device const float *logits [[buffer(0)]],
 // Takes (value, t) as the best so far when it is larger, or as large with a
 // lower token.
 inline void qwen4_consider(thread float &best, thread uint &token, float value, uint t) {
+  if (qwen4_unselectable_logit(value)) return;
   if (value > best || (value == best && t < token)) {
     best = value;
     token = t;
@@ -716,7 +725,7 @@ kernel void qwen4_mtp_argmax_context(device const float *logits [[buffer(0)]],
   if (tid != 0) return;
   const uint groups = (threads + 31) / 32;
   for (uint g = 1; g < groups; ++g) qwen4_consider(best, token, best_values[g], best_tokens[g]);
-  // No finite logit drafts token 0, as without a draft vocabulary.
+  // No selectable logit drafts token 0, as without a draft vocabulary.
   if (token == 0xffffffffu) token = 0;
   const uint end = p.last ? p.proposals : p.row + 1;
   for (uint slot = p.row; slot < end; ++slot) {

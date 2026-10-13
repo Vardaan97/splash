@@ -718,6 +718,27 @@ void mtpTest(MetalBackend &backend) {
   okContext &= cp[0] == 5 && cp[proposals] == 5;
   check(okContext, "MTP argmax with context rows: a context token, the lower token on a tie, only the lane's count");
 
+  // Pathological logits remain proposals only: ignore NaN and -inf,
+  // admit +inf, ignore rows beyond count, and use token 0 for no choice.
+  for (const float bad : {NAN, -INFINITY, INFINITY}) {
+    std::fill(vocabularyLogits.begin(), vocabularyLogits.end(), bad);
+    std::fill(contextLogits.begin(), contextLogits.end(), bad);
+    info[0] = 0; // no context on lane 0
+    contextLogits[slot + capacity + 2] = 7.0F;
+    contextLogits[slot + capacity + 8] = 100.0F; // beyond lane 1's count
+    CommandGraph pathological;
+    ops::Qwen4::addMtpArgmaxContext(pathological, upload(backend, vocabularyLogits), contextProposed,
+                                    contextCandidate, upload(backend, draftTokens), upload(backend, contextLogits),
+                                    upload(backend, contextTokens), upload(backend, info), lanes, laneRows, drafted,
+                                    capacity, slot, proposals, candidates, 1, true);
+    run(backend, pathological);
+    const auto got = download<uint32_t>(contextProposed, lanes * proposals);
+    const bool positive = bad == INFINITY;
+    check(got[1] == (positive ? draftTokens[0] : 0) &&
+              got[proposals + 1] == (positive ? draftTokens[0] : contextTokens[2]),
+          "MTP context argmax: NaN/-inf excluded, +inf admitted, zero context and count bounds");
+  }
+
   // Rows of one quantized tensor copied to rows of another: each pair's
   // destination row is its source row, byte for byte, in every plane.
   for (const uint32_t format : {GGUF_FMT_Q6K, GGUF_FMT_Q80, GGUF_FMT_Q4K}) {
