@@ -2575,9 +2575,13 @@ int main(int argc, char **argv) {
     const uint64_t beforeFirstDecode =
         BackendInstrumentation::submittedCommands(backend);
     ModelStepResult decoded = decodeOne(executor, 1, 128, pageTable);
+    // With a streamed PLE table the MTP head's draft is a command of its own:
+    // the CPU stages the rows it hashed before the verify's is encoded.
+    const auto *qwen4 = std::get_if<model::Qwen4ExpLayout>(&model.descriptor.target);
+    const uint64_t decodeCommands = model.streamedTable() && qwen4 && qwen4->mtpLayers ? 2 : 1;
     require(BackendInstrumentation::submittedCommands(backend) ==
-                beforeFirstDecode + 1,
-            "speculative verify and commit were not one Metal command");
+                beforeFirstDecode + decodeCommands,
+            "speculative verify and commit were not one Metal command (two with a streamed PLE table)");
     require(!decoded.outputTokens.empty(), "decode produced no tokens");
     require(states.metadata(0).lengths.targetTokens ==
                     128 + decoded.outputTokens.size() &&
