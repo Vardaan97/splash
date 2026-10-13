@@ -1095,6 +1095,8 @@ def run_protocol_extensions(port: int, model: str, vision: bool = True) -> None:
             "tools": [
                 {
                     "type": "function",
+                    # Only a strict tool's arguments are generated to its
+                    # schema, which holds them to {}.
                     "function": {
                         "name": "lookup",
                         "parameters": {
@@ -1102,6 +1104,7 @@ def run_protocol_extensions(port: int, model: str, vision: bool = True) -> None:
                             "properties": {},
                             "additionalProperties": False,
                         },
+                        "strict": True,
                     },
                 }
             ],
