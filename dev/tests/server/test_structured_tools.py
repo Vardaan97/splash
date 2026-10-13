@@ -245,6 +245,33 @@ class StructuredToolGrammarTest(unittest.TestCase):
                     )
                     self.assertEqual(accepted, text == declared or not strict)
 
+    def test_a_strict_tool_without_parameters_takes_only_empty_arguments(self):
+        # smoke_real's lookup beside a response schema: a closed object that
+        # declares no property is {} alone, which a strict tool's grammar
+        # holds it to; a tool that is not strict takes any arguments, such as
+        # the {"{}": null} a sampled call wrote.
+        parameters = {"type": "object", "properties": {}, "additionalProperties": False}
+        empty = "<tool_call>\n<function=lookup>\n</function>\n</tool_call>"
+
+        def call(name, value):
+            return (
+                f"<tool_call>\n<function=lookup>\n<parameter={name}>\n{value}\n"
+                "</parameter>\n</function>\n</tool_call>"
+            )
+
+        for strict in (False, True):
+            tool = {"name": "lookup", "parameters": parameters, "strict": strict}
+            settings = {
+                "choice": "required",
+                "parallel": False,
+                "tools": [{"type": "function", "function": tool}],
+            }
+            with self.subTest(strict=strict):
+                self.assert_complete(empty, **settings)
+            for text in (call("{}", "null"), call("{}", ""), call("answer", "42")):
+                with self.subTest(strict=strict, text=text):
+                    self.assertEqual(self.accepts(text, **settings), not strict)
+
     def test_parameters_of_a_strict_tool_come_in_schema_order(self):
         # A parameter left out cannot come later.
         tools = strict_tools(
