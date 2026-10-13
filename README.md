@@ -72,13 +72,19 @@ Qwen3.8-Flash-Next, its MTP head) selected automatically:
 
 Qwen3.8-Flash-Next has no DFlash2 draft: it drafts with the MTP head Unsloth
 publishes beside the GGUF (`MTP/mtp-*-shared-Q8_0.gguf`), which the first run
-downloads with the model. MTP decoding is lossless and about twice as fast as
-decoding without it. The head drafts from a 32K-token draft vocabulary and each
-request's own context tokens, reading an eighth of the vocabulary projection per
-draft step; the verify reads it all, so outputs are those of drafting from every
-token (`SPLASH_MTP_DRAFT_VOCAB=0` drafts from every token). `SPLASH_MTP=0` turns
-MTP off and `SPLASH_MTP_DRAFTS=1`–`7`
-sets the proposals per step (default 3). Vision runs from the repository's
+downloads with the model. Greedy MTP decoding is target-controlled; sampled
+decoding preserves the target distribution. Within a build, a lone seeded
+request repeats with the same cached prefixes and configuration. Its stream
+need not match the base build; batching or different cached prefixes can also
+change it. `SPLASH_MTP=0` turns MTP off.
+Adaptive depth defaults to a cap of seven proposals; `SPLASH_MTP_DRAFTS=1`–`7`
+sets the cap. `SPLASH_MTP_ADAPTIVE=0` fixes the depth (default three).
+By default, greedy and sampled batches draft from the vocabulary plus each
+request's context, falling back to the whole head when coverage is poor.
+`SPLASH_MTP_DRAFT_VOCAB=0` uses the whole head. Adaptive batches use the
+common acceptance-threshold depth, including constrained sampling. Head and
+threshold decisions use token history rather than timings. Fixed mode keeps
+its configured depth. Vision runs from the repository's
 `mmproj-BF16.gguf`. `UD-Q4_K_XL` needs about 118 GB of Metal memory; its SSD cache
 (`--max-cache-disk`) keeps GDN states but not KV pages.
 
