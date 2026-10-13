@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <span>
 #include <vector>
 
 #include "model/GgufFile.hpp"
@@ -31,11 +32,13 @@ struct PleStreaming final {
 
 class GgufTargetLoader final {
 public:
-  // Plans every image from the GGUF's metadata once. With streaming and a
-  // PLE table, ple() is refused and openPleStore() reads the table instead.
+  // Plans every image from the GGUF's metadata once; with `draftTokens`,
+  // also a qwen4exp MTP head's draft head of them (gguf::planDraftHeadImage).
+  // With streaming and a PLE table, ple() is refused and openPleStore() reads
+  // the table instead.
   GgufTargetLoader(metal::MetalBackend &backend, WeightImages &images,
                    const std::vector<std::filesystem::path> &paths, const QwenTargetDimensions &geometry,
-                   PleStreaming streaming = {});
+                   std::span<const uint32_t> draftTokens = {}, PleStreaming streaming = {});
   GgufTargetLoader(const GgufTargetLoader &) = delete;
   GgufTargetLoader &operator=(const GgufTargetLoader &) = delete;
 
@@ -44,6 +47,8 @@ public:
   [[nodiscard]] WeightFile embedding();
   // A qwen4exp target's PLE n-gram table and its hash.
   [[nodiscard]] WeightFile ple();
+  // The draft head the loader was asked for.
+  [[nodiscard]] WeightFile draftHead();
   [[nodiscard]] const gguf::PleHash &pleHash() const noexcept { return planned_->pleHash; }
   // Whether the PLE table streams (PleStreaming), and then its rows' format,
   // its store, which reads the open file its metadata was parsed from, and
@@ -63,8 +68,9 @@ private:
     explicit Planned(const std::vector<std::filesystem::path> &paths);
     void checkUnchanged() const;
     std::deque<WeightSource> files; // split order; tensor rows point into them
-    std::vector<gguf::Image> images; // layers, head, embedding, then ple
+    std::vector<gguf::Image> images; // layers, head, embedding, then ple and the draft head
     uint32_t layers = 0;
+    std::optional<size_t> draftHead;
     gguf::PleHash pleHash;
     std::optional<gguf::StreamedRows> pleRows; // set when the table streams
     PleStreaming streaming;

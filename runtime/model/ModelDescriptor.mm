@@ -1,5 +1,6 @@
 #include "ModelDescriptor.hpp"
 #include "GgufImage.hpp"
+#include "Qwen4DraftVocabulary.hpp"
 #include "SafetensorsImage.hpp"
 #include "WeightStore.hpp"
 #include "metal/abi/DraftAttention.h"
@@ -775,6 +776,10 @@ ModelDescriptor inspectModelRoot(const std::filesystem::path &root) {
     const char *mtpSetting = std::getenv("SPLASH_MTP");
     const bool mtp = std::filesystem::exists(root / "mtp") && !(mtpSetting && std::string_view(mtpSetting) == "0");
     ModelDescriptor result = describeSourceModel(std::move(name), targetFormat, visionFormat, config, draft, mtp);
+    // The MTP head drafts from Qwen3.8's draft vocabulary unless
+    // SPLASH_MTP_DRAFT_VOCAB=0 (Qwen4DraftVocabulary.hpp).
+    if (auto *qwen4 = std::get_if<Qwen4ExpLayout>(&result.target); qwen4 && qwen4->mtpLayers)
+      qwen4->mtpDraftTokens = qwen4DraftTokensFor(qwen4->vocabularySize);
     if (result.hasDraft() != draftDirectory)
       throw std::invalid_argument(result.hasDraft()
                                       ? "the model's root holds no draft/ for its DFlash2 draft"

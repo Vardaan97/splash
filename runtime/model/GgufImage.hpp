@@ -8,6 +8,7 @@
 // experts * N rows.
 
 #include <cstdint>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -163,6 +164,8 @@ public:
   // sources the caller adds before repack() takes it.
   [[nodiscard]] Repack planes(uint32_t format, uint64_t rows, uint64_t columns, const std::string &name);
   void repack(Repack repack);
+  // `bytes` as they are, in a section of their own.
+  void fill(std::vector<uint8_t> bytes);
   [[nodiscard]] Image finish();
 
 private:
@@ -189,6 +192,13 @@ void requireMetadata(const GgufMetadata &metadata, const QwenTargetDimensions &g
 // nextn tensors: eh_proj, enorm, hnorm and the head's mix. The geometry is
 // the target's; the MTP file has no PLE.
 [[nodiscard]] Image planMtpImage(const GgufFile &file, const QwenTargetDimensions &geometry);
+
+// The draft head of an MTP head that drafts from a draft vocabulary
+// (draft-head.bin, Qwen4ExpLayout::mtpDraftTokens): the rows of the target's
+// output.weight of `tokens` (ascending), repacked as the head's are, padded
+// to whole plane tiles, then the tokens (uint32 each).
+[[nodiscard]] Image planDraftHeadImage(const GgufFile &file, const QwenTargetDimensions &geometry,
+                                       std::span<const uint32_t> tokens);
 
 // The hash of a qwen4exp target's PLE n-gram embedding (llama.cpp
 // qwen4exp.cpp llm_graph_input_qwen4exp_ple): per n-gram position the

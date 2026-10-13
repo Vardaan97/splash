@@ -1,5 +1,6 @@
 #include "metal/abi/KernelABI.h"
 #include "metal/abi/Qwen4.h"
+#include "metal/abi/QuantFormat.h"
 #include "metal/kernels/common/gguf_sgmatrix.h"
 
 #include <metal_stdlib>
@@ -578,18 +579,15 @@ kernel void qwen4_mtp_widen(device const bfloat *projected [[buffer(0)]],
   streams[index] = float(projected[(ulong(s) * p.rows + row) * p.hidden + d]);
 }
 
-// One threadgroup per lane: the argmax of the lane's logits row p.row.
-kernel void qwen4_mtp_argmax(device const float *logits [[buffer(0)]],
-                             device uint *proposals [[buffer(1)]],
-                             device uint *candidates [[buffer(2)]],
-                             constant Qwen4MtpParams &p [[buffer(3)]],
-                             uint lane_index [[threadgroup_position_in_grid]],
-                             uint tid [[thread_index_in_threadgroup]],
-                             uint threads [[threads_per_threadgroup]],
-                             uint lane [[thread_index_in_simdgroup]],
-                             uint sg [[simdgroup_index_in_threadgroup]]) {
-  threadgroup float best_values[32];
-  threadgroup uint best_ids[32];
+// One threadgroup per lane: the argmax of the lane's logits row p.row, over
+// p.vocabulary logits: the tokens themselves or, Mapped, the logits of a
+// draft vocabulary's tokens, ascending, of which `tokens` names each. Ties
+// go toward the lower index, so toward the lower token either way.
+template <bool Mapped>
+inline void qwen4_mtp_argmax_row(device const float *logits, device uint *proposals, device uint *candidates,
+                                 device const uint *tokens, constant Qwen4MtpParams &p, uint lane_index, uint tid,
+                                 uint threads, uint lane, uint sg, threadgroup float *best_values,
+                                 threadgroup uint *best_ids) {
   device const float *x = logits + (ulong(lane_index) * p.lane_rows + p.row) * p.vocabulary;
   float best = -INFINITY;
   uint id = 0xffffffffu;
@@ -621,11 +619,140 @@ kernel void qwen4_mtp_argmax(device const float *logits [[buffer(0)]],
       best = best_values[g];
       id = best_ids[g];
     }
+  // No finite logit drafts token 0, as without a draft vocabulary.
   if (id >= p.vocabulary) id = 0;
+  else if (Mapped) id = tokens[id];
   const uint end = p.last ? p.proposals : p.row + 1;
   for (uint slot = p.row; slot < end; ++slot) {
     proposals[lane_index * p.proposals + slot] = id;
     candidates[(lane_index * p.proposals + slot) * p.candidates] = id;
+  }
+}
+
+kernel void qwen4_mtp_argmax(device const float *logits [[buffer(0)]],
+                             device uint *proposals [[buffer(1)]],
+                             device uint *candidates [[buffer(2)]],
+                             constant Qwen4MtpParams &p [[buffer(3)]],
+                             uint lane_index [[threadgroup_position_in_grid]],
+                             uint tid [[thread_index_in_threadgroup]],
+                             uint threads [[threads_per_threadgroup]],
+                             uint lane [[thread_index_in_simdgroup]],
+                             uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float best_values[32];
+  threadgroup uint best_ids[32];
+  qwen4_mtp_argmax_row<false>(logits, proposals, candidates, nullptr, p, lane_index, tid, threads, lane, sg,
+                              best_values, best_ids);
+}
+
+kernel void qwen4_mtp_argmax_mapped(device const float *logits [[buffer(0)]],
+                                    device uint *proposals [[buffer(1)]],
+                                    device uint *candidates [[buffer(2)]],
+                                    device const uint *tokens [[buffer(3)]],
+                                    constant Qwen4MtpParams &p [[buffer(4)]],
+                                    uint lane_index [[threadgroup_position_in_grid]],
+                                    uint tid [[thread_index_in_threadgroup]],
+                                    uint threads [[threads_per_threadgroup]],
+                                    uint lane [[thread_index_in_simdgroup]],
+                                    uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float best_values[32];
+  threadgroup uint best_ids[32];
+  qwen4_mtp_argmax_row<true>(logits, proposals, candidates, tokens, p, lane_index, tid, threads, lane, sg,
+                             best_values, best_ids);
+}
+
+// Takes (value, t) as the best so far when it is larger, or as large with a
+// lower token.
+inline void qwen4_consider(thread float &best, thread uint &token, float value, uint t) {
+  if (value > best || (value == best && t < token)) {
+    best = value;
+    token = t;
+  }
+}
+
+// The byte offset of unit `unit` of `row` in planes [rows / T][units][T][bytes].
+inline ulong qwen4_plane_offset(uint row, uint units, uint unit, uint bytes) {
+  return ((ulong(row / QUANT_TILE_ROWS) * units + unit) * QUANT_TILE_ROWS + row % QUANT_TILE_ROWS) * bytes;
+}
+
+// One threadgroup per lane: the argmax of the lane's row p.row over the
+// draft vocabulary's logits (`tokens` naming each) and the lane's context
+// rows' logits (Qwen4MtpContext), ties toward the lower token, as its
+// proposal p.row (and, p.last, every later one) and its first candidate.
+kernel void qwen4_mtp_argmax_context(device const float *logits [[buffer(0)]],
+                                     device uint *proposals [[buffer(1)]],
+                                     device uint *candidates [[buffer(2)]],
+                                     device const uint *tokens [[buffer(3)]],
+                                     device const float *context_logits [[buffer(4)]],
+                                     device const uint *context_tokens [[buffer(5)]],
+                                     device const Qwen4MtpContextLane *lanes [[buffer(6)]],
+                                     constant Qwen4MtpParams &p [[buffer(7)]],
+                                     constant Qwen4MtpContext &c [[buffer(8)]],
+                                     uint lane_index [[threadgroup_position_in_grid]],
+                                     uint tid [[thread_index_in_threadgroup]],
+                                     uint threads [[threads_per_threadgroup]],
+                                     uint lane [[thread_index_in_simdgroup]],
+                                     uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float best_values[32];
+  threadgroup uint best_tokens[32];
+  float best = -INFINITY;
+  uint token = 0xffffffffu;
+  device const float *x = logits + (ulong(lane_index) * p.lane_rows + p.row) * p.vocabulary;
+  for (uint v = tid; v < p.vocabulary; v += threads) qwen4_consider(best, token, x[v], tokens[v]);
+  const Qwen4MtpContextLane own = lanes[lane_index];
+  const uint count = min(own.count, c.capacity);
+  device const float *y = context_logits + ulong(lane_index) * c.logits_slot + ulong(p.row) * c.capacity;
+  device const uint *named = context_tokens + ulong(own.state_lane) * c.capacity;
+  for (uint v = tid; v < count; v += threads) qwen4_consider(best, token, y[v], named[v]);
+  for (uint offset = 16; offset > 0; offset >>= 1) {
+    const float other = simd_shuffle_down(best, offset);
+    const uint other_token = simd_shuffle_down(token, offset);
+    qwen4_consider(best, token, other, other_token);
+  }
+  if (lane == 0) {
+    best_values[sg] = best;
+    best_tokens[sg] = token;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid != 0) return;
+  const uint groups = (threads + 31) / 32;
+  for (uint g = 1; g < groups; ++g) qwen4_consider(best, token, best_values[g], best_tokens[g]);
+  // No finite logit drafts token 0, as without a draft vocabulary.
+  if (token == 0xffffffffu) token = 0;
+  const uint end = p.last ? p.proposals : p.row + 1;
+  for (uint slot = p.row; slot < end; ++slot) {
+    proposals[lane_index * p.proposals + slot] = token;
+    candidates[(lane_index * p.proposals + slot) * p.candidates] = token;
+  }
+}
+
+// One thread per (pair, group): copies the group's plane bytes of each
+// pair's source row to its destination row, and its meta unit when the group
+// starts one. Planes are [rows / T][units][T][unit bytes].
+kernel void qwen4_copy_head_rows(device const uchar *source0 [[buffer(0)]],
+                                 device const uchar *source1 [[buffer(1)]],
+                                 device const uchar *source_meta [[buffer(2)]],
+                                 device uchar *target0 [[buffer(3)]],
+                                 device uchar *target1 [[buffer(4)]],
+                                 device uchar *target_meta [[buffer(5)]],
+                                 device const uint2 *pairs [[buffer(6)]],
+                                 constant Qwen4HeadRowsParams &p [[buffer(7)]],
+                                 uint2 index [[thread_position_in_grid]]) {
+  const uint pair = index.x, group = index.y;
+  if (pair >= p.count || group >= p.groups) return;
+  const uint2 rows = pairs[pair];
+  const ulong from0 = qwen4_plane_offset(rows.x, p.groups, group, p.plane0_bytes);
+  const ulong to0 = qwen4_plane_offset(rows.y, p.groups, group, p.plane0_bytes);
+  for (uint b = 0; b < p.plane0_bytes; ++b) target0[to0 + b] = source0[from0 + b];
+  if (p.plane1_bytes) {
+    const ulong from1 = qwen4_plane_offset(rows.x, p.groups, group, p.plane1_bytes);
+    const ulong to1 = qwen4_plane_offset(rows.y, p.groups, group, p.plane1_bytes);
+    for (uint b = 0; b < p.plane1_bytes; ++b) target1[to1 + b] = source1[from1 + b];
+  }
+  if (group % p.meta_groups == 0) {
+    const uint units = p.groups / p.meta_groups, unit = group / p.meta_groups;
+    const ulong from = qwen4_plane_offset(rows.x, units, unit, p.meta_bytes);
+    const ulong to = qwen4_plane_offset(rows.y, units, unit, p.meta_bytes);
+    for (uint b = 0; b < p.meta_bytes; ++b) target_meta[to + b] = source_meta[from + b];
   }
 }
 

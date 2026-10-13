@@ -1,4 +1,6 @@
 #include "model/RuntimeArenas.hpp"
+#include "model/GgufImageLayout.hpp"
+#include "model/Qwen4DraftVocabulary.hpp"
 
 #include "ops/DraftSelector.hpp"
 #include "ops/Sampling.hpp"
@@ -224,6 +226,19 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   // from it (QwenTarget::addMtpDraft).
   if (geometry.target.qwen4() && geometry.target.mtpLayers)
     put(DecodeTensor::MtpHistory, bytesFor<float>(r * geometry.target.streamWidth()));
+  if (const uint32_t format = geometry.target.mtpDraftContextFormat; format < GGUF_FMT_COUNT) {
+    const uint32_t rows = kQwen4DraftContextTokens, hidden = geometry.target.hiddenSize;
+    const GgufPlaneBytes planes = ggufPlaneBytes(kQuantFormats[format], rows, hidden);
+    put(DecodeTensor::DraftContextPlane0, planes.plane0);
+    put(DecodeTensor::DraftContextPlane1, planes.plane1);
+    put(DecodeTensor::DraftContextMeta, planes.meta);
+    put(DecodeTensor::DraftContextTokens, bytesFor<uint32_t>(rows));
+    put(DecodeTensor::DraftContextCopies, bytesFor<uint32_t>(2ull * rows));
+    // A lane's projection stores its plan's rows of logits.
+    put(DecodeTensor::DraftContextLogits,
+        bytesFor<float>(uint64_t{operators.linear().decodeStorageRows(kDecodeRows, {rows, hidden})} * rows));
+    put(DecodeTensor::DraftContextInfo, bytesFor<uint32_t>(4));
+  }
   put(DecodeTensor::Hidden0,
       bytesFor<uint16_t>(r * geometry.target.hiddenSize));
   put(DecodeTensor::Hidden1,

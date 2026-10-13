@@ -48,6 +48,10 @@ struct Qwen4ExpLayout final : QwenHybridLayout<1> {
   // The MTP head's full-attention blocks (0 or 1); its KV is the last
   // attention layer of the KV pages.
   uint32_t mtpLayers = 0;
+  // The tokens the MTP head drafts from (model/Qwen4DraftVocabulary.hpp): 0
+  // for the whole vocabulary, else its draft vocabulary's, whose rows of the
+  // vocabulary projection it reads alone. The verify reads them all.
+  uint32_t mtpDraftTokens = 0;
 
   constexpr Qwen4ExpLayout()
       : QwenHybridLayout{{.maximumContextTokens = 262'144,
@@ -171,12 +175,23 @@ struct Qwen4ExpLayerWeights final {
 // ([e ; h_s] -> hidden); then one full-attention block of the trunk's form,
 // whose output streams feed the next draft step, and the head's mix, whose
 // output the trunk's vocabulary projection reads.
+// The vocabulary projection's rows of the draft vocabulary's tokens
+// (draft-head.bin): [mtpDraftTokens, hidden], and the tokens, ascending
+// (uint32 each).
+struct Qwen4DraftHead final {
+  ops::Projection logits;
+  metal::MetalBuffer tokens;
+};
+
 struct Qwen4MtpWeights final {
   Qwen4ExpLayerWeights block;
   ops::Projection embedHidden;
   ops::NormWeights embedNorm;
   ops::NormWeights hiddenNorm;
   Qwen4HyperWeights head;
+  // With a draft vocabulary (Qwen4ExpLayout::mtpDraftTokens), the head the
+  // draft steps project with in place of the target's.
+  std::optional<Qwen4DraftHead> draftHead;
 };
 
 struct Qwen4ExpWeights final : QwenTargetWeightsBase {
