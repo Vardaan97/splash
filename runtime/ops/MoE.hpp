@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <span>
 
 namespace splash::ops {
 
@@ -245,11 +246,13 @@ struct MoE final {
   [[nodiscard]] static MoePlan decodePlan(MoeShape shape, uint32_t lanes, MoeConfig config);
   // With `firstRow`, a decode plan's lanes route their rows before it to no
   // expert (MoeGroupParams::first_row); those rows' outputs are not theirs.
-  // With `lastRow`, the lanes' rows from it on route to no expert either
-  // (MoeGroupParams::last_row).
+  // With `lastRows`, lane l's rows from lastRows[l] (firstRow to
+  // SPLASH_TARGET_VERIFY_ROWS) on route to no expert either
+  // (MoeGroupParams::last_rows); lanes past its end route every row from
+  // firstRow on.
   static void add(metal::CommandGraph &graph, const MoeBuffers &buffers,
                   const BlockMoeWeights &weights, const MoePlan &plan, uint32_t firstRow = 0,
-                  uint32_t lastRow = 0);
+                  std::span<const uint32_t> lastRows = {});
 };
 
 } // namespace splash::ops

@@ -1,6 +1,8 @@
 #include "model/Runtime.hpp"
 #include "AwakeClock.hpp"
+#include "StderrLine.hpp"
 #include "model/QwenState.hpp"
+#include "model/MtpDepthPlanner.hpp"
 #include "model/Qwen4DraftVocabulary.hpp"
 #include "model/Qwen4DraftContext.hpp"
 #include "model/Qwen4Exp.hpp"
@@ -32,6 +34,7 @@
 #include <list>
 #include <numeric>
 #include <optional>
+#include <sstream>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -309,13 +312,20 @@ struct Runtime::Impl {
     // Qwen3.8-Flash-Next hashes its PLE n-grams from it, and a target
     // without a draft proposes its continuations from it.
     std::vector<uint32_t> tokens;
-    // The MTP head's proposals (mtpStepsFor): the steps the cycle in flight
-    // drafts, and decayed counts of the proposals the target accepted and
-    // of those it judged (a cycle judges its proposals up to the first it
-    // rejects). The prior is a rate of 0.8 worth five proposals.
+    // The MTP head's proposals (planMtpDepths): whether the cycle in flight
+    // was planned and how many proposals it drafts for this lane, and
+    // decayed counts of the proposals the target accepted and of those it
+    // judged (a cycle judges its proposals up to the first it rejects), over
+    // all positions (mtpStepsFor) and per position (MtpAcceptance). The prior
+    // is a rate of 0.8 worth five proposals.
+    bool mtpPlanned = false;
     uint32_t mtpDrafted = 0;
     float mtpAccepted = 4.0F;
     float mtpJudged = 5.0F;
+    MtpAcceptance mtpAcceptance;
+    // Cycles in a row it drafted nothing: every kMtpProbeCycles-th drafts
+    // one proposal, so that its acceptance keeps being measured.
+    uint32_t mtpIdleCycles = 0;
     Qwen4DraftContext draftContext;
   };
 
@@ -328,6 +338,8 @@ struct Runtime::Impl {
     // The draft proposals the lane's thinking end replaced, which its
     // speculation counts leave out.
     uint32_t endDrafts = 0;
+    // The proposals its cycle drafted: the MTP head's, or every one.
+    uint32_t drafted = kDraftProposalTokens;
     // Why the lane's selection is unusable (invalidSelection), found before
     // any lane commits.
     std::string failure;
@@ -424,28 +436,128 @@ struct Runtime::Impl {
     return std::max(steps, std::min(2U, mtpDraftSteps));
   }
   // The rows of each lane a verify after the MTP head's draft routes to
-  // Qwen3.8-Flash-Next's experts: the anchor and the drafted proposals. The
-  // rows past them only repeat the last proposal, so they route to no expert
-  // (QwenTarget::addVerify liveRows) and no token is kept from them. 0 when
-  // every row routes: a lane without drafted proposals, or a full verify.
-  uint32_t verifyLiveRows(std::span<Request *const> entries) const {
-    if (!targetModel.qwen4()) return 0;
-    uint32_t rows = 0;
+  // Qwen3.8-Flash-Next's experts: the anchor and the lane's drafted
+  // proposals. The rows past them only repeat the last proposal, so they
+  // route to no expert (QwenTarget::addVerify liveRows) and no token is kept
+  // from them. None when every row routes: a lane whose cycle was not
+  // planned (a full verify), or every lane drafting seven.
+  std::vector<uint32_t> verifyLiveRows(std::span<Request *const> entries) const {
+    if (!targetModel.qwen4()) return {};
+    std::vector<uint32_t> rows;
+    bool trimmed = false;
     for (const Request *entry : entries) {
-      if (!entry->mtpDrafted) return 0;
-      rows = std::max(rows, entry->mtpDrafted + 1);
+      if (!entry->mtpPlanned) return {};
+      rows.push_back(std::min(entry->mtpDrafted + 1, kDecodeRows));
+      trimmed = trimmed || rows.back() < kDecodeRows;
     }
-    return rows < kDecodeRows ? rows : 0;
+    return trimmed ? rows : std::vector<uint32_t>{};
   }
   // The outcome of the proposals a lane's cycle drafted: `accepted`
   // proposals in a row, counted past the drafted ones when a repeat of the
   // last was accepted too.
   static void countMtpOutcome(Request &entry, uint32_t accepted) {
+    if (!entry.mtpPlanned) return;
+    entry.mtpPlanned = false;
     if (!entry.mtpDrafted) return;
     const uint32_t kept = std::min(accepted, entry.mtpDrafted);
     entry.mtpAccepted = kMtpDecay * entry.mtpAccepted + static_cast<float>(kept);
     entry.mtpJudged = kMtpDecay * entry.mtpJudged + static_cast<float>(kept < entry.mtpDrafted ? kept + 1 : kept);
+    entry.mtpAcceptance.record(entry.mtpDrafted, kept);
     entry.mtpDrafted = 0;
+  }
+  // How the MTP head's depth is chosen (SPLASH_MTP_DEPTH): by the cost model
+  // (planMtpDepths, the default), or, "rule", every lane as deep as the
+  // deepest lane's mtpStepsFor. SPLASH_MTP_ADAPTIVE=0 fixes it at
+  // SPLASH_MTP_DRAFTS either way.
+  bool mtpCostDepth = mtpCostDepthFromEnvironment();
+  static bool mtpCostDepthFromEnvironment() {
+    const char *value = std::getenv("SPLASH_MTP_DEPTH");
+    return !value || std::string_view(value) != "rule";
+  }
+  // Cycles a lane drafts nothing before it drafts one proposal to measure
+  // its acceptance again; and every kMtpExploreCycles-th planned cycle of a
+  // lone greedy lane drafts one more or one fewer than its plan, so the
+  // measured cost of a step stays measured where the plan does not move.
+  static constexpr uint32_t kMtpProbeCycles = 8;
+  static constexpr uint64_t kMtpExploreCycles = 32;
+  MtpCostModel mtpCosts;
+  uint64_t mtpPlannedCycles = 0;
+  // The cycle in flight, for its cost (finalizeDecode): its shape and the
+  // host's seconds encoding it.
+  std::optional<MtpCostModel::Cycle> mtpCycle;
+  double mtpEncodeSeconds = 0.0;
+  // SPLASH_MTP_LOG=1 writes a line every kMtpLogCycles MTP cycles: the
+  // batch steps drafted, how many cycles drafted from the draft vocabulary,
+  // and each batch width's fitted costs.
+  static constexpr uint64_t kMtpLogCycles = 256;
+  bool mtpLog = [] {
+    const char *value = std::getenv("SPLASH_MTP_LOG");
+    return value && std::string_view(value) == "1";
+  }();
+  std::array<uint64_t, kMtpPlannerPositions + 1> mtpStepCounts{};
+  uint64_t mtpVocabularyCycles = 0;
+  void logMtpPlans(const MtpCostModel::Cycle &cycle) {
+    ++mtpStepCounts[std::min(cycle.steps, kMtpPlannerPositions)];
+    mtpVocabularyCycles += cycle.draftVocabulary;
+    uint64_t cycles = 0;
+    for (const uint64_t count : mtpStepCounts) cycles += count;
+    if (cycles % kMtpLogCycles) return;
+    std::ostringstream text;
+    text << "MTP plans: " << cycles << " cycles, steps 0-7:";
+    for (const uint64_t count : mtpStepCounts) text << ' ' << count;
+    text << ", draft vocabulary " << mtpVocabularyCycles;
+    for (uint32_t lanes = 1; lanes <= kMtpPlannerLanes; ++lanes) {
+      if (!mtpCosts.observations(lanes)) continue;
+      const auto theta = mtpCosts.coefficients(lanes, true);
+      text << "; B" << lanes << " ms base " << theta[0] * 1e3 << " step " << theta[1] * 1e3 << " draft-vocabulary step "
+           << theta[2] * 1e3 << " proposal " << theta[3] * 1e3;
+    }
+    logLine(text.str());
+  }
+  // Plans the MTP head's depth of each lane of a decode batch (mtpPlanned,
+  // mtpDrafted) and returns the steps the batch drafts.
+  uint32_t planMtpBatch(std::span<Request *const> entries) {
+    const uint32_t lanes = static_cast<uint32_t>(entries.size());
+    std::array<uint32_t, kLaneCount> depths{};
+    if (targetModel.hasMtpDraftVocabulary())
+      for (Request *entry : entries) entry->draftContext.scan(entry->tokens, geometry.target.vocabularySize);
+    const bool sampled = std::ranges::any_of(entries, [](const Request *entry) { return samplingEnabled(*entry); });
+    const bool draftVocabulary = useDraftVocabulary(entries);
+    if (!mtpAdaptive) {
+      depths.fill(mtpDraftSteps);
+    } else if (sampled || !mtpCostDepth) {
+      uint32_t steps = 1;
+      for (const Request *entry : entries) steps = std::max(steps, mtpStepsFor(*entry));
+      depths.fill(steps);
+    } else {
+      std::array<std::array<double, kMtpPlannerPositions + 1>, kLaneCount> expected{};
+      for (uint32_t lane = 0; lane < lanes; ++lane) expected[lane] = entries[lane]->mtpAcceptance.expectedTokens();
+      // Sampled batches retain the upstream common-depth policy above.
+      const bool measured = true;
+      const MtpDepthPlan plan =
+          planMtpDepths(std::span(expected).first(lanes), mtpCosts, measured, draftVocabulary, mtpDraftSteps);
+      for (uint32_t lane = 0; lane < lanes; ++lane) {
+        Request &entry = *entries[lane];
+        uint32_t depth = plan.depths[lane];
+        if (!depth && ++entry.mtpIdleCycles >= kMtpProbeCycles) depth = 1;
+        if (depth) entry.mtpIdleCycles = 0;
+        depths[lane] = depth;
+      }
+      ++mtpPlannedCycles;
+      if (lanes == 1 && measured && mtpPlannedCycles % kMtpExploreCycles == 0) {
+        const bool deeper = (mtpPlannedCycles / kMtpExploreCycles) % 2 == 1;
+        depths[0] = deeper ? std::min(depths[0] + 1, mtpDraftSteps) : (depths[0] ? depths[0] - 1 : 1);
+      }
+    }
+    uint32_t steps = 0, laneSteps = 0;
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+      entries[lane]->mtpPlanned = true;
+      entries[lane]->mtpDrafted = depths[lane];
+      steps = std::max(steps, depths[lane]);
+      laneSteps += depths[lane];
+    }
+    mtpCycle = MtpCostModel::Cycle{lanes, steps, laneSteps, draftVocabulary && steps};
+    return steps;
   }
   Qwen4DraftContextCache<kLaneCount> draftContextCache;
   // Binds each lane's context rows (copying in those it lacks) to a draft
@@ -1896,14 +2008,19 @@ struct Runtime::Impl {
       // writes the tokens on the GPU (QwenTarget::addMtpDraft); otherwise
       // the CPU looks them up.
       const bool mtp = targetModel.hasMtp();
-      const auto proposals = lookupProposals(entry, *entry.pendingToken);
+      // Under MTP the mask token until the head drafts: a lane that drafts
+      // nothing proposes it, which the target keeps no more than any token
+      // its distribution gives no weight.
+      std::array<uint32_t, kDraftProposalTokens> proposals;
+      if (mtp) proposals.fill(geometry.target.maskToken);
+      else proposals = lookupProposals(entry, *entry.pendingToken);
       std::copy(proposals.begin(), proposals.end(), rowTokens.begin() + 1);
       auto *proposed = contents<uint32_t>(decodeArena->get(lane, DecodeTensor::ProposedTokens), "proposals");
       auto *candidates = contents<uint32_t>(decodeArena->get(lane, DecodeTensor::Candidates), "candidates");
       auto *probabilities =
           contents<float>(decodeArena->get(lane, DecodeTensor::ProposalProbs), "proposal probabilities");
       for (uint32_t i = 0; i < kDraftProposalTokens; ++i) {
-        if (!mtp) proposed[i] = proposals[i];
+        proposed[i] = proposals[i];
         constexpr uint32_t kCandidates = 16;
         for (uint32_t c = 0; c < kCandidates; ++c) {
           candidates[i * kCandidates + c] = c ? geometry.target.vocabularySize : proposals[i];
@@ -2136,24 +2253,23 @@ struct Runtime::Impl {
       buffers.candidates = d(DecodeTensor::Candidates);
       buffers.proposalsPerLane = kDraftProposalTokens;
       buffers.candidatesPerProposal = 16;
-      // The batch drafts as deep as its deepest lane wants, from the draft
-      // vocabulary while every lane does.
-      uint32_t steps = 1;
-      if (targetModel.hasMtpDraftVocabulary())
-        for (uint32_t lane = 0; lane < lanes; ++lane)
-          entries[lane]->draftContext.scan(entries[lane]->tokens, geometry.target.vocabularySize);
+      // The batch drafts as deep as its deepest lane (planMtpBatch), each
+      // lane its own depth, from the draft vocabulary while every lane does.
+      std::array<uint32_t, kLaneCount> depths{};
+      uint32_t steps = 0;
       const bool draftVocabulary = useDraftVocabulary(entries.first(lanes));
       for (uint32_t lane = 0; lane < lanes; ++lane) {
-        steps = std::max(steps, mtpStepsFor(*entries[lane]));
+        depths[lane] = entries[lane]->mtpDrafted;
+        steps = std::max(steps, depths[lane]);
       }
-      for (uint32_t lane = 0; lane < lanes; ++lane) entries[lane]->mtpDrafted = steps;
       if (draftVocabulary && targetModel.hasMtpDraftVocabulary()) bindDraftContext(buffers, entries.first(lanes));
       targetModel.addMtpDraft(graph, std::move(buffers), kvPages.layers(), std::span(chunks).first(lanes), lanes,
-                              steps, draftVocabulary);
+                              steps, draftVocabulary, std::span(depths).first(lanes));
       return;
     }
+    const std::vector<uint32_t> liveRows = verifyLiveRows(entries.first(lanes));
     targetModel.addVerify(graph, std::move(buffers), kvPages.layers(),
-                          std::span(chunks).first(lanes), lanes, verifyLiveRows(entries.first(lanes)));
+                          std::span(chunks).first(lanes), lanes, liveRows);
   }
 
   // The verify rows' tokens, their PLE rows (on the GPU when the MTP head
@@ -2320,6 +2436,12 @@ struct Runtime::Impl {
   std::vector<ModelStepResult> finalizeDecode(
       std::span<DecodeLaneResult> lanes, std::span<const ModelBatchItem> items,
       CommandTiming timing) {
+    // The MTP cycle's cost: its GPU time and the host's encoding of it.
+    if (mtpCycle) {
+      mtpCosts.observe(*mtpCycle, timing.gpuSeconds + mtpEncodeSeconds);
+      if (mtpLog) logMtpPlans(*mtpCycle);
+    }
+    mtpCycle.reset();
     for (uint32_t lane = 0; lane < items.size(); ++lane) {
       DecodeLaneResult &laneResult = lanes[lane];
       auto d = [&](DecodeTensor tensor) {
@@ -2391,7 +2513,7 @@ struct Runtime::Impl {
                          std::move(output),
                          false,
                          DecodeStage::Regular,
-                         kDraftProposalTokens - laneResult.endDrafts,
+                         laneResult.drafted - std::min(laneResult.drafted, laneResult.endDrafts),
                          accepted - std::min(accepted, laneResult.endDrafts)});
       ModelStepResult &result = results.back();
       if (entry.generatedTokens < entry.maxNewTokens)
@@ -3103,6 +3225,7 @@ std::unique_ptr<ModelBatchTicket>
 Runtime::decodeAsync(const BatchPlan &plan,
                      std::span<const ModelBatchItem> items,
                      std::function<void()> completion) {
+  const AwakeClock::time_point encodeStart = AwakeClock::now();
   validatePlan(plan, items, WorkKind::Decode);
   const bool constrained = plan.constrained;
   if (plan.decodeStage != DecodeStage::Regular) {
@@ -3182,16 +3305,18 @@ Runtime::decodeAsync(const BatchPlan &plan,
                                  {logicalPositions.data(), width});
   } else {
     if (impl_->targetModel.hasMtp()) {
-      impl_->encodeTargetVerifyBatchForward(commandGraph, entries, items, true);
-      if (const uint32_t liveRows = impl_->verifyLiveRows(entries)) {
-        for (uint32_t lane = 0; lane < width; ++lane) {
-          lanes[lane].maximumRetained = std::min(lanes[lane].maximumRetained, liveRows);
-          maximumRetained[lane] = lanes[lane].maximumRetained;
-        }
+      // A batch whose lanes all draft nothing runs the verify alone.
+      if (impl_->planMtpBatch(entries))
+        impl_->encodeTargetVerifyBatchForward(commandGraph, entries, items, true);
+      for (uint32_t lane = 0; lane < width; ++lane) {
+        lanes[lane].drafted = entries[lane]->mtpDrafted;
+        lanes[lane].maximumRetained = std::min(lanes[lane].maximumRetained, entries[lane]->mtpDrafted + 1);
+        maximumRetained[lane] = lanes[lane].maximumRetained;
       }
     }
     impl_->encodeThinkingDrafts(commandGraph, entries);
   }
+  impl_->mtpEncodeSeconds = std::chrono::duration<double>(AwakeClock::now() - encodeStart).count();
   // A streamed PLE table: the MTP head's proposals' rows are staged between
   // the draft's command and the verify's, the looked-up proposals' now.
   if (impl_->stagesDraftedPleRows()) {
@@ -3203,6 +3328,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
       impl_->encodeTargetVerifyBatchPolicy(target, entries);
       impl_->encodeBatchAcceptance(target, entries, {maximumRetained.data(), width});
       impl_->encodeTargetStateCommit(target, entries);
+      impl_->mtpEncodeSeconds = std::chrono::duration<double>(AwakeClock::now() - encodeStart).count();
       return std::make_unique<Impl::StagedVerifyTicket>(*impl_, std::move(lanes), items, commandGraph, target,
                                                         std::move(completion));
     }
@@ -3228,6 +3354,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
                  items = std::move(copiedItems)](CommandTiming timing) mutable {
     return impl->finalizeDecode(lanes, items, timing);
   };
+  impl_->mtpEncodeSeconds = std::chrono::duration<double>(AwakeClock::now() - encodeStart).count();
   CommandTicket command = impl_->backend.submitCommandAsync(
       commandGraph.dispatches(), std::move(completion));
   return std::make_unique<DeferredMetalTicket>(std::move(command),

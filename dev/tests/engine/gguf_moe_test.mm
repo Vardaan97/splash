@@ -763,21 +763,24 @@ std::vector<uint16_t> runPlan(MetalBackend &backend, const Model &m, Buffers &b,
 }
 
 // A decode plan's run whose lanes route their rows before `firstRow`, and
-// from `lastRow` on when it is set, to no expert (MoE::add firstRow, an MTP
-// draft step; lastRow, a verify's rows past the drafted proposals): the tiles
-// hold no route of such a row, each of their routed routes reads the row's
-// shared expert row, and every live row's output is `full`'s, bit for bit.
+// lane l's from lastRows[l] on (all lanes' rows to the end without
+// lastRows), to no expert (MoE::add firstRow, an MTP draft step; lastRows,
+// a verify's rows past each lane's drafted proposals, or a draft step's
+// lanes that draft no further): the tiles hold no route of such a row, each
+// of their routed routes reads the row's shared expert row, and every live
+// row's output is `full`'s, bit for bit.
 void checkLiveRows(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan &plan, uint32_t firstRow,
-                   uint32_t lastRow, const std::vector<uint16_t> &full, const std::string &label) {
+                   std::vector<uint32_t> lastRows, const std::vector<uint16_t> &full, const std::string &label) {
   const uint32_t rows = plan.rows(), tileRows = plan.tileRows();
+  lastRows.resize(std::min<size_t>(lastRows.size(), rows / SPLASH_TARGET_VERIFY_ROWS));
   const auto live = [&](uint32_t row) {
-    const uint32_t r = row % SPLASH_TARGET_VERIFY_ROWS;
-    return r >= firstRow && (!lastRow || r < lastRow);
+    const uint32_t r = row % SPLASH_TARGET_VERIFY_ROWS, lane = row / SPLASH_TARGET_VERIFY_ROWS;
+    return r >= firstRow && (lane >= lastRows.size() || r < lastRows[lane]);
   };
   allocate(backend, b, plan);
   std::memset(b.moe.output.contents(), 0, b.moe.output.sizeBytes());
   CommandGraph graph;
-  MoE::add(graph, b.moe, m.weights, plan, firstRow, lastRow);
+  MoE::add(graph, b.moe, m.weights, plan, firstRow, lastRows);
   static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
   const auto *routeRows = static_cast<const uint32_t *>(b.moe.scratch.routeRows.contents());
   const auto *groupedRoutes = static_cast<const uint32_t *>(b.moe.scratch.groupedRoutes.contents());
@@ -919,11 +922,17 @@ int moe(MetalBackend &backend) {
           // A row's result depends on its own routes only, not on the lanes it
           // is batched with (the tile rows of one expert are independent),
           // nor on the rows before or after it that route to no expert.
-          const std::pair<uint32_t, uint32_t> ranges[] = {{1, 0}, {4, 0}, {7, 0}, {0, 2}, {0, 5}, {1, 4}};
-          for (const auto &[firstRow, lastRow] : ranges)
-            checkLiveRows(backend, m, b, plan, firstRow, lastRow, rows,
-                          label + " rows " + std::to_string(firstRow) + ".." +
-                              std::to_string(lastRow ? lastRow : SPLASH_TARGET_VERIFY_ROWS));
+          // Every lane alike, then a bound per lane (a lane may route none).
+          const std::pair<uint32_t, std::vector<uint32_t>> ranges[] = {
+              {1, {}}, {4, {}}, {7, {}}, {0, {2, 2, 2, 2}}, {0, {5, 5, 5, 5}}, {1, {4, 4, 4, 4}},
+              {0, {1, 8, 3, 5}}, {2, {2, 8, 5, 3}}, {0, {1, 1, 1, 1}}, {3, {8, 3}}};
+          for (const auto &[firstRow, lastRows] : ranges) {
+            std::string bounds;
+            for (const uint32_t last : lastRows) bounds += (bounds.empty() ? "" : ",") + std::to_string(last);
+            checkLiveRows(backend, m, b, plan, firstRow, lastRows, rows,
+                          label + " rows from " + std::to_string(firstRow) + " to " +
+                              (bounds.empty() ? std::string("the end") : bounds));
+          }
           if (widest.empty()) widest = rows;
           else if (!std::equal(rows.begin(), rows.end(), widest.begin())) {
             printf("  %s: rows differ from the four-lane dispatch FAIL\n", label.c_str());

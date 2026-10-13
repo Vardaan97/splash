@@ -81,8 +81,10 @@ Adaptive depth defaults to a cap of seven proposals; `SPLASH_MTP_DRAFTS=1`–`7`
 sets the cap. `SPLASH_MTP_ADAPTIVE=0` fixes the depth (default three).
 By default, greedy and sampled batches draft from the vocabulary plus each
 request's context, falling back to the whole head when coverage is poor.
-`SPLASH_MTP_DRAFT_VOCAB=0` uses the whole head. Adaptive batches use the
-common acceptance-threshold depth, including constrained sampling. Head and
+`SPLASH_MTP_DRAFT_VOCAB=0` uses the whole head. Adaptive greedy-only batches
+use cost-aware per-lane depth; `SPLASH_MTP_DEPTH=rule` selects the threshold
+policy instead. Any batch containing a sampled lane uses the common
+acceptance-threshold depth, including constrained sampling. Its head and
 threshold decisions use token history rather than timings. Fixed mode keeps
 its configured depth. Vision runs from the repository's
 `mmproj-BF16.gguf`. `UD-Q4_K_XL` needs about 118 GB of Metal memory; its SSD cache

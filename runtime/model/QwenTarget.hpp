@@ -394,14 +394,15 @@ public:
       metal::CommandGraph &graph, QwenTargetPrefillBuffers buffers,
       std::span<const QwenTargetPrefillSequence> sequences, uint32_t rows,
       std::span<const SplashKvLayer> kvLayers, ops::AneFfn *aneFfn = nullptr) const;
-  // With `liveRows`, Qwen3.8-Flash-Next's verify routes each lane's rows from
-  // it on to no expert (ops::MoE::add lastRow): the rows past the proposals
-  // its MTP head drafted, which only repeat the last one.
+  // With `liveRows`, Qwen3.8-Flash-Next's verify routes lane l's rows from
+  // liveRows[l] (1 to targetVerifyRows) on to no expert (ops::MoE::add
+  // lastRows): the rows past the proposals its MTP head drafted, which only
+  // repeat the last one. Lanes past its end route every row.
   void addVerify(
       metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
       std::span<const SplashKvLayer> kvLayers,
       std::span<const kv::ChunkedPrefillParams> chunks,
-      uint32_t lanes, uint32_t liveRows = 0) const;
+      uint32_t lanes, std::span<const uint32_t> liveRows = {}) const;
   // The final norm and LM head over `lanes` lanes of targetVerifyRows rows,
   // as verify ends: one sweep of the vocabulary projection for every lane.
   void addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden,
@@ -425,10 +426,13 @@ public:
   // j writes proposal j - 1, the last one also every later proposal. The
   // verify then writes the head's KV at its rows (addVerify). With
   // `draftVocabulary` and a head that has one (hasMtpDraftVocabulary), each
-  // step drafts from the draft vocabulary's tokens alone.
+  // step drafts from the draft vocabulary's tokens alone. With `depths`,
+  // lane l drafts depths[l] (at most `steps`) proposals: its rows route to no
+  // expert at the steps after, whose proposals the verify does not keep.
   void addMtpDraft(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
                    std::span<const SplashKvLayer> kvLayers, std::span<const kv::ChunkedPrefillParams> chunks,
-                   uint32_t lanes, uint32_t steps, bool draftVocabulary = true) const;
+                   uint32_t lanes, uint32_t steps, bool draftVocabulary = true,
+                   std::span<const uint32_t> depths = {}) const;
   // Whether the MTP head drafts from a draft vocabulary when asked
   // (Qwen4ExpLayout::mtpDraftTokens).
   [[nodiscard]] bool hasMtpDraftVocabulary() const noexcept;

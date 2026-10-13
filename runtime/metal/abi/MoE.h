@@ -43,11 +43,13 @@ static_assert(sizeof(MoeTileDescriptor) == 8,
 // writes (MoeTileCount). With `in_place` (ops::MoePlan::rowsInPlace: a plan
 // whose rows fill one 8-row tile on the staged tile), every expert's tile is
 // the plan's rows in place, and the gate/up pass reads them without a gather.
-// With `first_row`, the rows of each `lane_rows` rows before it route to no
-// expert: their routed outputs read their shared expert's row (an MTP draft
-// step's rows that only repeat a step before, QwenTarget::addMtpDraft). With
-// `last_row`, those from it on route to no expert either (a verify's rows
-// past the proposals the MTP head drafted, QwenTarget::addVerify liveRows).
+// With `lane_rows` set, the rows of each lane's `lane_rows` rows before
+// `first_row` route to no expert: their routed outputs read their shared
+// expert's row (an MTP draft step's rows that only repeat a step before,
+// QwenTarget::addMtpDraft). Nor do lane l's rows from byte l of `last_rows`
+// on (lane_rows: none): a verify's rows past the proposals the lane's MTP
+// head drafted (QwenTarget::addVerify liveRows), or every row of a lane that
+// drafts no further (addMtpDraft).
 struct MoeGroupParams {
   uint32_t rows;
   uint32_t top_k;
@@ -58,7 +60,7 @@ struct MoeGroupParams {
   uint32_t in_place;
   uint32_t lane_rows;
   uint32_t first_row;
-  uint32_t last_row;
+  uint32_t last_rows; // byte l: lane l's last row bound (lane_rows for none)
 };
 
 static_assert(sizeof(MoeGroupParams) == 40,

@@ -147,13 +147,13 @@ kernel void moe_route_select_f32_e512(
 // plan's rows: a route's grouped row is its expert tile's row of the route's
 // own row, and the routed tiles' grouped routes go unwritten, as no gather
 // reads them. The routes of a lane's rows before params.first_row, and from
-// params.last_row on when it is set, are left out, and their route rows name
+// its byte of params.last_rows on, are left out, and their route rows name
 // the row's shared expert row. Experts threads (256, or 512 for
 // Qwen3.8-Flash-Next).
 inline bool moe_route_dropped(uint row, constant MoeGroupParams &params) {
   if (!params.lane_rows) return false;
-  const uint lane_row = row % params.lane_rows;
-  return lane_row < params.first_row || (params.last_row && lane_row >= params.last_row);
+  const uint lane_row = row % params.lane_rows, lane = row / params.lane_rows;
+  return lane_row < params.first_row || lane_row >= ((params.last_rows >> (8 * lane)) & 0xffu);
 }
 
 template <uint Experts>
