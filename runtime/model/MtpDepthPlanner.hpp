@@ -19,7 +19,8 @@ inline constexpr uint32_t kMtpPlannerLanes = 4;
 struct MtpDepthParameters final {
   uint32_t probeCycles = 8;
   uint64_t exploreCycles = 32;
-  std::array<double, 4> priorRatios{1.0, 0.15, 0.10, 0.10};
+  bool measuredCosts = true;
+  std::array<double, 5> priorRatios{1.0, 0.15, 0.10, 0.05, 0.01};
 };
 [[nodiscard]] uint32_t probeMtpDepth(uint32_t depth, uint32_t &idleCycles, uint32_t interval) noexcept;
 [[nodiscard]] uint32_t exploreMtpDepth(uint32_t depth, uint32_t maximum, uint64_t cycle,
@@ -47,40 +48,43 @@ struct MtpAcceptance final {
   [[nodiscard]] std::array<double, kMtpPlannerPositions + 1> expectedTokens() const noexcept;
 };
 
-// The cost of a cycle of `lanes` lanes drafting `steps` steps (from the
-// draft vocabulary or the whole one) whose lanes draft `laneSteps`
-// proposals in all, which each route their row to experts in the draft and
-// the verify: a + b steps + c laneSteps, per batch width. Fit to the
-// cycles' measured seconds by ridge regression toward a prior with
-// forgetting; `measured` false asks for the prior's ratios alone, which no
-// measurement moves. Sampled batches use the upstream rule instead.
+// Cycle cost per batch width: base + whole/draft-head step cost + verify
+// proposal cost + draft routed-row cost. A depth d routes sum_{j=1..d}(9-j)
+// draft rows; the verify routes one base row per lane plus its proposals.
+// Ridge regression fits measured seconds with forgetting toward a prior.
+// Sampled batches use the upstream rule instead.
 class MtpCostModel final {
 public:
-  explicit MtpCostModel(std::array<double, 4> prior = MtpDepthParameters{}.priorRatios);
+  explicit MtpCostModel(std::array<double, 5> prior = MtpDepthParameters{}.priorRatios);
   struct Cycle {
     uint32_t lanes = 1;
     uint32_t steps = 0;
     uint32_t laneSteps = 0;
     bool draftVocabulary = true;
+    uint32_t draftRoutedRows = 0;
   };
   void observe(const Cycle &cycle, double seconds) noexcept;
   [[nodiscard]] double cost(const Cycle &cycle, bool measured) const noexcept;
   // The fitted (or prior) a, b of whole-vocabulary steps, b of draft
-  // vocabulary steps and c, in seconds (prior: relative to a of 1).
-  [[nodiscard]] std::array<double, 4> coefficients(uint32_t lanes, bool measured) const noexcept;
+  // vocabulary steps, verify proposals and draft routed rows, in seconds
+  // (prior: relative to a of 1).
+  [[nodiscard]] std::array<double, 5> coefficients(uint32_t lanes, bool measured) const noexcept;
   [[nodiscard]] uint64_t observations(uint32_t lanes) const noexcept;
 
 private:
   struct Fit {
-    std::array<std::array<double, 4>, 4> gram{};
-    std::array<double, 4> moments{};
+    std::array<std::array<double, 5>, 5> gram{};
+    std::array<double, 5> moments{};
     double scale = 0.0;
     uint64_t count = 0;
-    std::array<double, 4> theta{};
+    std::array<double, 5> theta{};
   };
-  std::array<double, 4> priorRatios_;
+  std::array<double, 5> priorRatios_;
   std::array<Fit, kMtpPlannerLanes> fits_{};
 };
+
+// Physical routed rows in the draft graph (the fixed eight-row lane).
+[[nodiscard]] uint32_t mtpDraftRoutedRows(std::span<const uint32_t> depths) noexcept;
 
 struct MtpDepthPlan final {
   uint32_t steps = 0;

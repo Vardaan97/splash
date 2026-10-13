@@ -61,7 +61,7 @@ void prior() {
 
 void fit() {
   // A machine whose cycles cost a + b steps + c lane-steps, a by width.
-  const double a[4] = {0.020, 0.030, 0.038, 0.046}, bWhole = 0.0025, bDraft = 0.0016, c = 0.0014;
+  const double a[4] = {0.020, 0.030, 0.038, 0.046}, bWhole = 0.0025, bDraft = 0.0016, c = 0.0007, routed = 0.00014;
   MtpCostModel costs;
   std::mt19937 rng(3);
   std::uniform_int_distribution<uint32_t> depth(0, 7);
@@ -69,26 +69,29 @@ void fit() {
   for (int cycle = 0; cycle < 3000; ++cycle) {
     const uint32_t lanes = 1 + cycle % 4;
     uint32_t steps = 0, laneSteps = 0;
+    std::array<uint32_t, 4> depths{};
     for (uint32_t lane = 0; lane < lanes; ++lane) {
       const uint32_t d = depth(rng);
+      depths[lane] = d;
       steps = std::max(steps, d);
       laneSteps += d;
     }
     const bool vocabulary = cycle % 5 != 0;
-    const double seconds = a[lanes - 1] + (vocabulary ? bDraft : bWhole) * steps + c * laneSteps + noise(rng);
-    costs.observe({lanes, steps, laneSteps, vocabulary}, seconds);
+    const uint32_t rows = mtpDraftRoutedRows(std::span(depths).first(lanes));
+    const double seconds = a[lanes - 1] + (vocabulary ? bDraft : bWhole) * steps + c * laneSteps + routed * rows + noise(rng);
+    costs.observe({lanes, steps, laneSteps, vocabulary, rows}, seconds);
   }
   for (uint32_t lanes = 2; lanes <= 4; ++lanes) {
     const auto theta = costs.coefficients(lanes, true);
     require(std::fabs(theta[0] - a[lanes - 1]) < 0.1 * a[lanes - 1] && std::fabs(theta[1] - bWhole) < 0.2 * bWhole &&
-                std::fabs(theta[2] - bDraft) < 0.2 * bDraft && std::fabs(theta[3] - c) < 0.2 * c,
+                std::fabs(theta[2] - bDraft) < 0.2 * bDraft && std::fabs(theta[3] - c) < 0.2 * c && std::fabs(theta[4] - routed) < 0.2 * routed,
             "cost model: fits each width's base, step and proposal costs from varied cycles (B" +
                 std::to_string(lanes) + ")");
   }
-  // A lone lane: only the cost of a step with its proposal is seen.
-  const auto one = costs.coefficients(1, true);
-  require(std::fabs(one[0] - a[0]) < 0.05 * a[0] && std::fabs(one[2] + one[3] - bDraft - c) < 0.1 * (bDraft + c),
-          "cost model: fits a lone lane's base and cost per proposal");
+  // Even a lone lane distinguishes the nonlinear draft-row feature.
+  const MtpCostModel::Cycle lone{1, 7, 7, true, 35};
+  require(std::fabs(costs.cost(lone, true) - (a[0] + 7 * (bDraft + c) + 35 * routed)) < 0.001,
+          "cost model: fits a lone lane's total routed work");
   require(costs.coefficients(1, false) == MtpCostModel{}.coefficients(1, false),
           "cost model: the prior ignores what was measured");
   // Measured costs move the plan: with a cheap base a lane keeping three in
@@ -96,10 +99,26 @@ void fit() {
   MtpCostModel steep;
   for (int cycle = 0; cycle < 400; ++cycle) {
     const uint32_t d = cycle % 8;
-    steep.observe({1, d, d, true}, 0.010 + 0.004 * d);
+    steep.observe({1, d, d, true, mtpDraftRoutedRows(std::span(&d, 1))}, 0.010 + 0.004 * d);
   }
   require(loneDepth(acceptanceAt(0.75), steep, true) < loneDepth(acceptanceAt(0.75), steep, false),
           "plan: a dearer proposal relative to the base drafts shallower, measured only");
+}
+
+void routedWork() {
+  const std::array<uint32_t, 4> concentrated{7, 7, 0, 0}, spread{7, 3, 2, 2};
+  require(mtpDraftRoutedRows(concentrated) == 70 && mtpDraftRoutedRows(spread) == 86,
+          "draft routes: equal verify proposals can route different draft rows");
+  const MtpCostModel::Cycle a{4, 7, 14, true, mtpDraftRoutedRows(concentrated)};
+  const MtpCostModel::Cycle b{4, 7, 14, true, mtpDraftRoutedRows(spread)};
+  MtpCostModel costs;
+  require(costs.cost(b, false) > costs.cost(a, false), "prior distinguishes draft routed work");
+  for (int i = 0; i < 400; ++i) {
+    costs.observe(a, 0.04);
+    costs.observe(b, 0.06);
+  }
+  require(costs.cost(b, true) > costs.cost(a, true) + 0.015,
+          "fit distinguishes equal-depth, equal-proposal plans by actual draft routes");
 }
 
 void lanes() {
@@ -119,7 +138,7 @@ void cadence() {
           "cadence: injected interval reaches the probe in two cycles");
   require(exploreMtpDepth(3, 7, 2, 2) == 4 && exploreMtpDepth(3, 7, 4, 2) == 2 &&
               exploreMtpDepth(3, 7, 4, 0) == 3, "cadence: exploration alternates and can be disabled");
-  const MtpCostModel custom({1.0, 0.8, 0.7, 0.6});
+  const MtpCostModel custom({1.0, 0.8, 0.7, 0.6, 0.05});
   require(custom.coefficients(1, false)[1] == 0.8, "prior: injectable component cost ratios");
 }
 
@@ -131,6 +150,7 @@ int main() {
     prior();
     fit();
     lanes();
+    routedWork();
     cadence();
   } catch (const std::exception &error) {
     std::cerr << "MTP depth planner tests FAILED: " << error.what() << '\n';

@@ -512,7 +512,7 @@ struct Runtime::Impl {
       if (!mtpCosts.observations(lanes)) continue;
       const auto theta = mtpCosts.coefficients(lanes, true);
       text << "; B" << lanes << " ms base " << theta[0] * 1e3 << " step " << theta[1] * 1e3 << " draft-vocabulary step "
-           << theta[2] * 1e3 << " proposal " << theta[3] * 1e3;
+           << theta[2] * 1e3 << " proposal " << theta[3] * 1e3 << " draft routed row " << theta[4] * 1e3;
     }
     logLine(text.str());
   }
@@ -536,7 +536,7 @@ struct Runtime::Impl {
       for (uint32_t lane = 0; lane < lanes; ++lane) expected[lane] = entries[lane]->mtpAcceptance.expectedTokens();
       // Only greedy batches use measured costs. Sampled batches keep
       // upstream's common-depth policy, with request-local draft heads.
-      const bool measured = true;
+      const bool measured = mtpParameters.measuredCosts;
       const MtpDepthPlan plan =
           planMtpDepths(std::span(expected).first(lanes), mtpCosts, measured, draftVocabulary, mtpDraftSteps);
       for (uint32_t lane = 0; lane < lanes; ++lane) {
@@ -556,7 +556,8 @@ struct Runtime::Impl {
       steps = std::max(steps, depths[lane]);
       laneSteps += depths[lane];
     }
-    mtpCycle = MtpCostModel::Cycle{lanes, steps, laneSteps, draftVocabulary && steps};
+    mtpCycle = MtpCostModel::Cycle{lanes, steps, laneSteps, draftVocabulary && steps,
+                                    mtpDraftRoutedRows(std::span(depths).first(lanes))};
     return steps;
   }
   Qwen4DraftContextCache<kLaneCount> draftContextCache;
