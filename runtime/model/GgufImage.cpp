@@ -6,7 +6,9 @@
 #include "model/StateLayout.hpp"
 #include "model/WeightLayout.hpp"
 
+#include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <optional>
 #include <sstream>
@@ -72,6 +74,37 @@ public:
     Repack repack = image_.planes(format, rows, columns, name);
     repack.sources.push_back(tensorRows(*tensor, rows, ggufRowBytes(kQuantFormats[format], columns), order));
     image_.repack(std::move(repack));
+  }
+
+  // Rows `selected` (ascending) of quantized rows [N, K], repacked into
+  // planes in that order and padded with zero rows to whole plane tiles;
+  // then the selected rows' indices (uint32 each).
+  void quantizedRows(const std::string &name, uint64_t rows, uint64_t columns, std::span<const uint32_t> selected) {
+    const GgufTensor *tensor = find(name, quantizedType);
+    if (!tensor) return;
+    if (tensor->rows() != rows || tensor->columns() != columns) throw GgufError("unexpected shape for " + name);
+    if (selected.empty() || !std::is_sorted(selected.begin(), selected.end()) ||
+        std::adjacent_find(selected.begin(), selected.end()) != selected.end() || selected.back() >= rows)
+      throw GgufError("the selected rows of " + name + " are not ascending rows of it");
+    const uint32_t format = imageFormat(tensor->type);
+    const uint64_t rowBytes = ggufRowBytes(kQuantFormats[format], columns);
+    const uint64_t tiled = (selected.size() + QUANT_TILE_ROWS - 1) / QUANT_TILE_ROWS * QUANT_TILE_ROWS;
+    Repack repack = image_.planes(format, tiled, columns, name);
+    const TensorRows all = tensorRows(*tensor, rows, rowBytes);
+    // A source per run of consecutive rows.
+    for (size_t first = 0; first < selected.size();) {
+      size_t end = first + 1;
+      while (end < selected.size() && selected[end] == selected[end - 1] + 1) ++end;
+      TensorRows run = all;
+      run.first = selected[first];
+      run.rows = end - first;
+      repack.sources.push_back(std::move(run));
+      first = end;
+    }
+    image_.repack(std::move(repack));
+    std::vector<uint8_t> indices(selected.size_bytes());
+    std::memcpy(indices.data(), selected.data(), indices.size());
+    image_.fill(std::move(indices));
   }
 
   // The routed experts' gate and up tensors, of `experts` * width rows each:
@@ -541,6 +574,11 @@ Repack ImageBuilder::planes(uint32_t format, uint64_t rows, uint64_t columns, co
 
 void ImageBuilder::repack(Repack repack) { image_.repacks.push_back(std::move(repack)); }
 
+void ImageBuilder::fill(std::vector<uint8_t> bytes) {
+  const uint64_t offset = section(bytes.size());
+  image_.fills.push_back({offset, std::move(bytes)});
+}
+
 Image ImageBuilder::finish() {
   image_.bytes = alignWeightOffset(cursor_);
   return std::move(image_);
@@ -669,6 +707,15 @@ Image planMtpImage(const GgufFile &file, const QwenTargetDimensions &target) {
     for (const std::string &problem : problems) names += (names.empty() ? "" : ", ") + problem;
     throw GgufError("MTP GGUF tensors this build cannot load: " + names);
   }
+  return b.finish();
+}
+
+Image planDraftHeadImage(const GgufFile &file, const QwenTargetDimensions &geometry,
+                          std::span<const uint32_t> tokens) {
+  std::vector<std::string> problems;
+  Builder b(file, geometry, problems, "draft-head.bin", geometry.layers, 5);
+  b.quantizedRows("output.weight", geometry.vocabularySize, geometry.hiddenSize, tokens);
+  if (!problems.empty()) throw GgufError("GGUF tensors this build cannot load: " + problems.front());
   return b.finish();
 }
 

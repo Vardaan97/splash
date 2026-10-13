@@ -115,6 +115,36 @@ struct Qwen4MtpParams {
   uint32_t pad;
 };
 
+// A draft step's context rows beside the draft vocabulary
+// (qwen4_mtp_argmax_context): each lane's logits of its context rows, at
+// `logits_slot` floats per lane and `capacity` per row, and each state
+// lane's tokens of them, `capacity` per lane. A lane's Qwen4MtpContextLane
+// gives its count and state lane.
+struct Qwen4MtpContext {
+  uint32_t capacity;
+  uint32_t logits_slot;
+  uint32_t pad[2];
+};
+struct Qwen4MtpContextLane {
+  uint32_t count;
+  uint32_t state_lane;
+  uint32_t pad[2];
+};
+
+// Rows of a quantized tensor's planes (metal/abi/QuantFormat.h) copied to
+// rows of another of the same format and width (qwen4_copy_head_rows):
+// `count` (source row, destination row) pairs; `groups` groups of 32 inputs
+// per row, `meta_groups` of them per meta unit.
+struct Qwen4HeadRowsParams {
+  uint32_t count;
+  uint32_t groups;
+  uint32_t meta_groups;
+  uint32_t plane0_bytes;
+  uint32_t plane1_bytes;
+  uint32_t meta_bytes;
+  uint32_t pad[2];
+};
+
 // The PLE rows (llama.cpp qwen4exp build_ple hash) of each lane's verify
 // rows on the GPU, from the rows' tokens and the two tokens before a lane's
 // first row (QWEN4_PLE_NONE for none).
