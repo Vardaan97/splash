@@ -448,6 +448,15 @@ struct Runtime::Impl {
   // (--ple-ssd-cache): every command stages the rows it gathers before it is
   // submitted (stagePleRows), so the GPU never waits for the CPU within one.
   SparseRowStore *pleStore = nullptr;
+  // Whether a prefill command reads ahead the PLE rows of the prompt tokens
+  // after its own (prefetchNextPrefillRows): SPLASH_PLE_SSD_READAHEAD=0 turns
+  // it off.
+  static bool pleReadAheadFromEnvironment() {
+    const char *value = std::getenv("SPLASH_PLE_SSD_READAHEAD");
+    return !value || std::string_view(value) != "0";
+  }
+  bool pleReadAhead = pleReadAheadFromEnvironment();
+  std::vector<uint32_t> pleAhead;
   explicit Impl(RuntimeContext value)
       : backend(value.backend),
         model(value.model),
@@ -1447,6 +1456,7 @@ struct Runtime::Impl {
       const uint32_t count = batch.rows * geometry.target.pleHeads();
       stagePleRows(prefillArena->get(PrefillTensor::PleIndices), prefillArena->get(PrefillTensor::PleSlots),
                    prefillArena->get(PrefillTensor::PleStaging), count, SparseRowUse::Prefill, true);
+      if (pleReadAhead) prefetchNextPrefillRows(batch);
     }
     return batch;
   }
@@ -1727,6 +1737,29 @@ struct Runtime::Impl {
     pleStore->stage({contents<const uint32_t>(indices, "PLE rows"), count},
                     {contents<uint8_t>(staging, "PLE staging"), count * rowBytes},
                     {contents<uint32_t>(slots, "PLE slots"), count}, use, adoptPrefetch);
+  }
+
+  // Reads ahead the PLE rows of the prompt tokens that follow a prefill
+  // command's, at most a command's worth, its lanes' in order: the readers
+  // bring them into the cache while the command runs, and the next chunk's
+  // stage finds them there, or finishes what is still in flight with them.
+  // A prompt of one chunk, or a chunk's first, finds nothing ahead of it.
+  void prefetchNextPrefillRows(const RaggedPrefillBatch &batch) {
+    const uint32_t heads = geometry.target.pleHeads();
+    pleAhead.clear();
+    uint64_t budget = kPrefillRows;
+    for (const RaggedPrefillSequence &sequence : batch.sequences) {
+      const Request &entry = *sequence.entry;
+      const uint64_t from = sequence.item->logicalPosition + sequence.item->tokenCount;
+      const uint64_t end = std::min<uint64_t>({entry.promptTokens, entry.tokens.size(), from + budget});
+      if (from >= end) continue;
+      const size_t base = pleAhead.size();
+      pleAhead.resize(base + (end - from) * heads);
+      plePromptRows(entry, from, {entry.tokens.data() + from, size_t(end - from)}, pleAhead.data() + base);
+      budget -= end - from;
+      if (!budget) break;
+    }
+    if (!pleAhead.empty()) pleStore->prefetch(pleAhead);
   }
 
   // A decode batch's PLE rows: kDecodeRows per lane.
