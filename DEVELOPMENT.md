@@ -221,9 +221,12 @@ Other models ignore the option with a warning; off by default.
   computed exactly as from the table.
 - Prefill and decode with looked-up proposals know their rows on the CPU. With
   the MTP head the GPU hashes the proposals' rows: the draft's command ends
-  with the hash, and the verify becomes a second command, encoded after the
-  CPU staged the rows (`StagedVerifyTicket` in `Runtime.cpp`; a constrained
-  cycle's target command waits for them the same way).
+  with the hash, and the verify becomes a second command (`StagedVerifyTicket`
+  in `Runtime.cpp`; a constrained cycle's target command waits for the rows
+  the same way). The verify is built with the draft and encoded into its
+  Metal command buffer while the draft runs (`MetalBackend::encodeCommand`),
+  so staging and submission wait for the draft. The verify is staged before
+  submission, without a CPU row-fill handshake inside the GPU command.
 - A prefill chunk reads ahead the rows of the prompt tokens after it while it
   runs; the next chunk's stage finds them cached or finishes what is still in
   flight. `SPLASH_PLE_SSD_READAHEAD=0` turns this off, and
