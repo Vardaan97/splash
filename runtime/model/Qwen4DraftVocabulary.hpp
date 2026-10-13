@@ -31,9 +31,9 @@ inline constexpr uint32_t kQwen4DraftContextTokens = 4096;
 // Whether `token` is one of the draft vocabulary's.
 [[nodiscard]] bool inQwen4DraftVocabulary(uint32_t token) noexcept;
 
-// The draft vocabulary an MTP head over `vocabulary` tokens drafts from:
-// kQwen4DraftVocabularyTokens for Qwen3.8's tokenizer unless
-// SPLASH_MTP_DRAFT_VOCAB=0, which drafts from every token; else 0.
+// The draft vocabulary size for a head with `vocabulary` rows: 32768
+// for 248320 rows unless SPLASH_MTP_DRAFT_VOCAB=0; otherwise 0. This size
+// check assumes Qwen3.8 token IDs and does not validate tokenizer identity.
 [[nodiscard]] uint32_t qwen4DraftTokensFor(uint32_t vocabulary);
 
 namespace detail {
