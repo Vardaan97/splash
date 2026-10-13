@@ -116,6 +116,7 @@ window. To set your own limits or cache options, add these to `splash serve`:
 | `--disable-ane` | Prefill on the GPU alone. Default: the 27B also uses the Neural Engine. |
 | `--max-cache-disk 16G` | Cap the SSD cache (default: auto, up to 32 GiB; `0` turns it off). |
 | `--persistent-cache` | Keep the SSD cache across restarts. Off by default. |
+| `--ple-ssd-cache 2G` | Qwen3.8-Flash-Next: read its PLE n-gram table (28.8 GB in IQ4_NL) from the SSD through a 2 GiB RAM cache instead of holding it in memory. Off by default. |
 
 Use `--max-memory` to leave room for other applications.
 The server listens on localhost without authentication by default. For LAN
@@ -123,7 +124,8 @@ access, authentication, browser apps on other origins, and other options, see
 [server configuration](DEVELOPMENT.md#server-configuration) or
 `splash serve --help`.
 [KV precision](DEVELOPMENT.md#kv-cache-precision) ·
-[SSD cache](DEVELOPMENT.md#ssd-cache)
+[SSD cache](DEVELOPMENT.md#ssd-cache) ·
+[PLE table streaming](DEVELOPMENT.md#ple-table-streaming)
 
 ## Performance
 
