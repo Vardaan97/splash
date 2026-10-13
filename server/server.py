@@ -1689,7 +1689,7 @@ def _native_command(args, relaunch_context=None):
         command.extend(("--idle-sleep", "allow"))
     if relaunch_context is not None and args.max_context is None:
         command.extend(("--relaunch-context", str(relaunch_context)))
-    if args.ple_ssd_cache:
+    if getattr(args, "ple_ssd_cache", None):
         command.extend(("--ple-ssd-cache", str(args.ple_ssd_cache)))
     return command
 
