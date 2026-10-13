@@ -494,7 +494,7 @@ struct Runtime::Impl {
   }
   bool useDraftVocabulary(std::span<Request *const> entries) const {
     return targetModel.hasMtpDraftVocabulary() && std::ranges::all_of(entries, [](const Request *entry) {
-      return !samplingEnabled(*entry) && entry->draftContext.useVocabulary();
+      return entry->draftContext.useVocabulary();
     });
   }
   ops::AneFfn *aneFfn;
