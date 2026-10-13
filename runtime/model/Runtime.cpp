@@ -47,6 +47,7 @@ using metal::CommandTicket;
 using metal::CommandTiming;
 using metal::MetalBackend;
 using metal::MetalBuffer;
+using metal::EncodedCommand;
 
 class DeferredMetalTicket final : public ModelBatchTicket {
 public:
@@ -2109,8 +2110,8 @@ struct Runtime::Impl {
   // Whether a cycle's PLE rows come from the GPU's hash of the MTP head's
   // proposals and a streamed table: the draft's command then ends with the
   // hash (encodeVerifyTokens), and the CPU stages the rows it names before
-  // the verify's command is encoded (StagedVerifyTicket, and the
-  // constrained ticket).
+  // the verify's command is submitted (StagedVerifyTicket, and the
+  // constrained ticket); StagedVerifyTicket pre-encodes it while drafting.
   [[nodiscard]] bool stagesDraftedPleRows() const noexcept { return pleStore && targetModel.hasMtp(); }
 
   void encodeTargetVerifyBatchPolicy(CommandGraph &graph,
@@ -2350,10 +2351,16 @@ struct Runtime::Impl {
   // flight and nothing of the cycle committed.
   class StagedVerifyTicket final : public ModelBatchTicket {
   public:
+    // `target` is the rest of the cycle, built with the draft (before the
+    // draft's command is submitted, as the one command of a resident table's
+    // cycle is) and encoded while the draft runs, so that once the draft
+    // completes only the staging and the commit remain: the buffers it binds
+    // are read when it runs, and the staging writes Shared ones.
     StagedVerifyTicket(Impl &impl, std::vector<DecodeLaneResult> lanes, std::span<const ModelBatchItem> items,
-                       const CommandGraph &draft, std::function<void()> completion)
+                       const CommandGraph &draft, const CommandGraph &target, std::function<void()> completion)
         : impl_(impl), lanes_(std::move(lanes)), items_(items.begin(), items.end()), wake_(std::move(completion)) {
       command_ = impl_.backend.submitCommandAsync(draft.dispatches(), wake_);
+      target_ = impl_.backend.encodeCommand(target.command());
     }
 
     std::vector<ModelMaskRequest> takeMaskRequests() override {
@@ -2380,22 +2387,8 @@ struct Runtime::Impl {
 
     void verify() {
       addTiming(command_.wait());
-      const uint32_t width = static_cast<uint32_t>(lanes_.size());
-      std::array<Request *, kLaneCount> entries{};
-      std::array<uint32_t, kLaneCount> maximumRetained{};
-      for (uint32_t lane = 0; lane < width; ++lane) {
-        entries[lane] = lanes_[lane].request;
-        maximumRetained[lane] = lanes_[lane].maximumRetained;
-      }
-      const std::span<Request *const> batch(entries.data(), width);
-      impl_.stageDecodePleRows(width);
-      CommandGraph target;
-      impl_.encodeBatchEmbedding(target, DecodeTensor::InputTokens, DecodeTensor::Hidden0, width);
-      impl_.encodeTargetVerifyBatchForward(target, batch, items_);
-      impl_.encodeTargetVerifyBatchPolicy(target, batch);
-      impl_.encodeBatchAcceptance(target, batch, {maximumRetained.data(), width});
-      impl_.encodeTargetStateCommit(target, batch);
-      command_ = impl_.backend.submitCommandAsync(target.dispatches(), wake_);
+      impl_.stageDecodePleRows(static_cast<uint32_t>(lanes_.size()));
+      command_ = impl_.backend.submitEncoded(std::move(target_), wake_);
       stage_ = Stage::Verify;
     }
 
@@ -2409,6 +2402,7 @@ struct Runtime::Impl {
     std::vector<ModelBatchItem> items_;
     Stage stage_ = Stage::Draft;
     CommandTicket command_;
+    EncodedCommand target_;
     CommandTiming timing_;
     std::function<void()> wake_;
   };
@@ -3138,9 +3132,16 @@ Runtime::decodeAsync(const BatchPlan &plan,
   // the draft's command and the verify's, the looked-up proposals' now.
   if (impl_->stagesDraftedPleRows()) {
     impl_->encodeVerifyTokens(commandGraph, width);
-    if (!constrained)
-      return std::make_unique<Impl::StagedVerifyTicket>(*impl_, std::move(lanes), items, commandGraph,
+    if (!constrained) {
+      CommandGraph target;
+      impl_->encodeBatchEmbedding(target, DecodeTensor::InputTokens, DecodeTensor::Hidden0, width);
+      impl_->encodeTargetVerifyBatchForward(target, entries, items);
+      impl_->encodeTargetVerifyBatchPolicy(target, entries);
+      impl_->encodeBatchAcceptance(target, entries, {maximumRetained.data(), width});
+      impl_->encodeTargetStateCommit(target, entries);
+      return std::make_unique<Impl::StagedVerifyTicket>(*impl_, std::move(lanes), items, commandGraph, target,
                                                         std::move(completion));
+    }
   } else if (impl_->pleStore) {
     impl_->stageDecodePleRows(width);
   }
