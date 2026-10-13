@@ -337,8 +337,8 @@ struct Runtime::Impl {
     // The draft proposals the lane's thinking end replaced, which its
     // speculation counts leave out.
     uint32_t endDrafts = 0;
-    // The proposals its cycle drafted: the MTP head's, or every one.
-    uint32_t drafted = kDraftProposalTokens;
+    // Real proposals, excluding repeated rows and prompt-lookup padding.
+    uint32_t drafted = 0;
     // Why the lane's selection is unusable (invalidSelection), found before
     // any lane commits.
     std::string failure;
@@ -446,7 +446,9 @@ struct Runtime::Impl {
     bool trimmed = false;
     for (const Request *entry : entries) {
       if (!entry->mtpPlanned) return {};
-      rows.push_back(std::min(entry->mtpDrafted + 1, kDecodeRows));
+      const auto cutoff = samplingPolicy(*entry).thinkingCutoff;
+      const uint32_t endDrafts = cutoff ? cutoff->replacedProposals() : 0;
+      rows.push_back(std::min(std::max(entry->mtpDrafted, endDrafts) + 1, kDecodeRows));
       trimmed = trimmed || rows.back() < kDecodeRows;
     }
     return trimmed ? rows : std::vector<uint32_t>{};
@@ -454,9 +456,11 @@ struct Runtime::Impl {
   // The outcome of the proposals a lane's cycle drafted: `accepted`
   // proposals in a row, counted past the drafted ones when a repeat of the
   // last was accepted too.
-  static void countMtpOutcome(Request &entry, uint32_t accepted) {
+  static void countMtpOutcome(Request &entry, uint32_t accepted, uint32_t endDrafts) {
     if (!entry.mtpPlanned) return;
     entry.mtpPlanned = false;
+    // Forced end tokens judge neither the head's proposals nor their positions.
+    if (endDrafts) { entry.mtpDrafted = 0; return; }
     if (!entry.mtpDrafted) return;
     const uint32_t kept = std::min(accepted, entry.mtpDrafted);
     entry.mtpAccepted = kMtpDecay * entry.mtpAccepted + static_cast<float>(kept);
@@ -1945,9 +1949,11 @@ struct Runtime::Impl {
   // followed the latest earlier occurrence of the request's last few tokens
   // (prompt lookup), the mask token where it has none; acceptance then
   // checks them as it checks a draft's.
-  std::array<uint32_t, kDraftProposalTokens> lookupProposals(const Request &entry, uint32_t anchor) const {
+  std::array<uint32_t, kDraftProposalTokens> lookupProposals(const Request &entry, uint32_t anchor,
+                                                          uint32_t &drafted) const {
     std::array<uint32_t, kDraftProposalTokens> proposals;
     proposals.fill(geometry.target.maskToken);
+    drafted = 0;
     const std::vector<uint32_t> &tokens = entry.tokens;
     const size_t length = tokens.size() + 1;
     const auto at = [&](size_t index) { return index < tokens.size() ? tokens[index] : anchor; };
@@ -1958,15 +1964,16 @@ struct Runtime::Impl {
         for (size_t k = 0; k < match && same; ++k) same = at(start + k) == at(length - match + k);
         if (!same) continue;
         const size_t next = start + match;
-        for (uint32_t i = 0; i < kDraftProposalTokens && next + i < length; ++i) proposals[i] = at(next + i);
+        drafted = static_cast<uint32_t>(std::min<size_t>(kDraftProposalTokens, length - next));
+        for (uint32_t i = 0; i < drafted; ++i) proposals[i] = at(next + i);
         return proposals;
       }
     }
     return proposals;
   }
 
-  void prepareDecodeLane(Request &entry, const ModelBatchItem &item,
-                         uint32_t lane) {
+  uint32_t prepareDecodeLane(Request &entry, const ModelBatchItem &item,
+                             uint32_t lane) {
     if (!entry.resident || !entry.promptComplete || !entry.pendingToken) {
       throw std::logic_error("decode request is not ready");
     }
@@ -1982,6 +1989,7 @@ struct Runtime::Impl {
     draftInput[0] = *entry.pendingToken;
     std::fill(draftInput + 1, draftInput + kDecodeRows,
               geometry.target.maskToken);
+    uint32_t drafted = draftModel ? kDraftProposalTokens : 0;
     std::array<uint32_t, kDecodeRows> rowTokens{};
     rowTokens.fill(geometry.target.maskToken);
     rowTokens[0] = *entry.pendingToken;
@@ -1996,7 +2004,7 @@ struct Runtime::Impl {
       // its distribution gives no weight.
       std::array<uint32_t, kDraftProposalTokens> proposals;
       if (mtp) proposals.fill(geometry.target.maskToken);
-      else proposals = lookupProposals(entry, *entry.pendingToken);
+      else proposals = lookupProposals(entry, *entry.pendingToken, drafted);
       std::copy(proposals.begin(), proposals.end(), rowTokens.begin() + 1);
       auto *proposed = contents<uint32_t>(decodeArena->get(lane, DecodeTensor::ProposedTokens), "proposals");
       auto *candidates = contents<uint32_t>(decodeArena->get(lane, DecodeTensor::Candidates), "candidates");
@@ -2022,6 +2030,10 @@ struct Runtime::Impl {
       }
     }
     if (geometry.target.qwen4() && !targetModel.hasMtp()) {
+      // The GPU replaces row-zero proposals after this CPU hash is staged.
+      // Hash the same forced end tokens, including rows past lookup padding.
+      if (const auto cutoff = samplingPolicy(entry).thinkingCutoff; cutoff && !cutoff->row)
+        std::copy_n(cutoff->end.begin(), cutoff->replacedProposals(), rowTokens.begin() + 1);
       // The PLE rows of the anchor and the proposals the step verifies.
       plePromptRows(entry, item.logicalPosition, rowTokens,
                     contents<uint32_t>(decodeArena->get(lane, DecodeTensor::PleIndices), "PLE rows"));
@@ -2040,6 +2052,7 @@ struct Runtime::Impl {
       // The draft is a text model over logical positions.
       draftPositions[row] = static_cast<uint32_t>(item.logicalPosition + row);
     }
+    return drafted;
   }
 
   // Batch lanes beyond the active width replay the last active request so
@@ -2420,7 +2433,8 @@ struct Runtime::Impl {
       std::span<DecodeLaneResult> lanes, std::span<const ModelBatchItem> items,
       CommandTiming timing) {
     // The MTP cycle's cost: its GPU time and the host's encoding of it.
-    if (mtpCycle) {
+    // The extra forced-end rows do not have the planned cycle's cost shape.
+    if (mtpCycle && std::ranges::none_of(lanes, [](const DecodeLaneResult &lane) { return lane.endDrafts; })) {
       mtpCosts.observe(*mtpCycle, timing.gpuSeconds + mtpEncodeSeconds);
       if (mtpLog) logMtpPlans(*mtpCycle);
     }
@@ -2439,7 +2453,10 @@ struct Runtime::Impl {
       if (laneResult.accepted > kDraftProposalTokens)
         throw std::runtime_error(
             "target accepted more than the draft proposed");
-      countMtpOutcome(*laneResult.request, laneResult.accepted);
+      // Acceptance may compare the padded rows too; only real proposals
+      // contribute to the lane's counts and depth history.
+      laneResult.accepted = std::min(laneResult.accepted, laneResult.drafted);
+      countMtpOutcome(*laneResult.request, laneResult.accepted, laneResult.endDrafts);
       // The retained target tokens end with the next anchor. A non-finite
       // target row can also accept a sentinel draft proposal as an interior
       // token, so every retained token is checked.
@@ -3233,7 +3250,9 @@ Runtime::decodeAsync(const BatchPlan &plan,
     if (const auto cutoff = Impl::samplingPolicy(entry).thinkingCutoff)
       laneResult.endDrafts = cutoff->replacedProposals();
 
-    impl_->prepareDecodeLane(entry, item, lane);
+    laneResult.drafted = impl_->prepareDecodeLane(entry, item, lane);
+    if (!impl_->draftModel && !impl_->targetModel.hasMtp())
+      laneResult.maximumRetained = std::min(laneResult.maximumRetained, std::max(laneResult.drafted, laneResult.endDrafts) + 1);
     requests[lane] = &entry;
     logicalPositions[lane] = item.logicalPosition;
     maximumRetained[lane] = laneResult.maximumRetained;
@@ -3264,7 +3283,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
         impl_->encodeTargetVerifyBatchForward(commandGraph, entries, items, true);
       for (uint32_t lane = 0; lane < width; ++lane) {
         lanes[lane].drafted = entries[lane]->mtpDrafted;
-        lanes[lane].maximumRetained = std::min(lanes[lane].maximumRetained, entries[lane]->mtpDrafted + 1);
+        lanes[lane].maximumRetained = std::min(lanes[lane].maximumRetained, std::max(entries[lane]->mtpDrafted, lanes[lane].endDrafts) + 1);
         maximumRetained[lane] = lanes[lane].maximumRetained;
       }
     }

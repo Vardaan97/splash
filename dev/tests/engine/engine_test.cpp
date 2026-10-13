@@ -9932,7 +9932,7 @@ void testSpeculativeCountsStayWithEachConcurrentRequest() {
   engine::Cache cache(pool, nullptr, nullptr);
   Executor executor;
   executor.decodeFinishes = false;
-  executor.speculativeCounts = {{1, {7, 2}}, {2, {7, 6}}};
+  executor.speculativeCounts = {{1, {3, 2}}, {2, {7, 6}}, {4, {0, 0}}};
   Events events;
   engine::Engine engine(test::engineConfig(), cache, executor, events);
   guardReleases(storage, engine);
@@ -9942,12 +9942,17 @@ void testSpeculativeCountsStayWithEachConcurrentRequest() {
   arithmetic.maxNewTokens = 21;
   engine.submit(std::move(prose));
   engine.submit(std::move(arithmetic));
+  auto verifyOnly = request(4, std::vector<uint32_t>(65, 14));
+  verifyOnly.maxNewTokens = 3;
+  engine.submit(std::move(verifyOnly));
   runUntilIdle(engine);
-  require(events.speculativeCounts.at(1) == SpeculativeCounts{14, 4, 2} &&
+  require(events.speculativeCounts.at(1) == SpeculativeCounts{6, 4, 2} &&
               events.speculativeCounts.at(2) == SpeculativeCounts{21, 18, 3} &&
-              events.draftedTokens == 14 + 21 &&
+              events.speculativeCounts.at(4) == SpeculativeCounts{} &&
+              events.draftedTokens == 6 + 21 &&
               events.acceptedDraftTokens == 4 + 18 &&
-              events.outputs.at(1).size() == 6 && events.outputs.at(2).size() == 21,
+              events.outputs.at(1).size() == 6 && events.outputs.at(2).size() == 21 &&
+              events.outputs.at(4).size() == 3,
           "concurrent requests mixed or dropped their speculative counts");
   auto score = request(3, std::vector<uint32_t>(65, 13));
   score.maxNewTokens = 0;

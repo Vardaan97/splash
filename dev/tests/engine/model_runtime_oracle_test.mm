@@ -1460,7 +1460,9 @@ void requireThinkingBudgetClosesThinking(model::Runtime &executor) {
                 committed >= first && committed < first + length
                     ? std::min(first + length - committed, model::ExecutionLimits::draftProposalTokens)
                     : 0;
-            require(drafted == model::ExecutionLimits::draftProposalTokens - replaced,
+            // Adaptive lanes may draft fewer proposals; forced end tokens
+            // contribute none even when they extend past that depth.
+            require(drafted <= model::ExecutionLimits::draftProposalTokens - replaced,
                     "a cycle counted the end tokens it drafted as the draft's");
           }
         }
