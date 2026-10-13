@@ -45,15 +45,24 @@ PreparedInput Qwen4::addNorm(metal::CommandGraph &graph, metal::MetalBuffer stre
   // A mix without injection binds its norm in the unused slots.
   std::vector<metal::MetalBuffer> bindings{std::move(streams), norm.buffer, injects ? inject : norm.buffer, normalized,
                                            injects ? weights : norm.buffer};
+  // Flash-Next's shape takes the kernels that sum alike but load ahead
+  // (kernels/shared/qwen4.metal): an injecting mix of decode's few rows a
+  // threadgroup of a quarter per stream each, the rest one of kThreads.
+  std::string name = "qwen4_hyper_norm";
+  uint32_t threads = kThreads;
+  if (shape.streams == QWEN4_MAXIMUM_STREAMS && shape.hidden == QWEN4_NORM_HIDDEN) {
+    const bool quarters = injects && rows <= QWEN4_NORM_QUARTER_ROWS;
+    name += quarters ? "_quarters" : "_loaded";
+    if (quarters) threads = QWEN4_NORM_QUARTER_THREADS;
+  }
   if (layout == LinearInput::Plain) {
-    graph.add("qwen4_hyper_norm", std::move(bindings), hyperParams(shape, rows, injects), {rows, 1, 1},
-              {kThreads, 1, 1});
+    graph.add(name, std::move(bindings), hyperParams(shape, rows, injects), {rows, 1, 1}, {threads, 1, 1});
     return {};
   }
   requireTableScratch(scratch, layout, shape.width(), rows);
   bindings.insert(bindings.end(), {scratch.input, scratch.sums});
-  graph.add(std::string("qwen4_hyper_norm") + tableSuffix(layout), std::move(bindings),
-            hyperParams(shape, rows, injects), {rows, 1, 1}, {kThreads, 1, 1});
+  graph.add(name + tableSuffix(layout), std::move(bindings), hyperParams(shape, rows, injects), {rows, 1, 1},
+            {threads, 1, 1});
   return {std::move(normalized), layout};
 }
 

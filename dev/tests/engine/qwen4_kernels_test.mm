@@ -3,6 +3,8 @@
 // llama.cpp's qwen4exp graph:
 // - the hyper-connection mix: per-stream RMS norm, injection weights, the
 //   low-rank gate and the stream average; the combine and the streams' start;
+//   the norm kernels of Flash-Next's own shape against the generic one, bit
+//   for bit;
 // - the PLE gate, its dilated convolution over a history, the history after
 //   a sequence and after a verify step's retained rows;
 // - QSA: the indexer's normalized, rotated queries and raw keys at their KV
@@ -22,6 +24,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
@@ -250,6 +253,92 @@ void hyperTableTest(MetalBackend &backend) {
   run(backend, mix);
   check(same(mixed, mixedT), "hyper mix table: output as the plain mix's");
   check(same(mixRef.input, mixGot.input) && same(mixRef.sums, mixGot.sums), "hyper mix table: table and sums as the prepare's");
+}
+
+// Flash-Next's shape (four streams of QWEN4_NORM_HIDDEN) takes the norm
+// kernels that load ahead: bit for bit the generic kernel's normalized rows,
+// injection weights and tables, at decode's row counts (quarters) and past
+// them (loaded), injecting or not. Shader validation's instrumentation
+// compiles the kernels apart, which can move a bf16 value by its last bit;
+// under it (`exact` false) they agree within that, and test-engine-metal runs
+// the exact comparison uninstrumented (`qwen4-kernels METALLIB bitwise`).
+void hyperNormShapeTest(MetalBackend &backend, bool exact) {
+  std::mt19937 rng(13);
+  const uint32_t hidden = QWEN4_NORM_HIDDEN, streams = QWEN4_MAXIMUM_STREAMS, rank = 64, width = hidden * streams;
+  const ops::HyperShape shape{hidden, streams, rank};
+  const uint32_t maximumRows = 512;
+  auto x = randoms(rng, maximumRows * width, 1.5f);
+  // A row of tiny values, where the norm's epsilon counts.
+  for (uint32_t c = 0; c < width; ++c) x[3 * width + c] *= 1e-4f;
+  std::vector<float> normPlus = randoms(rng, width, 0.3f);
+  for (float &v : normPlus) v += 1.0f;
+  const NormWeights nw{upload(backend, normPlus), true};
+  const MetalBuffer xs = upload(backend, x), inject = upload(backend, randoms(rng, streams * width, 0.02f));
+  // Equal bytes or, inexact, bf16 values (`floats` false) within their last
+  // bit and floats (sums of them) within 1e-4 relative.
+  const auto same = [exact](const MetalBuffer &a, const MetalBuffer &b, uint64_t bytes, bool floats = false) {
+    if (!std::memcmp(a.contents(), b.contents(), bytes)) return true;
+    if (exact) return false;
+    if (floats) {
+      const auto *x = static_cast<const float *>(a.contents()), *y = static_cast<const float *>(b.contents());
+      for (uint64_t i = 0; i < bytes / 4; ++i)
+        if (!(std::fabs(x[i] - y[i]) <= 1e-4f * (1.0f + std::fabs(y[i])))) return false;
+      return true;
+    }
+    const auto *x = static_cast<const uint16_t *>(a.contents()), *y = static_cast<const uint16_t *>(b.contents());
+    for (uint64_t i = 0; i < bytes / 2; ++i)
+      if (std::abs(int(x[i]) - int(y[i])) > 1) return false;
+    return true;
+  };
+  const auto table = [&](uint32_t rows) {
+    ops::LinearScratch t;
+    t.input = scratch(backend, ops::tableBytes(width, rows));
+    t.sums = scratch(backend, ops::tableSumsBytes(ops::LinearInput::Table16, width, rows));
+    std::memset(t.input.contents(), 0, t.input.sizeBytes());
+    std::memset(t.sums.contents(), 0, t.sums.sizeBytes());
+    return t;
+  };
+  bool okPlain = true, okTable = true;
+  for (const uint32_t rows : {1u, 3u, 8u, 16u, 24u, 32u, 64u, 65u, 128u, 136u, 256u, 512u})
+    for (const bool injects : {true, false}) {
+      MetalBuffer normalized = scratch(backend, rows * width * 2), weights = scratch(backend, rows * streams * 4);
+      MetalBuffer normalizedRef = scratch(backend, rows * width * 2), weightsRef = scratch(backend, rows * streams * 4);
+      for (MetalBuffer *b : {&normalized, &weights, &normalizedRef, &weightsRef}) std::memset(b->contents(), 0, b->sizeBytes());
+      const Qwen4HyperParams params{rows, hidden, streams, rank, injects ? 1u : 0u};
+      CommandGraph graph;
+      graph.add("qwen4_hyper_norm",
+                {xs, nw.buffer, injects ? inject : nw.buffer, normalizedRef, injects ? weightsRef : nw.buffer}, params,
+                {rows, 1, 1}, {QWEN4_ROW_THREADS, 1, 1});
+      ops::Qwen4::addNorm(graph, xs, nw, injects ? inject : MetalBuffer{}, normalized, weights, shape, rows);
+      const bool tables = rows % 8 == 0;
+      MetalBuffer normalizedT = scratch(backend, rows * width * 2), weightsT = scratch(backend, rows * streams * 4);
+      const ops::LinearScratch tableRef = table((rows + 7) / 8 * 8), tableGot = table((rows + 7) / 8 * 8);
+      if (tables) {
+        graph.add("qwen4_hyper_norm_table16",
+                  {xs, nw.buffer, injects ? inject : nw.buffer, normalizedRef, injects ? weightsRef : nw.buffer,
+                   tableRef.input, tableRef.sums},
+                  params, {rows, 1, 1}, {QWEN4_ROW_THREADS, 1, 1});
+        static_cast<void>(ops::Qwen4::addNorm(graph, xs, nw, injects ? inject : MetalBuffer{}, normalizedT, weightsT,
+                                              shape, rows, tableGot, ops::LinearInput::Table16));
+      }
+      run(backend, graph);
+      const bool plain = same(normalized, normalizedRef, rows * width * 2) &&
+                         (!injects || same(weights, weightsRef, rows * streams * 4, true));
+      okPlain &= plain;
+      if (!plain) std::cout << "  differs at " << rows << " rows" << (injects ? " injecting" : "") << '\n';
+      if (tables) {
+        const bool equal = same(normalizedT, normalizedRef, rows * width * 2) &&
+                           (!injects || same(weightsT, weightsRef, rows * streams * 4, true)) &&
+                           same(tableGot.input, tableRef.input, tableGot.input.sizeBytes()) &&
+                           // The sums of the table's values, which inexact can move further.
+                           (!exact || same(tableGot.sums, tableRef.sums, tableGot.sums.sizeBytes()));
+        okTable &= equal;
+        if (!equal) std::cout << "  table differs at " << rows << " rows" << (injects ? " injecting" : "") << '\n';
+      }
+    }
+  const std::string how = exact ? "bit for bit" : "close to (instrumented)";
+  check(okPlain, "hyper norm, Flash-Next's shape: " + how + " the generic kernel's output and weights");
+  check(okTable, "hyper norm table, Flash-Next's shape: " + how + " the generic kernel's output, weights and table");
 }
 
 void pleTest(MetalBackend &backend) {
@@ -630,14 +719,22 @@ void pleHashTest(MetalBackend &backend) {
 int main(int argc, const char *argv[]) {
   @autoreleasepool {
     try {
-      if (argc != 2) throw std::runtime_error("usage: qwen4-kernels METALLIB");
+      const bool bitwise = argc == 3 && std::string(argv[2]) == "bitwise";
+      if (argc != 2 && !bitwise) throw std::runtime_error("usage: qwen4-kernels METALLIB [bitwise]");
       MetalBackend backend(argv[1]);
-      hyperTest(backend);
-      hyperTableTest(backend);
-      pleTest(backend);
-      qsaTest(backend);
-      mtpTest(backend);
-      pleHashTest(backend);
+      if (bitwise) {
+        // Uninstrumented: the norm kernels of Flash-Next's shape alone, exact.
+        if (std::getenv("MTL_SHADER_VALIDATION")) throw std::runtime_error("bitwise runs without shader validation");
+        hyperNormShapeTest(backend, true);
+      } else {
+        hyperTest(backend);
+        hyperTableTest(backend);
+        hyperNormShapeTest(backend, !std::getenv("MTL_SHADER_VALIDATION"));
+        pleTest(backend);
+        qsaTest(backend);
+        mtpTest(backend);
+        pleHashTest(backend);
+      }
     } catch (const std::exception &error) {
       std::cerr << "qwen4 kernel test error: " << error.what() << '\n';
       return 1;

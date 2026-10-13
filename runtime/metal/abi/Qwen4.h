@@ -14,6 +14,15 @@
 #define QWEN4_ROW_THREADS 256u
 // The most streams a mix reads.
 #define QWEN4_MAXIMUM_STREAMS 4u
+// The mix norm's kernels for Flash-Next's shape, QWEN4_MAXIMUM_STREAMS
+// streams of QWEN4_NORM_HIDDEN values (ops::Qwen4::addNorm):
+// qwen4_hyper_norm_quarters, a threadgroup of QWEN4_NORM_QUARTER_THREADS
+// threads per row, for an injecting mix of at most QWEN4_NORM_QUARTER_ROWS
+// rows, and qwen4_hyper_norm_loaded, a threadgroup of QWEN4_ROW_THREADS per
+// row, for the rest.
+#define QWEN4_NORM_HIDDEN 2560u
+#define QWEN4_NORM_QUARTER_THREADS (QWEN4_MAXIMUM_STREAMS * QWEN4_ROW_THREADS)
+#define QWEN4_NORM_QUARTER_ROWS 64u
 
 // A mix over `streams` streams of `hidden` values per row: its norm and
 // injection (hyper_norm), its low-rank gate (hyper_low, `rank` values) and
