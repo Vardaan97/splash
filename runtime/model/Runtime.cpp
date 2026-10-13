@@ -2,6 +2,7 @@
 #include "AwakeClock.hpp"
 #include "model/QwenState.hpp"
 #include "model/Qwen4DraftVocabulary.hpp"
+#include "model/Qwen4DraftContext.hpp"
 #include "model/Qwen4Exp.hpp"
 #include "metal/abi/Qwen4.h"
 #include "model/QwenTarget.hpp"
@@ -315,17 +316,7 @@ struct Runtime::Impl {
     uint32_t mtpDrafted = 0;
     float mtpAccepted = 4.0F;
     float mtpJudged = 5.0F;
-    // Decayed counts of the tokens its decode emitted and of those outside
-    // the MTP head's draft vocabulary, which it never proposes
-    // (draftsFromVocabulary).
-    float draftVocabularyMisses = 0.0F;
-    float draftVocabularyTokens = 0.0F;
-    // Its context tokens outside the draft vocabulary, in the order they
-    // first appear in `tokens`, at most kQwen4DraftContextTokens
-    // (draftContext), a bitmap of them, and the tokens scanned so far.
-    std::vector<uint32_t> draftContext;
-    std::vector<uint64_t> draftContextBits;
-    size_t draftContextScanned = 0;
+    Qwen4DraftContext draftContext;
   };
 
   struct DecodeLaneResult final {
@@ -456,40 +447,7 @@ struct Runtime::Impl {
     entry.mtpJudged = kMtpDecay * entry.mtpJudged + static_cast<float>(kept < entry.mtpDrafted ? kept + 1 : kept);
     entry.mtpDrafted = 0;
   }
-  // With a draft vocabulary (Qwen4DraftVocabulary.hpp), each step of the
-  // MTP head reads about an eighth of the vocabulary projection, but a token
-  // outside it is never proposed, and each such token the target emits ends
-  // its cycle's accepted run. Past a miss rate of about 6 % a cycle loses
-  // more accepted tokens than the smaller head saves it time, so a lane
-  // drafts from it while at most half that, kDraftVocabularyMisses of its
-  // recent tokens (decayed by kDraftVocabularyDecay per token, about the last
-  // 50), fall outside, and the batch while every lane does.
-  static constexpr float kDraftVocabularyMisses = 0.03F;
-  static constexpr float kDraftVocabularyDecay = 0.98F;
-  // Whether the head drafts `token` for this request: a draft vocabulary
-  // token or one of its context's.
-  static bool draftable(const Request &entry, uint32_t token) {
-    if (inQwen4DraftVocabulary(token)) return true;
-    return token / 64 < entry.draftContextBits.size() && ((entry.draftContextBits[token / 64] >> (token % 64)) & 1);
-  }
-  // Its context tokens outside the draft vocabulary, from the tokens it read
-  // or emitted since the last scan.
-  void scanDraftContext(Request &entry) const {
-    if (entry.draftContextBits.empty()) entry.draftContextBits.assign((geometry.target.vocabularySize + 63) / 64, 0);
-    for (; entry.draftContextScanned < entry.tokens.size(); ++entry.draftContextScanned) {
-      const uint32_t token = entry.tokens[entry.draftContextScanned];
-      if (entry.draftContext.size() >= kQwen4DraftContextTokens) {
-        entry.draftContextScanned = entry.tokens.size();
-        break;
-      }
-      if (token >= geometry.target.vocabularySize || draftable(entry, token)) continue;
-      entry.draftContextBits[token / 64] |= uint64_t{1} << (token % 64);
-      entry.draftContext.push_back(token);
-    }
-  }
-  // Which request's context rows each state lane holds, and how many.
-  std::array<uint64_t, kLaneCount> draftContextOwners{};
-  std::array<uint32_t, kLaneCount> draftContextSynced{};
+  Qwen4DraftContextCache<kLaneCount> draftContextCache;
   // Binds each lane's context rows (copying in those it lacks) to a draft
   // from the draft vocabulary.
   void bindDraftContext(QwenTargetVerifyBuffers &buffers, std::span<Request *const> entries) {
@@ -504,22 +462,16 @@ struct Runtime::Impl {
     buffers.draftContextInfo = decodeArena->batchSlice(DecodeTensor::DraftContextInfo, lanes);
     for (uint32_t lane = 0; lane < lanes; ++lane) {
       Request &entry = *entries[lane];
-      scanDraftContext(entry);
       const uint32_t stateLane = entry.stateLane;
-      if (draftContextOwners[stateLane] != entry.id) {
-        draftContextOwners[stateLane] = entry.id;
-        draftContextSynced[stateLane] = 0;
-      }
-      const uint32_t count = static_cast<uint32_t>(entry.draftContext.size());
+      const uint32_t count = static_cast<uint32_t>(entry.draftContext.tokens.size());
       auto *pairs = contents<uint32_t>(decodeArena->get(stateLane, DecodeTensor::DraftContextCopies), "context copies");
       auto *tokens = contents<uint32_t>(decodeArena->get(stateLane, DecodeTensor::DraftContextTokens), "context tokens");
-      const uint32_t synced = draftContextSynced[stateLane];
+      const uint32_t synced = draftContextCache.bind(stateLane, entry.id, count);
       for (uint32_t row = synced; row < count; ++row) {
-        pairs[2 * (row - synced)] = entry.draftContext[row];
+        pairs[2 * (row - synced)] = entry.draftContext.tokens[row];
         pairs[2 * (row - synced) + 1] = row;
-        tokens[row] = entry.draftContext[row];
+        tokens[row] = entry.draftContext.tokens[row];
       }
-      draftContextSynced[stateLane] = count;
       buffers.draftContextCopies[lane] = decodeArena->get(stateLane, DecodeTensor::DraftContextCopies);
       buffers.draftContextCopyCounts[lane] = count - synced;
       buffers.draftContextCounts[lane] = count;
@@ -537,16 +489,13 @@ struct Runtime::Impl {
       info[2] = info[3] = 0;
     }
   }
-  static bool draftsFromVocabulary(const Request &entry) {
-    return entry.draftVocabularyMisses <= kDraftVocabularyMisses * entry.draftVocabularyTokens;
-  }
   void countDraftVocabulary(Request &entry, std::span<const uint32_t> tokens) const {
-    if (!targetModel.hasMtpDraftVocabulary()) return;
-    for (const uint32_t token : tokens) {
-      entry.draftVocabularyMisses =
-          kDraftVocabularyDecay * entry.draftVocabularyMisses + (draftable(entry, token) ? 0.0F : 1.0F);
-      entry.draftVocabularyTokens = kDraftVocabularyDecay * entry.draftVocabularyTokens + 1.0F;
-    }
+    if (targetModel.hasMtpDraftVocabulary()) entry.draftContext.record(tokens);
+  }
+  bool useDraftVocabulary(std::span<Request *const> entries) const {
+    return targetModel.hasMtpDraftVocabulary() && std::ranges::all_of(entries, [](const Request *entry) {
+      return !samplingEnabled(*entry) && entry->draftContext.useVocabulary();
+    });
   }
   ops::AneFfn *aneFfn;
   // Qwen3.8-Flash-Next's PLE table when it streams from its file
@@ -782,6 +731,7 @@ struct Runtime::Impl {
       states.clearDraftRings(entry.stateLane);
     states.releaseLane(entry.stateLane, entry.id);
     pageTableBindings[entry.stateLane] = {};
+    draftContextCache.release(entry.stateLane);
   }
 
   // A request lets go of its images; the encoded ones stay in the cache.
@@ -2189,10 +2139,12 @@ struct Runtime::Impl {
       // The batch drafts as deep as its deepest lane wants, from the draft
       // vocabulary while every lane does.
       uint32_t steps = 1;
-      bool draftVocabulary = true;
+      if (targetModel.hasMtpDraftVocabulary())
+        for (uint32_t lane = 0; lane < lanes; ++lane)
+          entries[lane]->draftContext.scan(entries[lane]->tokens, geometry.target.vocabularySize);
+      const bool draftVocabulary = useDraftVocabulary(entries.first(lanes));
       for (uint32_t lane = 0; lane < lanes; ++lane) {
         steps = std::max(steps, mtpStepsFor(*entries[lane]));
-        draftVocabulary = draftVocabulary && draftsFromVocabulary(*entries[lane]);
       }
       for (uint32_t lane = 0; lane < lanes; ++lane) entries[lane]->mtpDrafted = steps;
       if (draftVocabulary && targetModel.hasMtpDraftVocabulary()) bindDraftContext(buffers, entries.first(lanes));
