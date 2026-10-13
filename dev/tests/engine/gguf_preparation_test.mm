@@ -515,10 +515,22 @@ void checkRepack(MetalBackend &backend, const std::filesystem::path &directory, 
 // The draft head of a draft vocabulary through the production loader: each
 // token's row of the head's planes, byte for byte, then zero rows to the
 // tile's end, then the tokens; the same bytes once released and restored.
-void checkDraftHead(MetalBackend &backend, const std::filesystem::path &directory) {
-  const SmallTarget target = smallTarget(false);
+void checkDraftHead(MetalBackend &backend, const std::filesystem::path &directory, bool converted = false) {
+  SmallTarget target = smallTarget(false);
   const model::QwenTargetDimensions &g = target.geometry;
-  const auto path = directory / "draft-head.gguf";
+  if (converted) {
+    std::mt19937 rng(253);
+    auto native = makeNative(NVFP4, g.vocabularySize, g.hiddenSize, rng);
+    setTensorScales(native, NVFP4, g.hiddenSize, [](uint32_t) { return 1.75F; });
+    Tensor &head = tensorNamed(target.tensors, "output.weight");
+    head.type = model::ggml::kNVFP4;
+    head.data = blockNvfp4Rows(native);
+    const float scale = 1.75F;
+    std::vector<uint8_t> bytes(sizeof(scale));
+    std::memcpy(bytes.data(), &scale, sizeof(scale));
+    target.tensors.push_back({"output.scale", {1}, model::ggml::kF32, bytes});
+  }
+  const auto path = directory / (converted ? "draft-head-nvfp4.gguf" : "draft-head.gguf");
   writeGguf(path, target.tensors, g);
   const std::vector<uint32_t> tokens{0, 1, 2, 5, 6, 7, 63, 64, 100, 200, 254, 255};
   model::WeightImages images(backend, "fixture");
@@ -880,6 +892,7 @@ int main(int argc, char **argv) {
     guarded("llama.cpp NVFP4", [&] { checkGgufNvfp4(backend, directory.path()); });
     guarded("the target loader", [&] { checkDenseTarget(backend, directory.path()); });
     guarded("a draft vocabulary's head", [&] { checkDraftHead(backend, directory.path()); });
+    guarded("a converted NVFP4 draft head", [&] { checkDraftHead(backend, directory.path(), true); });
     guarded("MLX sources", [&] { checkMlxSources(backend, directory.path(), argv[3]); });
     guarded("NVFP4 and FP8 sources", [&] { checkFloatSources(backend, directory.path()); });
     std::printf("%s (%d failures)\n", failures ? "GGUF preparation tests FAILED" : "GGUF preparation tests passed",
