@@ -31,7 +31,9 @@ using splash::test::require;
 
 namespace {
 
-constexpr uint32_t kRowBytes = 90;
+// The row width every test runs at: Qwen3.8-Flash-Next's PLE rows of 160
+// values, IQ4_NL (90 bytes), then Q8_0 (170 bytes, five 34-byte blocks).
+uint32_t kRowBytes = 90;
 constexpr uint64_t kOffset = 77; // rows start past a header
 
 std::vector<uint8_t> randomBytes(size_t count, uint32_t seed) {
@@ -132,9 +134,11 @@ void cacheBytesHoldTheirRows() {
     require(SparseRowStore::cacheBytesFor(rows + 1, kRowBytes) > budget, "a cache's budget holds another row");
   }
   require(SparseRowStore::cacheRowsFor(100, kRowBytes) == 0, "a budget below one row holds a row");
-  // 102 bytes a row and at least two 4-byte buckets: 110 to 118 bytes a row.
+  // The row, its id and two links, and at least two 4-byte buckets: 20 to 28
+  // bytes a row more than its own.
   const uint64_t gib = SparseRowStore::cacheRowsFor(uint64_t{1} << 30, kRowBytes);
-  require(gib > (uint64_t{1} << 30) / 118 && gib < (uint64_t{1} << 30) / 110, "1 GiB holds an unexpected row count");
+  require(gib > (uint64_t{1} << 30) / (kRowBytes + 28) && gib < (uint64_t{1} << 30) / (kRowBytes + 20),
+          "1 GiB holds an unexpected row count");
   rejects([] { Fixture(1000, 0); }, "", "a cache without a row was accepted");
 }
 
@@ -425,25 +429,28 @@ void readsAnOpenFile(const std::filesystem::path &directory) {
 
 int main() {
   try {
-    const splash::test::TemporaryDirectory directory("sparse-row-store");
-    cacheBytesHoldTheirRows();
-    stagesExactRowsOnce();
-    evictsLeastRecentlyUsed();
-    retriesOnceThenPoisons();
-    aWrittenSourcePoisons();
-    aWriteDuringReadsCachesNothing();
-    rejectsBadCallsWithoutPoison();
-    stagesWithoutReaders();
-    stagesWhileReadersAreBlocked();
-    adoptsPrefetchedRows();
-    boundsQueuedPrefetch();
-    concurrentUse();
-    readsAnOpenFile(directory.path());
-    keepsMetadataSourceIdentity(directory.path());
+    for (const uint32_t width : {90u, 170u}) {
+      kRowBytes = width;
+      const splash::test::TemporaryDirectory directory("sparse-row-store");
+      cacheBytesHoldTheirRows();
+      stagesExactRowsOnce();
+      evictsLeastRecentlyUsed();
+      retriesOnceThenPoisons();
+      aWrittenSourcePoisons();
+      aWriteDuringReadsCachesNothing();
+      rejectsBadCallsWithoutPoison();
+      stagesWithoutReaders();
+      stagesWhileReadersAreBlocked();
+      adoptsPrefetchedRows();
+      boundsQueuedPrefetch();
+      concurrentUse();
+      readsAnOpenFile(directory.path());
+      keepsMetadataSourceIdentity(directory.path());
+    }
   } catch (const std::exception &error) {
-    std::cerr << "sparse row store test failed: " << error.what() << '\n';
+    std::cerr << "sparse row store test failed at " << kRowBytes << "-byte rows: " << error.what() << '\n';
     return 1;
   }
-  std::cout << "sparse row store tests passed\n";
+  std::cout << "sparse row store tests passed (90- and 170-byte rows)\n";
   return 0;
 }
