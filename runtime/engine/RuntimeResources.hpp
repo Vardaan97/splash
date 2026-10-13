@@ -11,6 +11,7 @@
 #include "ops/PageStorage.hpp"
 #include "model/ModelFactory.hpp"
 #include "model/QwenState.hpp"
+#include "model/SparseRowStore.hpp"
 #include "engine/MemoryAudit.hpp"
 #include "engine/ReleasableMemory.hpp"
 #include "engine/Status.hpp"
@@ -251,6 +252,8 @@ public:
   [[nodiscard]] const AneFfnOutcome &aneFfnOutcome() const noexcept { return aneFfnOutcome_; }
   // The split as it stands now, for /status.
   [[nodiscard]] AneFfnSnapshot aneFfnSnapshot() const;
+  // The streamed PLE table's store (--ple-ssd-cache), if the model has one.
+  [[nodiscard]] std::optional<model::SparseRowStats> streamedTableStats() const;
 
   [[nodiscard]] model::RuntimeContext modelContext() noexcept;
   // What the engine gives back while idle (NativeLoopConfig::weights): the

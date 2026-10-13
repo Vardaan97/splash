@@ -870,6 +870,11 @@ model::RuntimeContext RuntimeResources::modelContext() noexcept {
   };
 }
 
+std::optional<model::SparseRowStats> RuntimeResources::streamedTableStats() const {
+  if (const model::SparseRowStore *table = model_.streamedTable()) return table->stats();
+  return std::nullopt;
+}
+
 AneFfnSnapshot RuntimeResources::aneFfnSnapshot() const {
   if (!aneFfn_)
     return {.reason = aneFfnOutcome_.reason};
