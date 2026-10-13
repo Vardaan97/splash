@@ -29,6 +29,8 @@
 
 namespace splash::model {
 
+class WeightSource;
+
 class SparseRowError final : public std::runtime_error {
 public:
   using std::runtime_error::runtime_error;
@@ -72,6 +74,9 @@ public:
 // file (its size or modification time) is a change. `path` names the file in
 // errors only.
 [[nodiscard]] std::unique_ptr<RowReader> openRowReader(int descriptor, const std::filesystem::path &path);
+// Keeps the identity of the source the metadata was parsed from across the
+// descriptor handoff; a write before the reader's fresh snapshot is refused.
+[[nodiscard]] std::unique_ptr<RowReader> openRowReader(const WeightSource &source);
 
 struct SparseRowStoreOptions final {
   // The cache and working-memory reservation (committedBytes): workingBytes

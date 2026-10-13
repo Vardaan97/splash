@@ -7,6 +7,7 @@
 #include "TestChecks.hpp"
 #include "TestFiles.hpp"
 #include "model/SparseRowStore.hpp"
+#include "model/WeightSource.hpp"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -335,6 +336,32 @@ void concurrentUse() {
   require(!failures.load() && !f.store->stats().poisoned, "concurrent stages failed");
 }
 
+// A same-size write between the metadata source's check and the reader's
+// new snapshot must not become an accepted baseline at descriptor handoff.
+void keepsMetadataSourceIdentity(const std::filesystem::path &directory) {
+  const auto path = directory / "handoff.bin";
+  splash::test::writeFile(path, randomBytes(kOffset + 8 * kRowBytes, 31));
+  WeightSource source(path);
+  source.checkUnchanged();
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  const int writer = open(path.c_str(), O_WRONLY);
+  const uint8_t changed = 7;
+  require(writer >= 0 && pwrite(writer, &changed, 1, kOffset) == 1, "write at reader handoff");
+  close(writer);
+  // The descriptor-only reader would accept the new bytes as its snapshot.
+  openRowReader(source.descriptor(), source.path())->checkUnchanged();
+  rejects([&] { (void)openRowReader(source); }, "written while",
+          "a write at descriptor handoff replaced the metadata identity");
+  // Replacement at the path still leaves the open descriptor's identity intact.
+  const auto original = directory / "handoff-original.bin";
+  splash::test::writeFile(original, randomBytes(kOffset + 8 * kRowBytes, 32));
+  WeightSource unchanged(original);
+  const auto replacement = directory / "handoff-replacement.bin";
+  splash::test::writeFile(replacement, randomBytes(kOffset + 8 * kRowBytes, 33));
+  std::filesystem::rename(replacement, original);
+  openRowReader(unchanged)->checkUnchanged();
+}
+
 // The production reader reads the file it was given open, uncached: a write
 // to it poisons, a new file at its path changes nothing, a truncation fails.
 void readsAnOpenFile(const std::filesystem::path &directory) {
@@ -412,6 +439,7 @@ int main() {
     boundsQueuedPrefetch();
     concurrentUse();
     readsAnOpenFile(directory.path());
+    keepsMetadataSourceIdentity(directory.path());
   } catch (const std::exception &error) {
     std::cerr << "sparse row store test failed: " << error.what() << '\n';
     return 1;

@@ -1,4 +1,5 @@
 #include "model/SparseRowStore.hpp"
+#include "model/WeightSource.hpp"
 #include "AwakeClock.hpp"
 
 #include <sys/stat.h>
@@ -739,6 +740,14 @@ SparseRowStats SparseRowStore::stats() const {
 
 std::unique_ptr<RowReader> openRowReader(int descriptor, const std::filesystem::path &path) {
   return std::make_unique<FileRowReader>(descriptor, path);
+}
+
+std::unique_ptr<RowReader> openRowReader(const WeightSource &source) {
+  auto reader = openRowReader(source.descriptor(), source.path());
+  // Recheck the original snapshot after the reader has taken its own. A
+  // later write is then caught by the reader's checks before staging.
+  source.checkUnchanged();
+  return reader;
 }
 
 } // namespace splash::model

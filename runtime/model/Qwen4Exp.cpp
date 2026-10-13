@@ -1,5 +1,7 @@
 #include "Qwen4Exp.hpp"
+#include "model/GgufTarget.hpp"
 #include "model/QwenTargetLoader.hpp"
+#include "model/SparseRowStore.hpp"
 
 #include <algorithm>
 #include <stdexcept>
@@ -127,11 +129,19 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend, Qwen4ExpLayout
     if (hash.multipliers.size() != layout.pleNgram || hash.headOffsets.size() != layout.pleHeads() ||
         hash.eosToken != layout.pleEosToken || hash.tableRows > UINT32_MAX)
       throw WeightStoreError("the GGUF's PLE hash does not match the layout");
-    WeightFile file = gguf.ple();
-    result.pleTable =
-        readBlockEmbedding(file, static_cast<uint32_t>(hash.tableRows), layout.pleHeadDimension, "ple-table");
-    file.finish();
-    result.files.push_back(file.record());
+    if (gguf.pleStreamed()) {
+      result.pleStore = gguf.openPleStore();
+      result.pleFormat = gguf.pleFormat();
+      if (result.pleStore->table().rows != hash.tableRows)
+        throw WeightStoreError("the GGUF's PLE table does not match its hash");
+      result.files.push_back(gguf.pleRecord());
+    } else {
+      WeightFile file = gguf.ple();
+      result.pleTable =
+          readBlockEmbedding(file, static_cast<uint32_t>(hash.tableRows), layout.pleHeadDimension, "ple-table");
+      file.finish();
+      result.files.push_back(file.record());
+    }
     std::copy(hash.multipliers.begin(), hash.multipliers.end(), result.pleHash.multipliers.begin());
     result.pleHash.headOffsets = hash.headOffsets;
     result.pleHash.headVocabularies = hash.headVocabularies;

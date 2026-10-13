@@ -5,6 +5,7 @@
 #include "metal/abi/Qwen4.h"
 #include "model/QwenTarget.hpp"
 #include "model/RuntimeArenas.hpp"
+#include "model/SparseRowStore.hpp"
 
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/GDN.h"
@@ -443,6 +444,10 @@ struct Runtime::Impl {
     entry.mtpDrafted = 0;
   }
   ops::AneFfn *aneFfn;
+  // Qwen3.8-Flash-Next's PLE table when it streams from its file
+  // (--ple-ssd-cache): every command stages the rows it gathers before it is
+  // submitted (stagePleRows), so the GPU never waits for the CPU within one.
+  SparseRowStore *pleStore = nullptr;
   explicit Impl(RuntimeContext value)
       : backend(value.backend),
         model(value.model),
@@ -467,6 +472,9 @@ struct Runtime::Impl {
       throw std::invalid_argument(
           "model runtime resources do not match the loaded model");
     }
+    pleStore = model.streamedTable();
+    if (pleStore && (draftModel || !geometry.target.pleStreamRowBytes))
+      throw std::invalid_argument("a streamed PLE table runs with the MTP head or looked-up proposals");
     prefillArena = std::make_unique<PrefillArena>(backend, geometry, operators);
     decodeArena = std::make_unique<DecodeArena>(backend, geometry, operators);
     penaltyTable =
@@ -1434,6 +1442,12 @@ struct Runtime::Impl {
         }
       }
     }
+    if (pleStore) {
+      // The whole command's rows at once, so that lanes share their rows.
+      const uint32_t count = batch.rows * geometry.target.pleHeads();
+      stagePleRows(prefillArena->get(PrefillTensor::PleIndices), prefillArena->get(PrefillTensor::PleSlots),
+                   prefillArena->get(PrefillTensor::PleStaging), count, SparseRowUse::Prefill, true);
+    }
     return batch;
   }
 
@@ -1695,6 +1709,32 @@ struct Runtime::Impl {
                 return std::nullopt;
               },
               out + uint64_t{row} * heads);
+  }
+
+  // Stages a streamed PLE table's rows for `count` row ids of `indices` into
+  // `staging`, each distinct row once, and each id's row there into
+  // `slots`, which the gather reads (QwenTarget::addPleGather). The command
+  // that reads them is submitted after this returns, and no command reading
+  // these buffers is in flight: the engine runs one command at a time, and
+  // a ticket keeps its arena until it completes. A row that cannot be read
+  // throws before anything is submitted, which stops the engine.
+  void stagePleRows(const MetalBuffer &indices, const MetalBuffer &slots, const MetalBuffer &staging,
+                    uint32_t count, SparseRowUse use, bool adoptPrefetch) {
+    const uint64_t rowBytes = geometry.target.pleStreamRowBytes;
+    if (indices.sizeBytes() < bytesFor<uint32_t>(count) || slots.sizeBytes() < bytesFor<uint32_t>(count) ||
+        staging.sizeBytes() < count * rowBytes)
+      throw std::logic_error("PLE staging is smaller than its step");
+    pleStore->stage({contents<const uint32_t>(indices, "PLE rows"), count},
+                    {contents<uint8_t>(staging, "PLE staging"), count * rowBytes},
+                    {contents<uint32_t>(slots, "PLE slots"), count}, use, adoptPrefetch);
+  }
+
+  // A decode batch's PLE rows: kDecodeRows per lane.
+  void stageDecodePleRows(uint32_t width) {
+    stagePleRows(decodeArena->batchSlice(DecodeTensor::PleIndices, width),
+                 decodeArena->batchSlice(DecodeTensor::PleSlots, width),
+                 decodeArena->batchSlice(DecodeTensor::PleStaging, width),
+                 width * kDecodeRows * geometry.target.pleHeads(), SparseRowUse::Decode, false);
   }
 
   // The QSA blocks whose last token is one of `rows` rows from `position`,
@@ -2023,13 +2063,22 @@ struct Runtime::Impl {
   // The verify rows' tokens, their PLE rows (on the GPU when the MTP head
   // drafted the proposals) and embeddings.
   void encodeVerifyInputs(CommandGraph &graph, uint32_t width) {
+    encodeVerifyTokens(graph, width);
+    encodeBatchEmbedding(graph, DecodeTensor::InputTokens, DecodeTensor::Hidden0, width);
+  }
+  void encodeVerifyTokens(CommandGraph &graph, uint32_t width) {
     encodeBatchVerifyInput(graph, width);
     if (targetModel.hasMtp())
       targetModel.addPleHash(graph, decodeArena->batchSlice(DecodeTensor::InputTokens, width),
                              decodeArena->batchSlice(DecodeTensor::PlePrior, width),
                              decodeArena->batchSlice(DecodeTensor::PleIndices, width), width);
-    encodeBatchEmbedding(graph, DecodeTensor::InputTokens, DecodeTensor::Hidden0, width);
   }
+  // Whether a cycle's PLE rows come from the GPU's hash of the MTP head's
+  // proposals and a streamed table: the draft's command then ends with the
+  // hash (encodeVerifyTokens), and the CPU stages the rows it names before
+  // the verify's command is encoded (StagedVerifyTicket, and the
+  // constrained ticket).
+  [[nodiscard]] bool stagesDraftedPleRows() const noexcept { return pleStore && targetModel.hasMtp(); }
 
   void encodeTargetVerifyBatchPolicy(CommandGraph &graph,
                                      std::span<Request *const> entries) {
@@ -2258,6 +2307,79 @@ struct Runtime::Impl {
     return results;
   }
 
+  // An MTP cycle over a streamed PLE table: the draft's command ends with
+  // the GPU's hash of the verify rows' PLE row ids (encodeVerifyTokens); once
+  // it completes the CPU stages the rows they name, and the verify's command
+  // (the rest of the cycle) gathers them. The engine polls the ticket when a
+  // command completes (takeMaskRequests), so all of it runs on the engine
+  // thread, and the ticket keeps the batch's DecodeArena lanes throughout.
+  // A row that cannot be read throws between the commands, with none in
+  // flight and nothing of the cycle committed.
+  class StagedVerifyTicket final : public ModelBatchTicket {
+  public:
+    StagedVerifyTicket(Impl &impl, std::vector<DecodeLaneResult> lanes, std::span<const ModelBatchItem> items,
+                       const CommandGraph &draft, std::function<void()> completion)
+        : impl_(impl), lanes_(std::move(lanes)), items_(items.begin(), items.end()), wake_(std::move(completion)) {
+      command_ = impl_.backend.submitCommandAsync(draft.dispatches(), wake_);
+    }
+
+    std::vector<ModelMaskRequest> takeMaskRequests() override {
+      if (stage_ == Stage::Draft && command_.ready()) verify();
+      return {};
+    }
+
+    bool ready() const noexcept override { return stage_ == Stage::Verify && command_.ready(); }
+
+    std::vector<ModelStepResult> wait() override {
+      // A caller that waits without polling (Runtime::decode) runs the
+      // cycle through.
+      if (stage_ == Stage::Draft) verify();
+      if (stage_ != Stage::Verify) throw std::logic_error("staged verify ticket is not complete");
+      addTiming(command_.wait());
+      stage_ = Stage::Done;
+      return impl_.finalizeDecode(lanes_, items_, timing_);
+    }
+
+    double wallMilliseconds() const noexcept override { return timing_.wallSeconds * 1000.0; }
+
+  private:
+    enum class Stage : uint8_t { Draft, Verify, Done };
+
+    void verify() {
+      addTiming(command_.wait());
+      const uint32_t width = static_cast<uint32_t>(lanes_.size());
+      std::array<Request *, kLaneCount> entries{};
+      std::array<uint32_t, kLaneCount> maximumRetained{};
+      for (uint32_t lane = 0; lane < width; ++lane) {
+        entries[lane] = lanes_[lane].request;
+        maximumRetained[lane] = lanes_[lane].maximumRetained;
+      }
+      const std::span<Request *const> batch(entries.data(), width);
+      impl_.stageDecodePleRows(width);
+      CommandGraph target;
+      impl_.encodeBatchEmbedding(target, DecodeTensor::InputTokens, DecodeTensor::Hidden0, width);
+      impl_.encodeTargetVerifyBatchForward(target, batch, items_);
+      impl_.encodeTargetVerifyBatchPolicy(target, batch);
+      impl_.encodeBatchAcceptance(target, batch, {maximumRetained.data(), width});
+      impl_.encodeTargetStateCommit(target, batch);
+      command_ = impl_.backend.submitCommandAsync(target.dispatches(), wake_);
+      stage_ = Stage::Verify;
+    }
+
+    void addTiming(CommandTiming value) noexcept {
+      timing_.gpuSeconds += value.gpuSeconds;
+      timing_.wallSeconds += value.wallSeconds;
+    }
+
+    Impl &impl_;
+    std::vector<DecodeLaneResult> lanes_;
+    std::vector<ModelBatchItem> items_;
+    Stage stage_ = Stage::Draft;
+    CommandTicket command_;
+    CommandTiming timing_;
+    std::function<void()> wake_;
+  };
+
   // A constrained DFlash cycle has one host dependency between three Metal
   // commands: draft proposals define the grammar simulation, while the target
   // forward is independent of the resulting mask.  This ticket keeps the
@@ -2305,7 +2427,13 @@ struct Runtime::Impl {
 
         CommandGraph target;
         const uint32_t width = static_cast<uint32_t>(lanes_.size());
-        impl_.encodeVerifyInputs(target, width);
+        if (impl_.stagesDraftedPleRows()) {
+          // The draft's command hashed the rows (StagedVerifyTicket).
+          impl_.stageDecodePleRows(width);
+          impl_.encodeBatchEmbedding(target, DecodeTensor::InputTokens, DecodeTensor::Hidden0, width);
+        } else {
+          impl_.encodeVerifyInputs(target, width);
+        }
         impl_.encodeTargetVerifyBatchForward(
             target, {entries.data(), lanes_.size()}, items_);
         submit(target);
@@ -2972,6 +3100,16 @@ Runtime::decodeAsync(const BatchPlan &plan,
       }
     }
     impl_->encodeThinkingDrafts(commandGraph, entries);
+  }
+  // A streamed PLE table: the MTP head's proposals' rows are staged between
+  // the draft's command and the verify's, the looked-up proposals' now.
+  if (impl_->stagesDraftedPleRows()) {
+    impl_->encodeVerifyTokens(commandGraph, width);
+    if (!constrained)
+      return std::make_unique<Impl::StagedVerifyTicket>(*impl_, std::move(lanes), items, commandGraph,
+                                                        std::move(completion));
+  } else if (impl_->pleStore) {
+    impl_->stageDecodePleRows(width);
   }
   if (constrained) {
     return std::make_unique<Impl::ConstrainedDecodeTicket>(
