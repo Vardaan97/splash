@@ -21,9 +21,8 @@ inline constexpr uint32_t kQwen4DraftVocabularySource = 248320;
 // Beside it each request drafts from up to kQwen4DraftContextTokens more:
 // the tokens outside it that its own context holds (its prompt and output,
 // in the order they first appear), whose rows of the vocabulary projection
-// its state lane keeps. A request's context names its topic's words, which
-// no fixed list ranks: on eight real agentic coding sessions they lift the
-// decode tokens the head can draft from 91 % to 99 %.
+// its state lane keeps. Context coverage depends on the request's tokens
+// and the tokenizer; vocabulary size alone is not a tokenizer identity.
 inline constexpr uint32_t kQwen4DraftContextTokens = 4096;
 
 // The draft vocabulary's tokens, ascending, when `tokens` is its size; none
