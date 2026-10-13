@@ -35,9 +35,9 @@ import os
 import sys
 
 if __package__ in (None, ""):
-    from draft_vocabulary_manifest import write_manifest
+    from draft_vocabulary_manifest import capture_inputs, manifest_path, write_manifest
 else:
-    from .draft_vocabulary_manifest import write_manifest
+    from .draft_vocabulary_manifest import capture_inputs, manifest_path, write_manifest
 
 import numpy as np
 import pyarrow.parquet as pq
@@ -288,10 +288,21 @@ def main():
     parser.add_argument("--cpp")
     parser.add_argument("--ranking")
     parser.add_argument(
-        "--manifest", help="generation record (default: --cpp + .manifest.json)"
+        "--manifest",
+        help="generation record (default: replace --cpp suffix with .manifest.json)",
     )
     arguments = parser.parse_args()
+    code_paths = [path for root in arguments.code for path in source_paths(root)]
+    inputs = (
+        capture_inputs(arguments.tokenizer, arguments.corpus, code_paths)
+        if arguments.cpp
+        else None
+    )
     ranking = rank(arguments.tokenizer, arguments.corpus, arguments.code)
+    if inputs is not None and inputs != capture_inputs(
+        arguments.tokenizer, arguments.corpus, code_paths
+    ):
+        raise RuntimeError("generation inputs changed while ranking")
     if arguments.ranking:
         np.save(arguments.ranking, ranking)
     if arguments.traces:
@@ -299,12 +310,13 @@ def main():
     if arguments.cpp:
         write_cpp(arguments.cpp, np.sort(ranking[: arguments.tokens]))
         write_manifest(
-            arguments.manifest or arguments.cpp + ".manifest.json",
+            arguments.manifest or manifest_path(arguments.cpp),
             arguments.tokenizer,
             arguments.corpus,
-            [path for root in arguments.code for path in source_paths(root)],
+            code_paths,
             arguments.cpp,
             [sys.executable, *sys.argv],
+            inputs=inputs,
         )
 
 
