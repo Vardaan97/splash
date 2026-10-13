@@ -86,6 +86,11 @@ struct Gate final {
 
 SparseRowTable tableOf(uint64_t rows) { return {"test-table", rows, kRowBytes, kOffset}; }
 
+// The bytes of a store whose cache holds `rows` rows.
+uint64_t bytesFor(uint64_t rows, uint32_t prefetchRows) {
+  return SparseRowStore::cacheBytesFor(rows, kRowBytes) + SparseRowStore::workingBytes(kRowBytes, prefetchRows);
+}
+
 struct Fixture final {
   std::vector<uint8_t> bytes;
   MemoryReader *reader = nullptr;
@@ -96,7 +101,9 @@ struct Fixture final {
     reader = owned.get();
     store = std::make_unique<SparseRowStore>(
         tableOf(rows), std::move(owned),
-        SparseRowStoreOptions{SparseRowStore::cacheBytesFor(cacheRows, kRowBytes), readers, prefetchRows});
+        SparseRowStoreOptions{bytesFor(cacheRows, prefetchRows), readers, prefetchRows});
+    require(store->stats().cacheCapacityRows == cacheRows, "a store's cache holds other than its rows");
+    require(store->committedBytes() <= bytesFor(cacheRows, prefetchRows), "a store holds more than its bytes");
   }
   const uint8_t *row(uint32_t id) const { return bytes.data() + kOffset + uint64_t{id} * kRowBytes; }
   // Stages `ids` and checks every id's staged row against the source.
@@ -209,7 +216,7 @@ void rejectsBadCallsWithoutPoison() {
   // A table past its file is refused.
   rejects([] {
     SparseRowStore(tableOf(10), std::make_unique<MemoryReader>(std::vector<uint8_t>(kOffset + 9 * kRowBytes)),
-                   {SparseRowStore::cacheBytesFor(10, kRowBytes), 1, 16});
+                   {bytesFor(10, 16), 1, 16});
   }, "ends past its file", "a table past its file was accepted");
   rejects([] { SparseRowTable{"wide", uint64_t{1} << 32, kRowBytes, 0}.validate(); }, "32-bit",
           "a table past 32-bit ids was accepted");
@@ -338,7 +345,7 @@ void readsAnOpenFile(const std::filesystem::path &directory) {
   const int parsed = open(path.c_str(), O_RDONLY | O_CLOEXEC);
   require(parsed >= 0, "open the table fixture");
   SparseRowStore store(tableOf(rows), openRowReader(parsed, path),
-                       {SparseRowStore::cacheBytesFor(1024, kRowBytes), 2, 64});
+                       {bytesFor(1024, 64), 2, 64});
   close(parsed); // the reader holds its own descriptor
   const auto check = [&](const std::vector<uint32_t> &ids) {
     std::vector<uint8_t> staged(ids.size() * kRowBytes);
@@ -361,7 +368,7 @@ void readsAnOpenFile(const std::filesystem::path &directory) {
   splash::test::writeFile(second, bytes);
   const int secondFile = open(second.c_str(), O_RDONLY | O_CLOEXEC);
   SparseRowStore written(tableOf(rows), openRowReader(secondFile, second),
-                         {SparseRowStore::cacheBytesFor(1024, kRowBytes), 2, 64});
+                         {bytesFor(1024, 64), 2, 64});
   close(secondFile);
   std::this_thread::sleep_for(std::chrono::milliseconds(10)); // a distinct modification time
   const int writer = open(second.c_str(), O_WRONLY);
@@ -378,7 +385,7 @@ void readsAnOpenFile(const std::filesystem::path &directory) {
   splash::test::writeFile(third, bytes);
   const int thirdFile = open(third.c_str(), O_RDONLY | O_CLOEXEC);
   SparseRowStore truncated(tableOf(rows), openRowReader(thirdFile, third),
-                           {SparseRowStore::cacheBytesFor(1024, kRowBytes), 2, 64});
+                           {bytesFor(1024, 64), 2, 64});
   close(thirdFile);
   require(truncate(third.c_str(), off_t(kOffset + 10 * kRowBytes)) == 0, "truncate the table fixture");
   const std::vector<uint32_t> late{4000};
