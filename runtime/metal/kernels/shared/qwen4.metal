@@ -41,11 +41,11 @@ inline void reduce_streams(thread float (&values)[kStreams], uint streams, threa
 // A row's bf16 values as the register-tile projection that reads them takes
 // them (gguf_sg::Table16, as decode_linear_gguf_prepare writes it), read back
 // from `values` after the threadgroup wrote them: a simdgroup per 64-value
-// span.
+// span, each of the threadgroup's `simdgroups` taking every simdgroups-th.
 inline void qwen4_table16_row(device const bfloat *values, device bfloat *table, device float *sums, uint width,
-                              uint row, uint lane, uint sg) {
+                              uint row, uint lane, uint sg, uint simdgroups = kSimdgroups) {
   threadgroup_barrier(mem_flags::mem_device);
-  for (uint g = sg; g < width / 64; g += kSimdgroups) {
+  for (uint g = sg; g < width / 64; g += simdgroups) {
     const uint k = g * 64 + 2 * lane;
     gguf_sg::Table16::write(table + ulong(row / 8) * width * 8, sums + ulong(row / 8) * gguf_sg::Table16::sums_per_tile(width),
                             width, g, row % 8, lane, values[k], values[k + 1]);
@@ -116,6 +116,176 @@ kernel void qwen4_hyper_norm_table16(device const float *streams [[buffer(0)]],
   threadgroup float scratch[kSimdgroups * kStreams];
   qwen4_hyper_norm_row<true>(streams, norm, inject, normalized, weights, table, sums, p, row, tid, lane, sg, scratch);
 }
+
+// The same norm for Flash-Next's shape, four streams of QWEN4_NORM_HIDDEN
+// values: the same sums in the same order, so bit for bit the same output and
+// weights. qwen4_hyper_norm_row runs latency-bound at decode's few rows: its
+// threadgroup per row waits on each load of its passes in turn. These take
+// every load of a pass before its arithmetic.
+constant constexpr uint kNormHidden = QWEN4_NORM_HIDDEN;
+constant constexpr uint kNormValues = kNormHidden / kRowThreads; // per thread and stream
+static_assert(kNormHidden % kRowThreads == 0, "a thread's values per stream are whole");
+
+// Prefill's rows, and a mix that injects nothing: qwen4_hyper_norm_row's
+// threadgroup per row of kRowThreads threads; each thread holds its values of
+// every stream.
+template <bool Table>
+inline void qwen4_hyper_norm_loaded_row(device const float *streams, device const float *norm,
+                                        device const float *inject, device bfloat *normalized,
+                                        device float *weights, device bfloat *table, device float *table_sums,
+                                        constant Qwen4HyperParams &p, uint row, uint tid, uint lane, uint sg,
+                                        threadgroup float *scratch) {
+  if (row >= p.rows) return;
+  const uint width = kStreams * kNormHidden;
+  device const float *x = streams + ulong(row) * width;
+  float xs[kStreams][kNormValues];
+  for (uint s = 0; s < kStreams; ++s)
+    for (uint i = 0; i < kNormValues; ++i) xs[s][i] = x[s * kNormHidden + tid + i * kRowThreads];
+  float sums[kStreams] = {0.0f, 0.0f, 0.0f, 0.0f};
+  for (uint s = 0; s < kStreams; ++s)
+    for (uint i = 0; i < kNormValues; ++i) sums[s] += xs[s][i] * xs[s][i];
+  reduce_streams(sums, kStreams, scratch, lane, sg);
+  float scale[kStreams];
+  for (uint s = 0; s < kStreams; ++s) scale[s] = rsqrt(sums[s] / p.hidden + QWEN4_RMS_EPSILON);
+  float dots[kStreams] = {0.0f, 0.0f, 0.0f, 0.0f};
+  device bfloat *out = normalized + ulong(row) * width;
+  for (uint s = 0; s < kStreams; ++s) {
+    float ns[kNormValues];
+    for (uint i = 0; i < kNormValues; ++i) ns[i] = norm[s * kNormHidden + tid + i * kRowThreads];
+    for (uint i = 0; i < kNormValues; ++i) {
+      const uint c = s * kNormHidden + tid + i * kRowThreads;
+      const float v = xs[s][i] * scale[s] * ns[i];
+      out[c] = bfloat(v);
+      if (p.inject)
+        for (uint j = 0; j < kStreams; ++j) dots[j] += inject[ulong(j) * width + c] * v;
+    }
+  }
+  if (Table) qwen4_table16_row(out, table, table_sums, width, row, lane, sg);
+  if (!p.inject) return;
+  reduce_streams(dots, kStreams, scratch, lane, sg);
+  if (tid < kStreams) weights[row * kStreams + tid] = 2.0f * sigmoid_of(dots[tid] / p.streams);
+}
+
+// Decode's rows of an injecting mix: a threadgroup of
+// QWEN4_NORM_QUARTER_THREADS threads per row,
+// whose quarter q stands for qwen4_hyper_norm_row's threadgroup in stream q's
+// sum and in injection weight q's dot: each of its threads sums its values of
+// stream q, then runs injection dot q over every stream's values in order,
+// and writes stream q's normalized values.
+template <bool Table>
+inline void qwen4_hyper_norm_quarter_row(device const float *streams, device const float *norm,
+                                         device const float *inject, device bfloat *normalized,
+                                         device float *weights, device bfloat *table, device float *table_sums,
+                                         constant Qwen4HyperParams &p, uint row, uint thread_id, uint lane,
+                                         uint simdgroup, threadgroup float *scratch, threadgroup float *scales) {
+  if (row >= p.rows) return;
+  const uint q = thread_id / kRowThreads, tid = thread_id % kRowThreads;
+  const uint width = kStreams * kNormHidden;
+  device const float *x = streams + ulong(row) * width;
+  float mine[kNormValues];
+  for (uint i = 0; i < kNormValues; ++i) mine[i] = x[q * kNormHidden + tid + i * kRowThreads];
+  float sum = 0.0f;
+  for (uint i = 0; i < kNormValues; ++i) sum += mine[i] * mine[i];
+  // Simdgroup simdgroup is the quarter's simdgroup simdgroup % kSimdgroups.
+  sum = simd_sum(sum);
+  if (lane == 0) scratch[simdgroup] = sum;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0) {
+    float total = 0.0f;
+    for (uint g = 0; g < kSimdgroups; ++g) total += scratch[q * kSimdgroups + g];
+    scales[q] = rsqrt(total / p.hidden + QWEN4_RMS_EPSILON);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  device bfloat *out = normalized + ulong(row) * width;
+  float dot = 0.0f;
+  if (!p.inject) {
+    for (uint i = 0; i < kNormValues; ++i) {
+      const uint c = q * kNormHidden + tid + i * kRowThreads;
+      out[c] = bfloat(mine[i] * scales[q] * norm[c]);
+    }
+  } else {
+    device const float *w = inject + ulong(q) * width;
+    for (uint s = 0; s < kStreams; ++s) {
+      const float scale = scales[s];
+      float xv[kNormValues], ns[kNormValues], ws[kNormValues];
+      for (uint i = 0; i < kNormValues; ++i) {
+        const uint c = s * kNormHidden + tid + i * kRowThreads;
+        xv[i] = x[c];
+        ns[i] = norm[c];
+        ws[i] = w[c];
+      }
+      for (uint i = 0; i < kNormValues; ++i) {
+        const uint c = s * kNormHidden + tid + i * kRowThreads;
+        const float v = xv[i] * scale * ns[i];
+        if (s == q) out[c] = bfloat(v);
+        dot += ws[i] * v;
+      }
+    }
+  }
+  if (Table) qwen4_table16_row(out, table, table_sums, width, row, lane, simdgroup, kStreams * kSimdgroups);
+  if (!p.inject) return;
+  dot = simd_sum(dot);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (lane == 0) scratch[simdgroup] = dot;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid != 0) return;
+  float total = 0.0f;
+  for (uint g = 0; g < kSimdgroups; ++g) total += scratch[q * kSimdgroups + g];
+  weights[row * kStreams + q] = 2.0f * sigmoid_of(total / p.streams);
+}
+
+#define QWEN4_NORM_ARGUMENTS                                                                                     \
+  device const float *streams [[buffer(0)]], device const float *norm [[buffer(1)]],                            \
+      device const float *inject [[buffer(2)]], device bfloat *normalized [[buffer(3)]],                        \
+      device float *weights [[buffer(4)]]
+
+kernel void qwen4_hyper_norm_loaded(QWEN4_NORM_ARGUMENTS, constant Qwen4HyperParams &p [[buffer(5)]],
+                                   uint row [[threadgroup_position_in_grid]],
+                                   uint tid [[thread_index_in_threadgroup]],
+                                   uint lane [[thread_index_in_simdgroup]],
+                                   uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float scratch[kSimdgroups * kStreams];
+  qwen4_hyper_norm_loaded_row<false>(streams, norm, inject, normalized, weights, nullptr, nullptr, p, row, tid, lane,
+                                     sg, scratch);
+}
+
+kernel void qwen4_hyper_norm_loaded_table16(QWEN4_NORM_ARGUMENTS, device bfloat *table [[buffer(5)]],
+                                           device float *sums [[buffer(6)]],
+                                           constant Qwen4HyperParams &p [[buffer(7)]],
+                                           uint row [[threadgroup_position_in_grid]],
+                                           uint tid [[thread_index_in_threadgroup]],
+                                           uint lane [[thread_index_in_simdgroup]],
+                                           uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float scratch[kSimdgroups * kStreams];
+  qwen4_hyper_norm_loaded_row<true>(streams, norm, inject, normalized, weights, table, sums, p, row, tid, lane, sg,
+                                    scratch);
+}
+
+kernel void qwen4_hyper_norm_quarters(QWEN4_NORM_ARGUMENTS, constant Qwen4HyperParams &p [[buffer(5)]],
+                                            uint row [[threadgroup_position_in_grid]],
+                                            uint thread_id [[thread_index_in_threadgroup]],
+                                            uint lane [[thread_index_in_simdgroup]],
+                                            uint simdgroup [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float scratch[kStreams * kSimdgroups];
+  threadgroup float scales[kStreams];
+  qwen4_hyper_norm_quarter_row<false>(streams, norm, inject, normalized, weights, nullptr, nullptr, p, row,
+                                      thread_id, lane, simdgroup, scratch, scales);
+}
+
+kernel void qwen4_hyper_norm_quarters_table16(QWEN4_NORM_ARGUMENTS, device bfloat *table [[buffer(5)]],
+                                                    device float *sums [[buffer(6)]],
+                                                    constant Qwen4HyperParams &p [[buffer(7)]],
+                                                    uint row [[threadgroup_position_in_grid]],
+                                                    uint thread_id [[thread_index_in_threadgroup]],
+                                                    uint lane [[thread_index_in_simdgroup]],
+                                                    uint simdgroup [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float scratch[kStreams * kSimdgroups];
+  threadgroup float scales[kStreams];
+  qwen4_hyper_norm_quarter_row<true>(streams, norm, inject, normalized, weights, table, sums, p, row, thread_id,
+                                     lane, simdgroup, scratch, scales);
+}
+
+#undef QWEN4_NORM_ARGUMENTS
 
 // silu(low / streams) of the mix's low-rank projection, in place.
 kernel void qwen4_hyper_low(device bfloat *low [[buffer(0)]],
