@@ -67,7 +67,7 @@ OPTIONS = {
     "--disable-ane": ([(["--disable-ane"], True)], []),
     "--ple-ssd-cache": values(
         "--ple-ssd-cache",
-        {"off": None, "2G": 2 * 1024**3, "64M": 64 * 1024**2, "OFF": None},
+        {"off": None, "OFF": None, "64M": 64 * 1024**2, "2G": 2 * 1024**3},
         ("0", "1M", "63M", "auto", "bad", "-2G"),
     ),
     "--max-memory": values(
