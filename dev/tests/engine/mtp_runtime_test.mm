@@ -82,7 +82,7 @@ struct Fixture {
     return {floats(16, hidden).blocks().segments.front(), floats(1, hidden).blocks().segments.front(),
             forward, forward, down};
   }
-  explicit Fixture(const char *library, bool adaptive = true, bool withContext = false)
+  explicit Fixture(const char *library, bool adaptive = true, bool withContext = false, bool zeroDepth = false, bool lookup = false)
       : backend(library), contextWeights(withContext), operators(backend.capabilities()) {
     setenv("SPLASH_MTP_ADAPTIVE", adaptive ? "1" : "0", 1);
     setenv("SPLASH_MTP_DRAFTS", "7", 1);
@@ -109,7 +109,8 @@ struct Fixture {
     layout.pleHeadDimension = 256;
     layout.pleConvolutionTaps = 2;
     layout.pleLayer = 0;
-    weights.pleHash = {{1, 1, 1, 1}, {0}, {1}, 1};
+    const uint32_t pleRows = zeroDepth ? 32 : 1;
+    weights.pleHash = {{1, 1, 1, 1}, {0}, {pleRows}, pleRows};
     layout.mtpLayers = 1;
     layout.mtpDraftTokens = 256;
     std::vector<uint16_t> embeddings(uint64_t{vocabulary} * hidden, 0x3f80);
@@ -130,10 +131,21 @@ struct Fixture {
                                upload(std::vector<float>(layout.gdnValueHeads)),
                                norm(layout.gdnHeadDimension), floats(hidden, layout.attentionWidth)};
     trunk.ffn = moe();
-    weights.pleTable = {1, 256, {upload(std::vector<uint16_t>(256)), GGUF_FMT_BF16}};
+    std::vector<uint16_t> pleTable(uint64_t{pleRows} * 256);
+    if (zeroDepth)
+      for (uint32_t row = 0; row < pleRows; ++row)
+        std::fill_n(pleTable.begin() + row * 256, 256, row % 2 ? 0xbf80 : 0x3f80);
+    weights.pleTable = {pleRows, 256, {upload(pleTable), GGUF_FMT_BF16}};
     trunk.ple = Qwen4PleWeights{floats(4 * hidden, 256), floats(hidden, 256),
                                norm(4 * hidden), norm(4 * hidden), norm(4 * hidden),
                                upload(std::vector<float>(2 * 4 * hidden))};
+    if (zeroDepth) {
+      // Nonconstant PLE rows leave their sign in the committed history;
+      // an all-zero table would hide a hash of the old lookup padding.
+      std::vector<float> identity(uint64_t{hidden} * 256);
+      for (uint32_t i = 0; i < hidden; ++i) identity[i * 256 + i] = 1.0F;
+      trunk.ple->value = {hidden, 256, {{ops::QuantizedSegment::floats(hidden, 256, upload(identity))}}};
+    }
     weights.layers.push_back(trunk);
     weights.finalHyper = hyper(false);
     Qwen4MtpWeights mtp;
@@ -162,6 +174,12 @@ struct Fixture {
     mtp.draftHead = Qwen4DraftHead{{256, hidden, {{quantized(256, hidden, true)}}}, upload(tokens)};
     mtp.draftHead->logits.destination = ops::FloatOutput::Float32;
     weights.mtp = mtp;
+    if (lookup) {
+      // Keep one real trunk attention layer when the MTP head is absent.
+      weights.layers.push_back(mtp.block);
+      layout.layers = layout.fullAttentionPeriod = 2;
+      weights.mtp.reset(); layout.mtpLayers = 0;
+    }
     model.target = weights;
     model.draft.layout = nullDraftLayout(hidden, vocabulary, hidden);
     model.descriptor.target = layout;
@@ -181,6 +199,9 @@ struct Fixture {
       require(bool(pages->allocateExtent(i)), "fixture extent allocation");
     states = std::make_unique<QwenStateStorage>(backend, admit, model.stateLayout(ops::GdnStateFormat::Float32), nullptr);
     RuntimeContext context{backend, model, *pages, *states, operators};
+    context.mtpDepth.probeCycles = context.mtpDepth.exploreCycles = 0;
+    context.mtpDepth.measuredCosts = false; // deterministic plans, independent of GPU timings
+    if (zeroDepth) context.mtpDepth.priorRatios = {1.0, 100.0, 100.0, 100.0, 100.0};
     runtime = std::make_unique<Runtime>(context);
   }
   engine::EngineRequest request(uint64_t id, std::vector<uint32_t> prompt, bool constrained = false) {
@@ -222,11 +243,86 @@ struct Fixture {
   }
 };
 
+void unequalCommit(const char *library) {
+  Fixture f(library);
+  const std::array<uint64_t, 2> ids{1, 2};
+  const std::array<uint32_t, 2> lanes{2, 0}; // decode order differs from state order
+  f.prefill(f.request(1, {10}), lanes[0]);
+  f.prefill(f.request(2, {11}), lanes[1]);
+  bool unequal = false, zero = false;
+  for (uint32_t cycle = 0; cycle < 40; ++cycle) {
+    const auto before0 = f.states->metadata(lanes[0]).lengths.targetTokens;
+    const auto before1 = f.states->metadata(lanes[1]).lengths.targetTokens;
+    const auto results = f.submit(ids, lanes)->wait();
+    require(results.size() == 2, "Runtime B2 result width");
+    for (uint32_t i = 0; i < 2; ++i) {
+      const auto &r = results[i];
+      require(r.failure.empty() && !r.finished && r.requestId == ids[i], "Runtime healthy lane commits");
+      require(r.acceptedDraftTokens <= r.draftedTokens && r.outputTokens.size() == r.acceptedDraftTokens + 1,
+              "Runtime retained-proposal accounting");
+      require(std::ranges::all_of(r.outputTokens, [i](uint32_t t) { return t == i; }), "Runtime greedy tokens");
+      const uint64_t before = i ? before1 : before0;
+      require(f.states->metadata(lanes[i]).lengths.targetTokens == before + r.outputTokens.size(),
+              "Runtime commits each lane's actual retained rows");
+    }
+    unequal |= results[0].draftedTokens != results[1].draftedTokens;
+    if (results[1].draftedTokens == 0 && results[0].draftedTokens > 0) {
+      zero = true;
+      require(results[1].acceptedDraftTokens == 0 && results[1].outputTokens.size() == 1,
+              "Runtime zero-depth lane commits only its target anchor");
+    }
+  }
+  require(unequal && zero, "Runtime B2 reaches unequal and zero depth commits");
+  // Make the zero-depth lane's target now agree with the padded proposal
+  // rows. Its prior acceptance remains low (zero-depth cycles judge none).
+  // Retention must still stop at the one real anchor, even if the GPU's raw
+  // acceptance would keep the padding. The fixture changes only shared weights
+  // after all commands have drained, as the runtime oracle's fault fixtures do.
+  auto &weights = std::get<Qwen4ExpWeights>(f.model.target);
+  auto *embeddings = static_cast<uint16_t *>(weights.tokenEmbedding.blocks().rows.contents());
+  std::fill_n(embeddings + hidden, hidden, 0x3f80);
+  std::fill_n(embeddings + 11 * hidden, hidden, 0x3f80);
+  const auto before = f.states->metadata(lanes[1]).lengths.targetTokens;
+  const auto capped = f.submit(ids, lanes)->wait();
+  require(capped[0].draftedTokens > 0 && capped[1].draftedTokens == 0 &&
+              capped[1].acceptedDraftTokens == 0 && capped[1].outputTokens.size() == 1 &&
+              f.states->metadata(lanes[1]).lengths.targetTokens == before + 1,
+          "Runtime zero-depth commit excludes matching physical padding");
+  f.runtime->end(1); f.runtime->end(2);
+  std::cout << "runtime_unequal_zero_commit=PASS\n";
+}
+
 uint32_t copyDispatches(Fixture &f) {
   const auto profile = metal::BackendInstrumentation::takeDispatchProfile(f.backend);
   return std::count_if(profile.begin(), profile.end(), [](const auto &d) {
     return d.pipelineName == "qwen4_copy_head_rows";
   });
+}
+
+void thinkingZeroDepth(const char *library) {
+  std::vector<uint8_t> history;
+  for (const bool lookup : {false, true}) {
+    Fixture f(library, true, false, true, lookup);
+    auto request = f.request(43, {10});
+    request.thinkingBudget = ThinkingBudget{1, {3, 4, 5}, 6};
+    f.prefill(request, 2);
+    const auto before = f.states->metadata(2).lengths.targetTokens;
+    const auto result = f.decode(43, 2);
+    require(result.failure.empty() && result.outputTokens == std::vector<uint32_t>({0, 3, 4, 5}),
+            "Runtime zero-depth/empty-lookup cutoff keeps the forced end rows in one cycle");
+    require(result.draftedTokens == 0 && result.acceptedDraftTokens == 0 &&
+                f.states->metadata(2).lengths.targetTokens == before + 4,
+            "Runtime zero-depth/empty-lookup cutoff commits forced rows without counting them as drafts");
+    const auto auxiliary = f.states->current(2).auxiliary;
+    const auto *bytes = static_cast<const uint8_t *>(auxiliary.contents());
+    const uint64_t historyBytes = std::get<Qwen4ExpWeights>(f.model.target).layout.pleHistoryBytes();
+    require(auxiliary.sizeBytes() >= historyBytes, "Runtime fixture holds its PLE history");
+    if (!lookup) history.assign(bytes, bytes + historyBytes);
+    else require(std::equal(history.begin(), history.end(), bytes),
+                 "Runtime CPU lookup and GPU MTP hash the same forced-end PLE rows");
+    f.runtime->end(43);
+  }
+  std::cout << "runtime_thinking_zero_depth_lookup=PASS\n";
 }
 
 void thinkingCutoff(const char *library) {
@@ -352,7 +448,7 @@ void constrainedTransitions(const char *library) {
 int main(int argc, char **argv) {
   try {
     require(argc == 2, "usage: mtp-runtime METALLIB");
-    thinkingCutoff(argv[1]); contextLifetime(argv[1]); constrainedTransitions(argv[1]);
+    unequalCommit(argv[1]); thinkingZeroDepth(argv[1]); thinkingCutoff(argv[1]); contextLifetime(argv[1]); constrainedTransitions(argv[1]);
   } catch (const std::exception &error) {
     std::cerr << "mtp-runtime: FAIL: " << error.what() << '\n'; return 1;
   }
