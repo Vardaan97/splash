@@ -74,7 +74,8 @@ uint64_t imageBytes(const std::vector<gguf::Image> &images) {
 
 LoadedModel loadModel(metal::MetalBackend &backend,
                               const std::filesystem::path &root,
-                              const ModelDescriptor &descriptor) {
+                              const ModelDescriptor &descriptor,
+                              const ModelLoadOptions &options) {
   LoadedModel result;
   result.descriptor = descriptor;
   if (!result.descriptor.valid())
@@ -103,7 +104,8 @@ LoadedModel loadModel(metal::MetalBackend &backend,
           }
         }
         case TargetSource::Gguf: {
-          GgufTargetLoader loader(backend, images, findTargetGgufs(directory), layout);
+          GgufTargetLoader loader(backend, images, findTargetGgufs(directory), layout,
+                                  {options.pleCacheBytes, options.pleReaders});
           return readTarget(backend, layout, std::ref(loader), mtp.get());
         }
         }
@@ -127,7 +129,8 @@ LoadedModel loadModel(metal::MetalBackend &backend,
   return result;
 }
 
-uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor) {
+uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor,
+                          const ModelLoadOptions &options) {
   uint64_t bytes = 0;
   if (descriptor.targetSource == TargetSource::Gguf) {
     std::deque<WeightSource> sources;
@@ -136,7 +139,13 @@ uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescript
       files.push_back(&sources.emplace_back(path));
     const GgufFile file(files);
     bytes = std::visit(
-        [&](const auto &layout) { return imageBytes(gguf::planImages(file, layout)); },
+        [&](const auto &layout) {
+          std::vector<gguf::Image> images = gguf::planImages(file, layout);
+          // A streamed PLE table writes no image (GgufTargetLoader).
+          if (options.pleCacheBytes && layout.qwen4() && layout.pleLayer < layout.layers)
+            std::erase_if(images, [](const gguf::Image &image) { return image.name == "ple.bin"; });
+          return imageBytes(images);
+        },
         descriptor.target);
     if (const auto *qwen4 = std::get_if<Qwen4ExpLayout>(&descriptor.target); qwen4 && qwen4->mtpLayers) {
       WeightSource mtp(findMtpGguf(root));

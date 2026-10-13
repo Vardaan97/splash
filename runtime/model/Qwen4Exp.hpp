@@ -28,11 +28,14 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string_view>
 #include <vector>
 
 namespace splash::model {
+
+class SparseRowStore;
 
 struct Qwen4ExpLayout final : QwenHybridLayout<1> {
   // The family's name, as the installer pairs its draft (install/families.py).
@@ -181,8 +184,12 @@ struct Qwen4ExpWeights final : QwenTargetWeightsBase {
   std::vector<Qwen4ExpLayerWeights> layers;
   // The last mix, which feeds the head (finalNorm is unused).
   Qwen4HyperWeights finalHyper;
-  // The PLE table's native rows of pleHeadDimension values.
+  // The PLE table's native rows of pleHeadDimension values; empty when the
+  // table streams from its file (--ple-ssd-cache), where pleStore reads the
+  // rows of pleFormat a step gathers.
   ops::EmbeddingWeights pleTable;
+  std::shared_ptr<SparseRowStore> pleStore;
+  uint32_t pleFormat = 0;
   Qwen4PleHash pleHash;
   std::optional<Qwen4MtpWeights> mtp;
 };

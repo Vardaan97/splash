@@ -1676,6 +1676,8 @@ def _native_command(args):
         )
     if args.allow_idle_sleep:
         command.extend(("--idle-sleep", "allow"))
+    if args.ple_ssd_cache:
+        command.extend(("--ple-ssd-cache", str(args.ple_ssd_cache)))
     return command
 
 

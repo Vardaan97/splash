@@ -99,6 +99,11 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
   // Qwen3.8-Flash-Next's MTP head's attention layers, the last of
   // kvLayout's.
   uint32_t mtpLayers = 0;
+  // Qwen3.8-Flash-Next's PLE table when it streams from its file: the bytes
+  // and format (GGUF_FMT_*) of its native rows, which a step stages
+  // (PleStaging); zero bytes when the table is in memory.
+  uint32_t pleStreamRowBytes = 0;
+  uint32_t pleStreamFormat = 0;
   // Distinct operator requirements, collected from the loaded weights.
   std::vector<ops::ProjectionShape> prefillProjections;
   std::vector<ops::ProjectionShape> decodeProjections;
@@ -204,6 +209,11 @@ struct QwenHyperBuffers final {
   metal::MetalBuffer branch;
   metal::MetalBuffer zeros;
   metal::MetalBuffer pleIndices;
+  // A streamed table's step: each distinct row once (pleStaging) and each
+  // index's row there (pleSlots), which the gather reads instead of
+  // pleIndices and the table.
+  metal::MetalBuffer pleSlots;
+  metal::MetalBuffer pleStaging;
   metal::MetalBuffer pleRows;
   metal::MetalBuffer pleValue;
   metal::MetalBuffer pleGated;
@@ -436,6 +446,10 @@ private:
   // Qwen3.8-Flash-Next's graphs (QwenTarget.cpp addQwen4*).
   [[nodiscard]] metal::MetalBuffer addQwen4Prefill(PrefillStep &step, const Qwen4ExpWeights &weights) const;
   void addQwen4Verify(VerifyStep &step, const Qwen4ExpWeights &weights) const;
+  // The PLE layer's `count` rows into h.pleRows: from the table by
+  // h.pleIndices, or, when the table streams, from the rows the runtime
+  // staged by h.pleSlots, with the table's own gather.
+  void addPleGather(metal::CommandGraph &graph, const QwenHyperBuffers &h, uint32_t count) const;
   // A mix into `output`; its projections read the tables its norm and low
   // step write, and with `next`, the decode projection that reads `output`
   // first takes the table the mix writes (the returned input).

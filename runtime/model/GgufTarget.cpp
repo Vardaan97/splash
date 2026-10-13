@@ -38,7 +38,7 @@ void GgufTargetLoader::Planned::checkUnchanged() const {
 
 GgufTargetLoader::GgufTargetLoader(metal::MetalBackend &backend, WeightImages &images,
                                    const std::vector<std::filesystem::path> &paths,
-                                   const QwenTargetDimensions &geometry)
+                                   const QwenTargetDimensions &geometry, PleStreaming streaming)
     : backend_(backend), images_(images), planned_(std::make_shared<Planned>(paths)) {
   std::vector<WeightSource *> parsed;
   for (WeightSource &source : planned_->files) parsed.push_back(&source);
@@ -47,6 +47,33 @@ GgufTargetLoader::GgufTargetLoader(metal::MetalBackend &backend, WeightImages &i
   planned_->images = gguf::planImages(file, geometry);
   planned_->layers = geometry.layers;
   planned_->pleHash = gguf::readPleHash(file, geometry);
+  planned_->streaming = streaming;
+  if (streaming.cacheBytes && planned_->images.size() == planned_->layers + 3)
+    planned_->pleRows = gguf::pleTableRows(file, geometry);
+}
+
+uint32_t GgufTargetLoader::pleFormat() const {
+  if (!planned_->pleRows) throw GgufError("the PLE table does not stream");
+  return planned_->pleRows->format;
+}
+
+std::shared_ptr<SparseRowStore> GgufTargetLoader::openPleStore() const {
+  if (!planned_->pleRows) throw GgufError("the PLE table does not stream");
+  const gguf::StreamedRows &rows = *planned_->pleRows;
+  const WeightSource &source = planned_->files.at(rows.file);
+  // The file the metadata was parsed from, unwritten since.
+  source.checkUnchanged();
+  return std::make_shared<SparseRowStore>(
+      SparseRowTable{rows.tensor, rows.rows, rows.rowBytes, rows.offset},
+      openRowReader(source),
+      SparseRowStoreOptions{planned_->streaming.cacheBytes, planned_->streaming.readers});
+}
+
+WeightFileRecord GgufTargetLoader::pleRecord() const {
+  if (!planned_->pleRows) throw GgufError("the PLE table does not stream");
+  const gguf::Image &plan = planned_->images[planned_->layers + 2];
+  // As WeightImages::load records it (WeightFile).
+  return {"target/" + plan.name, plan.magic, plan.layer, plan.type, plan.bytes, images_.contentIdentity()};
 }
 
 WeightFile GgufTargetLoader::open(size_t index) {
@@ -70,6 +97,7 @@ WeightFile GgufTargetLoader::embedding() { return open(planned_->layers + 1); }
 
 WeightFile GgufTargetLoader::ple() {
   if (planned_->images.size() != planned_->layers + 3) throw GgufError("the target has no PLE table");
+  if (planned_->pleRows) throw GgufError("the PLE table streams");
   return open(planned_->layers + 2);
 }
 

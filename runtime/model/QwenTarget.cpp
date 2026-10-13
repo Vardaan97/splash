@@ -3,6 +3,7 @@
 #include "model/Qwen3_6Moe.hpp"
 #include "model/Qwen3_8.hpp"
 #include "model/Qwen4Exp.hpp"
+#include "model/SparseRowStore.hpp"
 #include "ops/Qwen4.hpp"
 #include "metal/abi/Qwen4.h"
 #include "model/WeightStore.hpp"
@@ -140,6 +141,10 @@ QwenTargetGeometry qwenTargetGeometry(const Qwen4ExpWeights &weights) {
   geometry.kvLayout = layout.kvLayout();
   geometry.stateLayout = layout.gdnStateLayout();
   geometry.mtpLayers = layout.mtpLayers;
+  if (weights.pleStore) {
+    geometry.pleStreamRowBytes = weights.pleStore->table().rowBytes;
+    geometry.pleStreamFormat = weights.pleFormat;
+  }
   const auto hyper = [&](const Qwen4HyperWeights &mix) {
     includeProjection(geometry, mix.down);
     includeProjection(geometry, mix.up);
@@ -701,7 +706,7 @@ metal::MetalBuffer QwenTarget::addQwen4Prefill(PrefillStep &step, const Qwen4Exp
     if (layer.ple) {
       const Qwen4PleWeights &ple = *layer.ple;
       const ops::PleShape ps = pleShape(geometry_);
-      ops::Embedding::add(step.graph, h.pleIndices, weights.pleTable, h.pleRows, rows * geometry_.pleHeads());
+      addPleGather(step.graph, h, rows * geometry_.pleHeads());
       project(h.pleRows, ple.key, h.gate);
       project(h.pleRows, ple.value, h.pleValue);
       ops::Qwen4::addPleGate(step.graph, h.gate, h.pleValue, h.streams, ple.keyNorm, ple.queryNorm,
@@ -978,7 +983,7 @@ void QwenTarget::addQwen4Verify(VerifyStep &step, const Qwen4ExpWeights &weights
     if (layer.ple) {
       const Qwen4PleWeights &ple = *layer.ple;
       const ops::PleShape ps = pleShape(geometry_);
-      ops::Embedding::add(step.graph, h.pleIndices, weights.pleTable, h.pleRows, rows * geometry_.pleHeads());
+      addPleGather(step.graph, h, rows * geometry_.pleHeads());
       project(h.pleRows, ple.key, h.gate);
       project(h.pleRows, ple.value, h.pleValue);
       ops::Qwen4::addPleGate(step.graph, h.gate, h.pleValue, h.streams, ple.keyNorm, ple.queryNorm,
@@ -1110,6 +1115,21 @@ void QwenTarget::addMtpDraft(metal::CommandGraph &graph, QwenTargetVerifyBuffers
                                 rowsOf<float>(backend_, h.mtpHistory, lane * laneRows + j - 1, 1, width), {},
                                 hyperShape(geometry_), j);
   }
+}
+
+void QwenTarget::addPleGather(metal::CommandGraph &graph, const QwenHyperBuffers &h, uint32_t count) const {
+  const Qwen4ExpWeights *weights = qwen4();
+  if (!weights) throw std::logic_error("only Qwen3.8-Flash-Next gathers PLE rows");
+  if (!geometry_.pleStreamRowBytes) {
+    ops::Embedding::add(graph, h.pleIndices, weights->pleTable, h.pleRows, count);
+    return;
+  }
+  // At most `count` distinct rows, each slot below it: the gather of the
+  // table's rows with the staging as a table of `count` rows, so a row's
+  // values are computed exactly as from the table.
+  const ops::EmbeddingWeights staged{count, geometry_.pleHeadDimension,
+                                     ops::NativeRows(h.pleStaging, geometry_.pleStreamFormat)};
+  ops::Embedding::add(graph, h.pleSlots, staged, h.pleRows, count);
 }
 
 void QwenTarget::addPleHash(metal::CommandGraph &graph, metal::MetalBuffer tokens, metal::MetalBuffer before,

@@ -102,11 +102,11 @@ MemoryGovernor::MemoryGovernor(
     metal::MetalBackend &backend, uint64_t limitBytes,
     uint64_t hostReserveBytes,
     HostAvailableMemoryProvider hostAvailableMemory,
-    uint64_t untrackedReserveBytes)
+    uint64_t untrackedReserveBytes, uint64_t hostHeldBytes)
     : backend_(backend), limitBytes_(limitBytes),
       hostReserveBytes_(hostReserveBytes),
       hostAvailableMemory_(std::move(hostAvailableMemory)),
-      untrackedReserveBytes_(untrackedReserveBytes) {
+      untrackedReserveBytes_(untrackedReserveBytes), hostHeldBytes_(hostHeldBytes) {
   if (!limitBytes_) {
     throw std::invalid_argument("memory governor limit must be positive");
   }
@@ -141,7 +141,8 @@ MemoryGovernor::chargedBytes(bool refreshDevice) const noexcept {
   const uint64_t accounted = untrackedReserveBytes_ <= limit - memory.allocatedBytes
       ? memory.allocatedBytes + untrackedReserveBytes_
       : limit;
-  return std::max(accounted, memory.deviceCurrentAllocatedBytes);
+  const uint64_t device = std::max(accounted, memory.deviceCurrentAllocatedBytes);
+  return hostHeldBytes_ <= limit - device ? device + hostHeldBytes_ : limit;
 }
 
 std::optional<uint64_t> MemoryGovernor::sampleHostAvailable() const noexcept {

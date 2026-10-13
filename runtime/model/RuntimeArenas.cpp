@@ -20,6 +20,12 @@ void putHyper(const RuntimeGeometry &geometry, uint64_t rows, Put put) {
   put(Tensor::HyperBranch, bytesFor<uint16_t>(rows * g.hiddenSize));
   put(Tensor::HyperZeros, bytesFor<uint16_t>(rows * g.hiddenSize));
   put(Tensor::PleIndices, bytesFor<uint32_t>(rows * g.pleHeads()));
+  // A streamed table's step stages up to every index's row (each distinct
+  // one once) and each index's slot.
+  if (g.pleStreamRowBytes) {
+    put(Tensor::PleSlots, bytesFor<uint32_t>(rows * g.pleHeads()));
+    put(Tensor::PleStaging, rows * g.pleHeads() * g.pleStreamRowBytes);
+  }
   put(Tensor::PleRows, bytesFor<uint16_t>(rows * g.pleWidth()));
   put(Tensor::PleValue, bytesFor<uint16_t>(rows * g.hiddenSize));
   put(Tensor::PleGated, bytesFor<float>(rows * g.streamWidth()));

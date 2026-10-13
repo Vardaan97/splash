@@ -134,6 +134,10 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
       if (value != "prevent" && value != "allow")
         throw UsageError("--idle-sleep requires prevent or allow");
       result.preventIdleSleep = value == "prevent";
+    } else if (option == "--ple-ssd-cache") {
+      if (!parsePositive(value, result.pleCacheBytes) || result.pleCacheBytes < kMinimumPleCacheBytes)
+        throw UsageError("--ple-ssd-cache requires a byte count of at least " +
+                         std::to_string(kMinimumPleCacheBytes));
     } else if (option == "--ane") {
       if (value != "on" && value != "off")
         throw UsageError("--ane requires on or off");

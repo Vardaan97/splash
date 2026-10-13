@@ -202,4 +202,19 @@ struct PleHash {
 };
 [[nodiscard]] PleHash readPleHash(const GgufFile &file, const QwenTargetDimensions &geometry);
 
+// Where a qwen4exp target's PLE table (per_layer_token_embd.weight) is in its
+// GGUF, for reading its rows from the file (--ple-ssd-cache) instead of
+// writing ple.bin: rows exactly as ple.bin would hold them, so only a table
+// ple.bin copies as stored streams. Throws GgufError for a table of another
+// type or shape, or of a rotated GGUF.
+struct StreamedRows final {
+  std::string tensor;
+  uint32_t file = 0;   // the part of a split GGUF that holds it
+  uint64_t offset = 0; // of row 0, from the start of that file
+  uint64_t rows = 0;
+  uint32_t rowBytes = 0;
+  uint32_t format = 0; // its gguf_embedding_format (GGUF_FMT_*)
+};
+[[nodiscard]] StreamedRows pleTableRows(const GgufFile &file, const QwenTargetDimensions &geometry);
+
 } // namespace splash::model::gguf

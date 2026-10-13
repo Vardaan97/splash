@@ -26,3 +26,4 @@ image_patches_rounded | --max-image-pixels 1000000 | auto auto --max-image-patch
 image_patches_default | --max-image-pixels 4194304 | auto auto
 idle_sleep | --allow-idle-sleep | auto auto --idle-sleep allow
 disable_ane | --disable-ane | auto auto --ane off
+ple_ssd_cache | --ple-ssd-cache 2G | auto auto --ple-ssd-cache 2147483648

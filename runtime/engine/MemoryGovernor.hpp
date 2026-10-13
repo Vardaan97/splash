@@ -158,11 +158,13 @@ public:
 
   // Metal memory outside the backend's buffers (pipelines, driver
   // allocations) is charged only beyond untrackedReserveBytes, the part of
-  // the limit the caller has set aside for it.
+  // the limit the caller has set aside for it. hostHeldBytes, host memory
+  // the engine holds outside Metal for as long as it runs (a streamed
+  // table's row cache, SparseRowStore::committedBytes), is charged in full.
   MemoryGovernor(metal::MetalBackend &backend, uint64_t limitBytes,
                  uint64_t hostReserveBytes,
                  HostAvailableMemoryProvider hostAvailableMemory,
-                 uint64_t untrackedReserveBytes);
+                 uint64_t untrackedReserveBytes, uint64_t hostHeldBytes = 0);
 
   // The only way to reserve memory. Low-level storage/model components
   // receive only this transactional callback, so allocation stays governed
@@ -265,6 +267,7 @@ private:
   uint64_t hostReserveBytes_ = 0;
   HostAvailableMemoryProvider hostAvailableMemory_;
   uint64_t untrackedReserveBytes_ = 0;
+  uint64_t hostHeldBytes_ = 0;
   uint64_t reservedBytes_ = 0;
   bool serving_ = false;
   bool requestWaiting_ = false;

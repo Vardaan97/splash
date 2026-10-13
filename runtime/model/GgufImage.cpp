@@ -706,4 +706,32 @@ PleHash readPleHash(const GgufFile &file, const QwenTargetDimensions &g) {
   return hash;
 }
 
+StreamedRows pleTableRows(const GgufFile &file, const QwenTargetDimensions &g) {
+  if (!g.qwen4() || g.pleLayer >= g.layers) throw GgufError("the target has no PLE table");
+  const std::string name = "per_layer_token_embd.weight";
+  const GgufTensor &tensor = file.require(name);
+  if (file.rotation()) throw GgufError("the PLE table of a rotated GGUF does not stream");
+  // ple.bin holds the rows as stored (Builder::nativeTable, copiedRows), but
+  // for NVFP4's, which the writer rebuilds.
+  if (!embeddingType(tensor.type) || tensor.type == ggml::kNVFP4)
+    throw GgufError("a PLE table of type " + ggmlTypeName(tensor.type) + " does not stream");
+  if (tensor.columns() != g.pleHeadDimension || !tensor.rows()) throw GgufError("unexpected shape for " + name);
+  const uint32_t format = imageFormat(tensor.type);
+  const uint64_t rowBytes = ggufRowBytes(kQuantFormats[format], tensor.columns());
+  if (!rowBytes || rowBytes > UINT32_MAX || tensor.rows() * rowBytes != tensor.bytes)
+    throw GgufError("unexpected size for " + name);
+  const WeightSource &source = file.source(tensor.file);
+  if (tensor.offset > source.bytes() - source.dataOffset() ||
+      tensor.bytes > source.bytes() - source.dataOffset() - tensor.offset)
+    throw GgufError(name + " lies outside its file");
+  StreamedRows rows;
+  rows.tensor = name;
+  rows.file = tensor.file;
+  rows.offset = source.dataOffset() + tensor.offset;
+  rows.rows = tensor.rows();
+  rows.rowBytes = static_cast<uint32_t>(rowBytes);
+  rows.format = format;
+  return rows;
+}
+
 } // namespace splash::model::gguf

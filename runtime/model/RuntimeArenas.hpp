@@ -125,6 +125,9 @@ enum class PrefillTensor : uint32_t {
   HyperBranch,
   HyperZeros,
   PleIndices,
+  // A streamed PLE table's staging (QwenHyperBuffers::pleSlots, pleStaging).
+  PleSlots,
+  PleStaging,
   PleRows,
   PleValue,
   PleGated,
@@ -224,6 +227,8 @@ public:
     h.branch = get(PrefillTensor::HyperBranch);
     h.zeros = get(PrefillTensor::HyperZeros);
     h.pleIndices = get(PrefillTensor::PleIndices);
+    h.pleSlots = get(PrefillTensor::PleSlots);
+    h.pleStaging = get(PrefillTensor::PleStaging);
     h.pleRows = get(PrefillTensor::PleRows);
     h.pleValue = get(PrefillTensor::PleValue);
     h.pleGated = get(PrefillTensor::PleGated);
@@ -325,6 +330,9 @@ enum class DecodeTensor : uint32_t {
   HyperBranch,
   HyperZeros,
   PleIndices,
+  // A streamed PLE table's staging (QwenHyperBuffers::pleSlots, pleStaging).
+  PleSlots,
+  PleStaging,
   PleRows,
   PleValue,
   PleGated,
@@ -473,6 +481,8 @@ public:
     h.branch = batchSlice(DecodeTensor::HyperBranch, lanes);
     h.zeros = batchSlice(DecodeTensor::HyperZeros, lanes);
     h.pleIndices = batchSlice(DecodeTensor::PleIndices, lanes);
+    h.pleSlots = batchSlice(DecodeTensor::PleSlots, lanes);
+    h.pleStaging = batchSlice(DecodeTensor::PleStaging, lanes);
     h.pleRows = batchSlice(DecodeTensor::PleRows, lanes);
     h.pleValue = batchSlice(DecodeTensor::PleValue, lanes);
     h.pleGated = batchSlice(DecodeTensor::PleGated, lanes);
