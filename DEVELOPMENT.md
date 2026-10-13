@@ -841,6 +841,13 @@ responses (in a stream, its usage chunk), and `/status` sums them in
 request uses reads no cached KV: alone, it computes what it would on a server
 that served nothing before.
 
+Flash-Next's draft vocabulary and request context preserve the target sampling
+distribution, but can change seeded streams across builds. Before release,
+compare full-model greedy outputs at the same prompts, cached prefixes and
+batch schedule against the base. Repeat seeded sampled requests within each
+build with the same cached prefixes and configuration. Cross-build sampled
+byte identity is not a gate when the drafting policy changes.
+
 ### Output limits and streaming
 
 Chat's `max_completion_tokens` or `max_tokens`, Responses' `max_output_tokens`,

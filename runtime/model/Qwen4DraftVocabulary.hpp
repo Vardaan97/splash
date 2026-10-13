@@ -13,7 +13,10 @@ namespace splash::model {
 // argmax over them alone (Qwen4ExpLayout::mtpDraftTokens): it reads their rows
 // of the vocabulary projection, an eighth of it, at each draft step. A draft
 // is a proposal the verify judges with the whole vocabulary. Greedy output
-// remains target-controlled; sampled batches use the whole head instead.
+// remains target-controlled and sampled acceptance preserves the target
+// distribution. Request-local context and threshold depth make lone seeded
+// runs repeat within a build with the same cached prefixes/configuration;
+// changing proposals need not preserve the base build's seeded stream.
 // A token outside this set and the context is never proposed by this head.
 inline constexpr uint32_t kQwen4DraftVocabularyTokens = 32768;
 // The vocabulary it is of: Qwen3.8's tokenizer.

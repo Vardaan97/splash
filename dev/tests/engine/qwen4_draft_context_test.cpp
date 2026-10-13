@@ -52,12 +52,57 @@ void contextRecovery() {
 }
 
 
+void requestLocalContextRepeats() {
+  std::vector<uint32_t> outside;
+  for (uint32_t t = 0; outside.size() < 8; ++t)
+    if (!inQwen4DraftVocabulary(t)) outside.push_back(t);
+  struct Snapshot {
+    std::vector<uint32_t> tokens;
+    float misses, observations;
+    bool smallHead;
+    bool operator==(const Snapshot &) const = default;
+  };
+  const auto run = [&](bool reused) {
+    Qwen4DraftContextCache<4> cache;
+    if (reused) {
+      static_cast<void>(cache.bind(2, 7, 6));
+      cache.release(2); // completed request, same ID reused by this run
+    }
+    Qwen4DraftContext context;
+    std::vector<uint32_t> history{outside[0], outside[1], outside[0]};
+    std::vector<Snapshot> decisions;
+    uint32_t stateLane = reused ? 2 : 0;
+    for (uint32_t cycle = 0; cycle < 12; ++cycle) {
+      context.scan(history, kQwen4DraftVocabularySource);
+      const uint32_t count = static_cast<uint32_t>(context.tokens.size());
+      const uint32_t copied = cache.bind(stateLane, 7, count);
+      require(copied <= count, "context: physical copy count stays bounded");
+      decisions.push_back({context.tokens, context.misses, context.observations, context.useVocabulary()});
+      const std::array selected{outside[2 + cycle % 6]};
+      context.record(selected);
+      history.push_back(selected[0]);
+      if (reused) {
+        static_cast<void>(cache.bind(1, 90 + cycle, 1)); // another request's rows
+        cache.release(1);
+        if (cycle == 5) {
+          cache.release(stateLane); // suspend and resume on a different lane
+          stateLane = 3;
+        }
+      }
+    }
+    return decisions;
+  };
+  require(run(false) == run(true),
+          "context: lone request's head decisions repeat across reuse, unrelated requests and lane migration");
+}
+
 } // namespace
 
 int main() {
   try {
     contextLifetime();
     contextRecovery();
+    requestLocalContextRepeats();
   } catch (const std::exception &error) {
     std::cerr << "Qwen4 draft context tests FAILED: " << error.what() << '\n';
     return 1;
