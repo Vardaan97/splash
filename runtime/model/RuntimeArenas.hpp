@@ -340,6 +340,19 @@ enum class DecodeTensor : uint32_t {
   MtpTokens,
   MtpHistory,
   PlePrior,
+  // Indexed by state lane: the vocabulary projection's rows of the lane's
+  // request's context tokens beside the draft vocabulary (planes of
+  // QwenTargetGeometry::mtpDraftContextFormat, kQwen4DraftContextTokens
+  // rows), those tokens, and the (token, row) pairs a cycle copies in.
+  DraftContextPlane0,
+  DraftContextPlane1,
+  DraftContextMeta,
+  DraftContextTokens,
+  DraftContextCopies,
+  // Indexed by decode lane: a draft step's logits of the lane's context
+  // rows, and its context (count, logits row stride, state lane, 0).
+  DraftContextLogits,
+  DraftContextInfo,
   // One tensor per ops::kMoeScratchFields entry, in its order (moeScratchTensor).
   MoeScratch,
   MoeScratchLast = MoeScratch + ops::kMoeScratchFields.size() - 1,

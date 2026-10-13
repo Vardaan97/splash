@@ -34,6 +34,7 @@ struct Qwen3_6MoeLayerWeights;
 struct Qwen4ExpWeights;
 struct Qwen4ExpLayerWeights;
 struct Qwen4HyperWeights;
+struct Qwen4DraftHead;
 
 // Both supported targets bind the same mixer tensors per hybrid layer; only
 // the FFN differs between them.
@@ -90,6 +91,10 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
   // tile takes (ops::MoeShape).
   uint32_t moeExpertFormat = GGUF_FMT_COUNT;
   bool moeRegisterFormats = true;
+  // With a draft vocabulary, the format of the vocabulary projection's rows
+  // each state lane keeps of its request's context tokens
+  // (Qwen4DraftVocabulary.hpp); GGUF_FMT_COUNT for none.
+  uint32_t mtpDraftContextFormat = GGUF_FMT_COUNT;
   std::array<uint32_t, maximumCaptureLayers> captureLayerValues{};
   uint32_t captureLayerCount = 0;
   // The target's KV layout in the format the runtime stores KV in, and its
@@ -313,6 +318,21 @@ struct QwenTargetVerifyBuffers final {
   metal::MetalBuffer candidates;
   uint32_t proposalsPerLane = 0;
   uint32_t candidatesPerProposal = 0;
+  // With the draft vocabulary, each lane's context rows beside it
+  // (Qwen4DraftVocabulary.hpp): its head over its state lane's rows, how
+  // many of them hold its context tokens, and the (token, row) pairs to copy
+  // into them first; the lanes' logits of them (draftContextLogitsSlot
+  // floats each), the state lanes' tokens of them and each lane's
+  // Qwen4MtpContextLane. Lanes without draftContextCounts draft from the
+  // draft vocabulary alone.
+  std::array<ops::Projection, ExecutionLimits::maximumBatchWidth> draftContextHeads;
+  std::array<uint32_t, ExecutionLimits::maximumBatchWidth> draftContextCounts{};
+  std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> draftContextCopies;
+  std::array<uint32_t, ExecutionLimits::maximumBatchWidth> draftContextCopyCounts{};
+  metal::MetalBuffer draftContextLogits;
+  uint32_t draftContextLogitsSlot = 0;
+  metal::MetalBuffer draftContextTokens;
+  metal::MetalBuffer draftContextInfo;
 };
 
 // Qwen3.8-Flash-Next's state after the rows a step retained, which its
@@ -393,10 +413,15 @@ public:
   [[nodiscard]] bool hasMtp() const noexcept { return geometry_.mtpLayers != 0; }
   // `steps` draft steps over each lane's verify rows before the verify: step
   // j writes proposal j - 1, the last one also every later proposal. The
-  // verify then writes the head's KV at its rows (addVerify).
+  // verify then writes the head's KV at its rows (addVerify). With
+  // `draftVocabulary` and a head that has one (hasMtpDraftVocabulary), each
+  // step drafts from the draft vocabulary's tokens alone.
   void addMtpDraft(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
                    std::span<const SplashKvLayer> kvLayers, std::span<const kv::ChunkedPrefillParams> chunks,
-                   uint32_t lanes, uint32_t steps) const;
+                   uint32_t lanes, uint32_t steps, bool draftVocabulary = true) const;
+  // Whether the MTP head drafts from a draft vocabulary when asked
+  // (Qwen4ExpLayout::mtpDraftTokens).
+  [[nodiscard]] bool hasMtpDraftVocabulary() const noexcept;
   // The PLE rows of each lane's verify rows from their tokens and the two
   // tokens before each lane's rows (QWEN4_PLE_NONE for none).
   void addPleHash(metal::CommandGraph &graph, metal::MetalBuffer tokens, metal::MetalBuffer before,
@@ -447,10 +472,12 @@ private:
                                ops::PreparedInput input = {}) const;
   // The MTP head over each lane's rows: its inputs (`embedding` rows paired
   // with the carried streams and `history`), its attention block (writing
-  // its KV) and, when `full`, its FFN, its head mix and logits. Each lane's
-  // rows before `firstRow` route to no expert (ops::MoE::add).
+  // its KV) and, when `full`, its FFN, its head mix and logits: of the whole
+  // vocabulary or, with `draftHead`, of its tokens. Each lane's rows before
+  // `firstRow` route to no expert (ops::MoE::add).
   void addQwen4MtpVerify(VerifyStep &step, const Qwen4ExpWeights &weights, metal::MetalBuffer embedding,
-                         metal::MetalBuffer history, uint32_t limit, bool full, uint32_t firstRow = 0) const;
+                         metal::MetalBuffer history, uint32_t limit, bool full, uint32_t firstRow = 0,
+                         const Qwen4DraftHead *draftHead = nullptr) const;
   // A state cell's carried MTP streams within its auxiliary state.
   [[nodiscard]] metal::MetalBuffer mtpCarried(const metal::MetalBuffer &auxiliary) const;
 

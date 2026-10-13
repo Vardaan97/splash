@@ -38,13 +38,17 @@ void GgufTargetLoader::Planned::checkUnchanged() const {
 
 GgufTargetLoader::GgufTargetLoader(metal::MetalBackend &backend, WeightImages &images,
                                    const std::vector<std::filesystem::path> &paths,
-                                   const QwenTargetDimensions &geometry)
+                                   const QwenTargetDimensions &geometry, std::span<const uint32_t> draftTokens)
     : backend_(backend), images_(images), planned_(std::make_shared<Planned>(paths)) {
   std::vector<WeightSource *> parsed;
   for (WeightSource &source : planned_->files) parsed.push_back(&source);
   const GgufFile file(parsed);
   rotation_ = file.rotation();
   planned_->images = gguf::planImages(file, geometry);
+  if (!draftTokens.empty()) {
+    planned_->draftHead = planned_->images.size();
+    planned_->images.push_back(gguf::planDraftHeadImage(file, geometry, draftTokens));
+  }
   planned_->layers = geometry.layers;
   planned_->pleHash = gguf::readPleHash(file, geometry);
 }
@@ -69,8 +73,14 @@ WeightFile GgufTargetLoader::head() { return open(planned_->layers); }
 WeightFile GgufTargetLoader::embedding() { return open(planned_->layers + 1); }
 
 WeightFile GgufTargetLoader::ple() {
-  if (planned_->images.size() != planned_->layers + 3) throw GgufError("the target has no PLE table");
+  if (planned_->images.size() < planned_->layers + 3 || planned_->draftHead == planned_->layers + 2)
+    throw GgufError("the target has no PLE table");
   return open(planned_->layers + 2);
+}
+
+WeightFile GgufTargetLoader::draftHead() {
+  if (!planned_->draftHead) throw GgufError("the target loader planned no draft head");
+  return open(*planned_->draftHead);
 }
 
 GgufMtpLoader::GgufMtpLoader(metal::MetalBackend &backend, WeightImages &images,

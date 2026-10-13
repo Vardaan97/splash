@@ -154,6 +154,19 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend, Qwen4ExpLayout
     head.head = readHyper(file, layout, false, "mtp-head");
     file.finish();
     result.files.push_back(file.record());
+    if (layout.mtpDraftTokens) {
+      // Rows of the vocabulary projection the target holds anyway: no
+      // computed state depends on them, so they stay out of the manifest
+      // fingerprint, which is then that of drafting from every token.
+      WeightFile drafts = gguf.draftHead();
+      Qwen4DraftHead draftHead;
+      const uint32_t tiled = (layout.mtpDraftTokens + QUANT_TILE_ROWS - 1) / QUANT_TILE_ROWS * QUANT_TILE_ROWS;
+      draftHead.logits = format.projection(drafts, tiled, layout.hiddenSize, "draft-logits");
+      draftHead.logits.destination = ops::FloatOutput::Float32;
+      draftHead.tokens = drafts.section(uint64_t{layout.mtpDraftTokens} * sizeof(uint32_t), "draft-tokens");
+      drafts.finish();
+      head.draftHead = std::move(draftHead);
+    }
     result.mtp = std::move(head);
   }
   result.manifestFingerprintSha256 = weightManifestFingerprint(result.files);

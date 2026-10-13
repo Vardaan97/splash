@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <span>
 #include <vector>
 
 #include "model/GgufFile.hpp"
@@ -23,9 +24,11 @@ namespace splash::model {
 
 class GgufTargetLoader final {
 public:
-  // Plans every image from the GGUF's metadata once.
+  // Plans every image from the GGUF's metadata once; with `draftTokens`,
+  // also a qwen4exp MTP head's draft head of them (gguf::planDraftHeadImage).
   GgufTargetLoader(metal::MetalBackend &backend, WeightImages &images,
-                   const std::vector<std::filesystem::path> &paths, const QwenTargetDimensions &geometry);
+                   const std::vector<std::filesystem::path> &paths, const QwenTargetDimensions &geometry,
+                   std::span<const uint32_t> draftTokens = {});
   GgufTargetLoader(const GgufTargetLoader &) = delete;
   GgufTargetLoader &operator=(const GgufTargetLoader &) = delete;
 
@@ -34,6 +37,8 @@ public:
   [[nodiscard]] WeightFile embedding();
   // A qwen4exp target's PLE n-gram table and its hash.
   [[nodiscard]] WeightFile ple();
+  // The draft head the loader was asked for.
+  [[nodiscard]] WeightFile draftHead();
   [[nodiscard]] const gguf::PleHash &pleHash() const noexcept { return planned_->pleHash; }
   // The input rotation of a Prism ML GGUF, which planImages checked names
   // every quantized tensor of the target and its token table.
@@ -45,8 +50,9 @@ private:
     explicit Planned(const std::vector<std::filesystem::path> &paths);
     void checkUnchanged() const;
     std::deque<WeightSource> files; // split order; tensor rows point into them
-    std::vector<gguf::Image> images; // layers, head, embedding, then ple
+    std::vector<gguf::Image> images; // layers, head, embedding, then ple and the draft head
     uint32_t layers = 0;
+    std::optional<size_t> draftHead;
     gguf::PleHash pleHash;
   };
   [[nodiscard]] WeightFile open(size_t index);

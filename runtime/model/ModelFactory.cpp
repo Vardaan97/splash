@@ -1,6 +1,7 @@
 #include "ModelFactory.hpp"
 #include "model/DraftCheckpoint.hpp"
 #include "model/GgufTarget.hpp"
+#include "model/Qwen4DraftVocabulary.hpp"
 #include "model/QwenTargetLoader.hpp"
 #include "model/SafetensorsTarget.hpp"
 #include "model/VisionLoader.hpp"
@@ -70,6 +71,15 @@ uint64_t imageBytes(const std::vector<gguf::Image> &images) {
   return total;
 }
 
+// The draft vocabulary a target's MTP head drafts from: none but for a
+// Qwen3.8-Flash-Next layout that names one.
+template <class Layout> std::span<const uint32_t> draftTokens(const Layout &layout) {
+  if constexpr (std::is_same_v<Layout, Qwen4ExpLayout>)
+    return qwen4DraftVocabulary(layout.mtpDraftTokens);
+  else
+    return {};
+}
+
 } // namespace
 
 LoadedModel loadModel(metal::MetalBackend &backend,
@@ -103,7 +113,7 @@ LoadedModel loadModel(metal::MetalBackend &backend,
           }
         }
         case TargetSource::Gguf: {
-          GgufTargetLoader loader(backend, images, findTargetGgufs(directory), layout);
+          GgufTargetLoader loader(backend, images, findTargetGgufs(directory), layout, draftTokens(layout));
           return readTarget(backend, layout, std::ref(loader), mtp.get());
         }
         }
@@ -141,6 +151,7 @@ uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescript
     if (const auto *qwen4 = std::get_if<Qwen4ExpLayout>(&descriptor.target); qwen4 && qwen4->mtpLayers) {
       WeightSource mtp(findMtpGguf(root));
       bytes += gguf::planMtpImage(GgufFile(mtp), *qwen4).bytes;
+      if (qwen4->mtpDraftTokens) bytes += gguf::planDraftHeadImage(file, *qwen4, draftTokens(*qwen4)).bytes;
     }
   } else {
     bytes = std::visit([&](const auto &layout) -> uint64_t {
