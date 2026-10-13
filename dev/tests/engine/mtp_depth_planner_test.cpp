@@ -113,6 +113,16 @@ void lanes() {
   require(capped.steps <= 2 && capped.depths[0] <= 2, "plan: at most the steps it may draft");
 }
 
+void cadence() {
+  uint32_t idle = 0;
+  require(probeMtpDepth(0, idle, 2) == 0 && probeMtpDepth(0, idle, 2) == 1 && idle == 0,
+          "cadence: injected interval reaches the probe in two cycles");
+  require(exploreMtpDepth(3, 7, 2, 2) == 4 && exploreMtpDepth(3, 7, 4, 2) == 2 &&
+              exploreMtpDepth(3, 7, 4, 0) == 3, "cadence: exploration alternates and can be disabled");
+  const MtpCostModel custom({1.0, 0.8, 0.7, 0.6});
+  require(custom.coefficients(1, false)[1] == 0.8, "prior: injectable component cost ratios");
+}
+
 } // namespace
 
 int main() {
@@ -121,6 +131,7 @@ int main() {
     prior();
     fit();
     lanes();
+    cadence();
   } catch (const std::exception &error) {
     std::cerr << "MTP depth planner tests FAILED: " << error.what() << '\n';
     return 1;

@@ -322,7 +322,7 @@ struct Runtime::Impl {
     float mtpAccepted = 4.0F;
     float mtpJudged = 5.0F;
     MtpAcceptance mtpAcceptance;
-    // Cycles in a row it drafted nothing: every kMtpProbeCycles-th drafts
+    // Cycles in a row it drafted nothing: the configured probe interval drafts
     // one proposal, so that its acceptance keeps being measured.
     uint32_t mtpIdleCycles = 0;
     Qwen4DraftContext draftContext;
@@ -478,17 +478,15 @@ struct Runtime::Impl {
     return !value || std::string_view(value) != "rule";
   }
   // Cycles a lane drafts nothing before it drafts one proposal to measure
-  // its acceptance again; and every kMtpExploreCycles-th planned cycle of a
+  // its acceptance again; and at its configured exploration interval, a planned cycle of a
   // lone greedy lane drafts one more or one fewer than its plan, so the
   // measured cost of a step stays measured where the plan does not move.
-  static constexpr uint32_t kMtpProbeCycles = 8;
-  static constexpr uint64_t kMtpExploreCycles = 32;
+  MtpDepthParameters mtpParameters;
   MtpCostModel mtpCosts;
   uint64_t mtpPlannedCycles = 0;
   // The cycle in flight, for its cost (finalizeDecode): its shape and the
   // host's seconds encoding it.
   std::optional<MtpCostModel::Cycle> mtpCycle;
-  double mtpEncodeSeconds = 0.0;
   // SPLASH_MTP_LOG=1 writes a line every kMtpLogCycles MTP cycles: the
   // batch steps drafted, how many cycles drafted from the draft vocabulary,
   // and each batch width's fitted costs.
@@ -535,22 +533,20 @@ struct Runtime::Impl {
     } else {
       std::array<std::array<double, kMtpPlannerPositions + 1>, kLaneCount> expected{};
       for (uint32_t lane = 0; lane < lanes; ++lane) expected[lane] = entries[lane]->mtpAcceptance.expectedTokens();
-      // Sampled batches retain the upstream common-depth policy above.
+      // Only greedy batches use measured costs. Sampled batches keep
+      // upstream's common-depth policy, with request-local draft heads.
       const bool measured = true;
       const MtpDepthPlan plan =
           planMtpDepths(std::span(expected).first(lanes), mtpCosts, measured, draftVocabulary, mtpDraftSteps);
       for (uint32_t lane = 0; lane < lanes; ++lane) {
         Request &entry = *entries[lane];
         uint32_t depth = plan.depths[lane];
-        if (!depth && ++entry.mtpIdleCycles >= kMtpProbeCycles) depth = 1;
-        if (depth) entry.mtpIdleCycles = 0;
+        depth = probeMtpDepth(depth, entry.mtpIdleCycles, mtpParameters.probeCycles);
         depths[lane] = depth;
       }
       ++mtpPlannedCycles;
-      if (lanes == 1 && measured && mtpPlannedCycles % kMtpExploreCycles == 0) {
-        const bool deeper = (mtpPlannedCycles / kMtpExploreCycles) % 2 == 1;
-        depths[0] = deeper ? std::min(depths[0] + 1, mtpDraftSteps) : (depths[0] ? depths[0] - 1 : 1);
-      }
+      if (lanes == 1)
+        depths[0] = exploreMtpDepth(depths[0], mtpDraftSteps, mtpPlannedCycles, mtpParameters.exploreCycles);
     }
     uint32_t steps = 0, laneSteps = 0;
     for (uint32_t lane = 0; lane < lanes; ++lane) {
@@ -645,6 +641,8 @@ struct Runtime::Impl {
                        ? std::make_unique<DFlashDraft>(value.model.draft, value.backend, operators)
                        : nullptr),
         aneFfn(value.aneFfn) {
+    mtpParameters = value.mtpDepth;
+    mtpCosts = MtpCostModel(mtpParameters.priorRatios);
     if (states.layout() != model.stateLayout(states.layout().target.format) ||
         kvPages.layout() != model.targetKvLayout(kvPages.layout().format)) {
       throw std::invalid_argument(
@@ -2431,11 +2429,11 @@ struct Runtime::Impl {
 
   std::vector<ModelStepResult> finalizeDecode(
       std::span<DecodeLaneResult> lanes, std::span<const ModelBatchItem> items,
-      CommandTiming timing) {
+      CommandTiming timing, double encodeSeconds) {
     // The MTP cycle's cost: its GPU time and the host's encoding of it.
     // The extra forced-end rows do not have the planned cycle's cost shape.
     if (mtpCycle && std::ranges::none_of(lanes, [](const DecodeLaneResult &lane) { return lane.endDrafts; })) {
-      mtpCosts.observe(*mtpCycle, timing.gpuSeconds + mtpEncodeSeconds);
+      mtpCosts.observe(*mtpCycle, timing.gpuSeconds + encodeSeconds);
       if (mtpLog) logMtpPlans(*mtpCycle);
     }
     mtpCycle.reset();
@@ -2543,8 +2541,10 @@ struct Runtime::Impl {
     // completes only the staging and the commit remain: the buffers it binds
     // are read when it runs, and the staging writes Shared ones.
     StagedVerifyTicket(Impl &impl, std::vector<DecodeLaneResult> lanes, std::span<const ModelBatchItem> items,
-                       const CommandGraph &draft, const CommandGraph &target, std::function<void()> completion)
-        : impl_(impl), lanes_(std::move(lanes)), items_(items.begin(), items.end()), wake_(std::move(completion)) {
+                       const CommandGraph &draft, const CommandGraph &target, double encodeSeconds,
+                       std::function<void()> completion)
+        : impl_(impl), lanes_(std::move(lanes)), items_(items.begin(), items.end()), encodeSeconds_(encodeSeconds),
+          wake_(std::move(completion)) {
       command_ = impl_.backend.submitCommandAsync(draft.dispatches(), wake_);
       target_ = impl_.backend.encodeCommand(target.command());
     }
@@ -2563,7 +2563,7 @@ struct Runtime::Impl {
       if (stage_ != Stage::Verify) throw std::logic_error("staged verify ticket is not complete");
       addTiming(command_.wait());
       stage_ = Stage::Done;
-      return impl_.finalizeDecode(lanes_, items_, timing_);
+      return impl_.finalizeDecode(lanes_, items_, timing_, encodeSeconds_);
     }
 
     double wallMilliseconds() const noexcept override { return timing_.wallSeconds * 1000.0; }
@@ -2573,7 +2573,11 @@ struct Runtime::Impl {
 
     void verify() {
       addTiming(command_.wait());
+      // The host's staging between the two commands counts as the cycle's
+      // encoding, as a constrained cycle's verify inputs do.
+      const auto encodeStart = AwakeClock::now();
       impl_.stageDecodePleRows(static_cast<uint32_t>(lanes_.size()));
+      encodeSeconds_ += std::chrono::duration<double>(AwakeClock::now() - encodeStart).count();
       command_ = impl_.backend.submitEncoded(std::move(target_), wake_);
       stage_ = Stage::Verify;
     }
@@ -2590,6 +2594,7 @@ struct Runtime::Impl {
     CommandTicket command_;
     EncodedCommand target_;
     CommandTiming timing_;
+    double encodeSeconds_ = 0.0;
     std::function<void()> wake_;
   };
 
@@ -2603,11 +2608,11 @@ struct Runtime::Impl {
   public:
     ConstrainedDecodeTicket(Impl &impl, std::vector<DecodeLaneResult> lanes,
                             std::span<const ModelBatchItem> items,
-                            const CommandGraph &draft,
+                            const CommandGraph &draft, double encodeSeconds,
                             std::function<void()> completion)
         : impl_(impl), lanes_(std::move(lanes)),
           items_(items.begin(), items.end()),
-          wake_(std::move(completion)) {
+          encodeSeconds_(encodeSeconds), wake_(std::move(completion)) {
       submit(draft);
     }
 
@@ -2638,6 +2643,7 @@ struct Runtime::Impl {
           }
         }
 
+        const auto encodeStart = AwakeClock::now();
         CommandGraph target;
         const uint32_t width = static_cast<uint32_t>(lanes_.size());
         if (impl_.stagesDraftedPleRows()) {
@@ -2649,6 +2655,7 @@ struct Runtime::Impl {
         }
         impl_.encodeTargetVerifyBatchForward(
             target, {entries.data(), lanes_.size()}, items_);
+        encodeSeconds_ += std::chrono::duration<double>(AwakeClock::now() - encodeStart).count();
         submit(target);
         stage_ = Stage::TargetForward;
       }
@@ -2672,6 +2679,7 @@ struct Runtime::Impl {
               std::chrono::duration<double>(AwakeClock::now() - *maskWaitStarted_)
                   .count();
           maskWaitStarted_.reset();
+          const auto encodeStart = AwakeClock::now();
           std::array<Request *, kLaneCount> entries{};
           std::array<uint32_t, kLaneCount> maximumRetained{};
           for (uint32_t lane = 0; lane < lanes_.size(); ++lane) {
@@ -2694,6 +2702,7 @@ struct Runtime::Impl {
           if (impl_.draftModel)
             impl_.encodeDraftStateCommitBatch(
                 commit, {entries.data(), lanes_.size()}, items_);
+          encodeSeconds_ += std::chrono::duration<double>(AwakeClock::now() - encodeStart).count();
           submit(commit);
           stage_ = Stage::Commit;
         }
@@ -2740,7 +2749,7 @@ struct Runtime::Impl {
           targetForwardGpuSeconds_;
       counters.lastConstrainedMaskWaitSeconds = maskWaitSeconds_;
       counters.totalConstrainedMaskWaitSeconds += maskWaitSeconds_;
-      return impl_.finalizeDecode(lanes_, items_, timing_);
+      return impl_.finalizeDecode(lanes_, items_, timing_, encodeSeconds_);
     }
 
     double wallMilliseconds() const noexcept override {
@@ -2772,6 +2781,7 @@ struct Runtime::Impl {
     CommandTicket command_;
     CommandTiming timing_;
     std::array<bool, kLaneCount> abandoned_{};
+    double encodeSeconds_ = 0.0;
     double targetForwardGpuSeconds_ = 0.0;
     double maskWaitSeconds_ = 0.0;
     std::optional<AwakeClock::time_point> maskWaitStarted_;
@@ -3289,7 +3299,6 @@ Runtime::decodeAsync(const BatchPlan &plan,
     }
     impl_->encodeThinkingDrafts(commandGraph, entries);
   }
-  impl_->mtpEncodeSeconds = std::chrono::duration<double>(AwakeClock::now() - encodeStart).count();
   // A streamed PLE table: the MTP head's proposals' rows are staged between
   // the draft's command and the verify's, the looked-up proposals' now.
   if (impl_->stagesDraftedPleRows()) {
@@ -3301,16 +3310,17 @@ Runtime::decodeAsync(const BatchPlan &plan,
       impl_->encodeTargetVerifyBatchPolicy(target, entries);
       impl_->encodeBatchAcceptance(target, entries, {maximumRetained.data(), width});
       impl_->encodeTargetStateCommit(target, entries);
-      impl_->mtpEncodeSeconds = std::chrono::duration<double>(AwakeClock::now() - encodeStart).count();
-      return std::make_unique<Impl::StagedVerifyTicket>(*impl_, std::move(lanes), items, commandGraph, target,
-                                                        std::move(completion));
+      return std::make_unique<Impl::StagedVerifyTicket>(
+          *impl_, std::move(lanes), items, commandGraph, target,
+          std::chrono::duration<double>(AwakeClock::now() - encodeStart).count(), std::move(completion));
     }
   } else if (impl_->pleStore) {
     impl_->stageDecodePleRows(width);
   }
   if (constrained) {
     return std::make_unique<Impl::ConstrainedDecodeTicket>(
-        *impl_, std::move(lanes), items, commandGraph, std::move(completion));
+        *impl_, std::move(lanes), items, commandGraph,
+        std::chrono::duration<double>(AwakeClock::now() - encodeStart).count(), std::move(completion));
   }
   impl_->encodeVerifyInputs(commandGraph, width);
   impl_->encodeTargetVerifyBatchForward(commandGraph, entries, items);
@@ -3323,11 +3333,11 @@ Runtime::decodeAsync(const BatchPlan &plan,
 
   std::vector<ModelBatchItem> copiedItems(items.begin(), items.end());
   Impl *impl = impl_.get();
-  auto finish = [impl, lanes = std::move(lanes),
+  const double encodeSeconds = std::chrono::duration<double>(AwakeClock::now() - encodeStart).count();
+  auto finish = [impl, encodeSeconds, lanes = std::move(lanes),
                  items = std::move(copiedItems)](CommandTiming timing) mutable {
-    return impl->finalizeDecode(lanes, items, timing);
+    return impl->finalizeDecode(lanes, items, timing, encodeSeconds);
   };
-  impl_->mtpEncodeSeconds = std::chrono::duration<double>(AwakeClock::now() - encodeStart).count();
   CommandTicket command = impl_->backend.submitCommandAsync(
       commandGraph.dispatches(), std::move(completion));
   return std::make_unique<DeferredMetalTicket>(std::move(command),

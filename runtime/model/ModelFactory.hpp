@@ -3,6 +3,7 @@
 #include "ops/Vision.hpp"
 #include "DFlashDraft.hpp"
 #include "ModelDescriptor.hpp"
+#include "MtpDepthPlanner.hpp"
 #include "Qwen3_6Moe.hpp"
 #include "Qwen3_8.hpp"
 #include "QwenVision.hpp"
@@ -97,6 +98,7 @@ struct RuntimeContext final {
   const ops::ExecutionPlans &operators;
   // The prefill FFN's Neural Engine split (engine::startAneFfn), if any.
   ops::AneFfn *aneFfn = nullptr;
+  MtpDepthParameters mtpDepth{};
 };
 
 // Validates only the interface between independently defined target and draft
