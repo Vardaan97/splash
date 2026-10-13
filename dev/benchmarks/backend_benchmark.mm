@@ -626,10 +626,10 @@ runDecodeThroughput(engine::Engine &engine, Driver &driver,
       decodeOutputTokens > completedTokens) {
     throw std::runtime_error("decode throughput work accounting is invalid");
   }
-  if (draftedTokens != uint64_t{width} * decodeBatches *
+  if (draftedTokens > uint64_t{width} * decodeBatches *
                            model::ExecutionLimits::draftProposalTokens ||
-      acceptedDraftTokens > draftedTokens) {
-    throw std::runtime_error("decode throughput DFlash accounting is invalid");
+      acceptedDraftTokens > draftedTokens || acceptedDraftTokens > decodeOutputTokens) {
+    throw std::runtime_error("decode throughput speculative accounting is invalid");
   }
   result.outputTokensPerLaneBatch =
       static_cast<double>(decodeOutputTokens) /

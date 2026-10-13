@@ -15,7 +15,7 @@ otherwise idle:
   arithmetic seldom moves; the transcripts, greedy answers of 512 tokens to
   real requests, move with it. With --expect-output-change (or
   EXPECT_OUTPUT_CHANGE=1) each build must still repeat itself, and the
-  candidate's acceptance rate per width may be at most 0.02 below the
+  candidate's accepted proposals per lane decode batch may be at most 0.02 below the
   baseline's.
 - the prefill FFN's Neural Engine split: with --ane-ffn-share every round of
   a build that takes the option runs that share and must report it, and a
@@ -297,7 +297,7 @@ def metrics(rounds: list[dict]) -> dict:
 
 
 def outputs(record: dict) -> dict:
-    """Token identity only; draft choices can change proposal counts."""
+    """Token identity only; adaptive depths and counts may vary with timings."""
     result = {}
     for width, samples in record["decode"].items():
         for sample in samples:
@@ -326,14 +326,16 @@ def acceptance(records: list[dict], width: int) -> float:
         for record in records
         for sample in record["decode"][width]
     )
-    drafted = sum(
-        sample["drafted_tokens"]
+    batches = sum(
+        width * sample["decode_batches"]
         for record in records
         for sample in record["decode"][width]
     )
-    if not drafted:
-        raise RegressionError(f"B{width} drafted no tokens")
-    return accepted / drafted
+    if not batches:
+        raise RegressionError(f"B{width} decoded no batches")
+    # #253 reports physical proposal slots; newer builds report real proposals.
+    # Lane batches are compatible across both accounting schemes.
+    return accepted / batches
 
 
 def differences(first: dict, second: dict) -> list[str]:
@@ -349,6 +351,22 @@ def summarize(rounds: list[dict], expect_output_change: bool) -> dict:
     if [record["version"] for record in rounds] != list(ROUNDS):
         raise RegressionError("rounds are not in ABBA order")
     failures = []
+    for record in rounds:
+        for width, samples in record["decode"].items():
+            for sample in samples:
+                accepted = sample["accepted_draft_tokens"]
+                drafted = sample["drafted_tokens"]
+                batches = sample["decode_batches"]
+                if not (
+                    isinstance(accepted, int)
+                    and isinstance(drafted, int)
+                    and isinstance(batches, int)
+                    and batches > 0
+                    and 0 <= accepted <= drafted <= 7 * width * batches
+                ):
+                    failures.append(
+                        f"{record['version']} B{width} sample {sample['sample']}: invalid draft counts"
+                    )
     baseline, candidate = [rounds[0], rounds[3]], [rounds[1], rounds[2]]
     builds, plans = {}, {}
     for name, records in (("baseline", baseline), ("candidate", candidate)):
@@ -408,11 +426,11 @@ def summarize(rounds: list[dict], expect_output_change: bool) -> dict:
         for width, rate in rates.items():
             if rate["candidate"] < rate["baseline"] - ACCEPTANCE_TOLERANCE:
                 failures.append(
-                    f"{width} acceptance fell from {rate['baseline']:.4f} "
+                    f"{width} accepted per lane batch fell from {rate['baseline']:.4f} "
                     f"to {rate['candidate']:.4f}"
                 )
     elif changed := differences(outputs(rounds[0]), outputs(rounds[1])):
-        failures.append(f"candidate outputs or acceptance differ: {changed}")
+        failures.append(f"candidate outputs differ: {changed}")
     if invariants := sorted(
         {f for record in candidate for f in record["performance_failures"]}
     ):
@@ -425,6 +443,7 @@ def summarize(rounds: list[dict], expect_output_change: bool) -> dict:
             failures.append(f"{name}: {abba.describe(result)}")
     return {
         "expect_output_change": expect_output_change,
+        "acceptance_metric": "accepted proposals per lane decode batch",
         "acceptance": rates,
         "memory_plan": {
             **plans,

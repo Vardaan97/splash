@@ -26,7 +26,7 @@ def benchmark_document(
             "sample": sample,
             "output_token_hash": f"hash-{width}",
             "accepted_draft_tokens": 40,
-            "drafted_tokens": 64,
+            "drafted_tokens": 56,
             "decode_batches": 8,
             "decode_gpu_ms": step * width * 8,
         }
@@ -105,7 +105,7 @@ class BackendRegressionTests(unittest.TestCase):
         )
         # GPU time per decode step, not per request.
         self.assertEqual(summary["speed"]["decode_B2_gpu_ms_per_step"]["baseline"], 20)
-        self.assertEqual(summary["acceptance"]["B1"]["candidate"], 40 / 64)
+        self.assertEqual(summary["acceptance"]["B1"]["candidate"], 40 / 8)
         # Rounds against a build without the short scenario compare the rest.
         summary = regression.summarize(rounds(scenarios=("decode", "partial")), False)
         self.assertTrue(summary["pass"])
@@ -219,16 +219,14 @@ class BackendRegressionTests(unittest.TestCase):
         summary = regression.summarize(
             rounds({1: changed_output, 2: changed_output}), False
         )
-        self.assertTrue(
-            any("outputs or acceptance differ" in f for f in summary["failures"])
-        )
+        self.assertTrue(any("outputs differ" in f for f in summary["failures"]))
         # A transcript is compared token for token, like the other requests.
         summary = regression.summarize(
             rounds({1: changed_transcript, 2: changed_transcript}), False
         )
         self.assertTrue(
             any(
-                "outputs or acceptance differ" in f and "transcript_3 sample 0" in f
+                "outputs differ" in f and "transcript_3 sample 0" in f
                 for f in summary["failures"]
             )
         )
@@ -242,17 +240,20 @@ class BackendRegressionTests(unittest.TestCase):
                 "pass"
             ]
         )
-        # Within 0.02 of the baseline's acceptance rate (40/64 = 0.625).
+        # Compatible accepted-per-lane-batch accounting, tolerance 0.02.
         self.assertTrue(
             regression.summarize(
-                rounds({1: lower_acceptance(39), 2: lower_acceptance(39)}), True
+                rounds({1: lower_acceptance(40), 2: lower_acceptance(40)}), True
             )["pass"]
         )
         summary = regression.summarize(
-            rounds({1: lower_acceptance(38), 2: lower_acceptance(38)}), True
+            rounds({1: lower_acceptance(39), 2: lower_acceptance(39)}), True
         )
         self.assertEqual(
-            len([f for f in summary["failures"] if "acceptance fell" in f]), 4
+            len(
+                [f for f in summary["failures"] if "accepted per lane batch fell" in f]
+            ),
+            4,
         )
         # A build must repeat itself even when outputs may change.
         for index in (1, 3):
@@ -271,6 +272,40 @@ class BackendRegressionTests(unittest.TestCase):
         self.assertTrue(
             regression.summarize(rounds({1: adaptive, 2: adaptive}), False)["pass"]
         )
+
+    def test_physical_slots_and_real_proposals_have_compatible_acceptance(self):
+        def physical_slots(document):
+            for sample in document["decode_throughput"]["samples"]:
+                sample["drafted_tokens"] = (
+                    7 * sample["width"] * sample["decode_batches"]
+                )
+
+        def real_proposals(document):
+            for sample in document["decode_throughput"]["samples"]:
+                sample["drafted_tokens"] = 48
+
+        records = rounds({0: physical_slots, 3: physical_slots, 1: real_proposals})
+        for expect_change in (False, True):
+            summary = regression.summarize(records, expect_change)
+            self.assertTrue(summary["pass"], summary["failures"])
+            self.assertEqual(
+                summary["acceptance"]["B4"], {"baseline": 1.25, "candidate": 1.25}
+            )
+
+    def test_invalid_adaptive_counts_still_fail(self):
+        for field, value in (
+            ("accepted_draft_tokens", 57),
+            ("drafted_tokens", 57),
+            ("accepted_draft_tokens", -1),
+        ):
+
+            def invalid(document):
+                decode_samples(document, 1)[0][field] = value
+
+            summary = regression.summarize(rounds({2: invalid}), False)
+            self.assertTrue(
+                any("invalid draft counts" in f for f in summary["failures"])
+            )
 
     def test_identity_is_compared_within_each_build(self):
         # Two builds may load different layouts of one model: allowed.
