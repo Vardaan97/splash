@@ -2112,9 +2112,13 @@ int main(int argc, char **argv) {
     // The evaluation of the split's program that fails, counted from 1 as
     // ane::ProgramInstrumentation counts them; 0 for none.
     uint64_t aneFfnFault = 0;
+    // --ple-ssd-cache BYTES: a Qwen3.8-Flash-Next target's PLE table streams
+    // from its file through a cache of BYTES, as splash serve's option does;
+    // its TOKENS line equals the resident table's.
+    model::ModelLoadOptions loadOptions;
     if (argc < 3)
       fail("usage: model-runtime-oracle METALLIB MODEL_ROOT [--kv-format int8|bf16] [--state-format fp32|bf16] "
-           "[--ane-ffn-share SHARE] [--ane-ffn-fault EVALUATION]");
+           "[--ane-ffn-share SHARE] [--ane-ffn-fault EVALUATION] [--ple-ssd-cache BYTES]");
     for (int i = 3; i < argc; ++i) {
       const std::string_view option(argv[i]);
       if (option == "--images-only") imagesOnly = true;
@@ -2138,6 +2142,12 @@ int main(int argc, char **argv) {
         char *end = nullptr;
         aneFfnFault = std::strtoull(value, &end, 10);
         if (end == value || *end || !aneFfnFault) fail("--ane-ffn-fault takes an evaluation from 1");
+      } else if (option == "--ple-ssd-cache" && i + 1 < argc) {
+        const char *value = argv[++i];
+        char *end = nullptr;
+        loadOptions.pleCacheBytes = std::strtoull(value, &end, 10);
+        if (end == value || *end || loadOptions.pleCacheBytes < (64ULL << 20))
+          fail("--ple-ssd-cache takes a byte count of at least 67108864");
       } else fail("unknown model-runtime-oracle option");
     }
     metal::MetalBackend backend(argv[1]);
@@ -2156,13 +2166,15 @@ int main(int argc, char **argv) {
     // Metal operation while loading. This oracle has no such guard, so the
     // weights must fit in reclaimable memory above the macOS reserve before
     // any is loaded; it can refuse a model production starts.
-    const uint64_t weightBytes = model::modelWeightBytes(modelRoot, descriptor);
+    const uint64_t weightBytes = model::modelWeightBytes(modelRoot, descriptor, loadOptions) + loadOptions.pleCacheBytes;
     if (*hostAvailableBytes <= hostReserveBytes ||
         weightBytes > *hostAvailableBytes - hostReserveBytes)
       stopForHostMemory("the weights need " + mebibytes(weightBytes),
                         *hostAvailableBytes, hostReserveBytes);
     model::LoadedModel model =
-        model::loadModel(backend, modelRoot, descriptor);
+        model::loadModel(backend, modelRoot, descriptor, loadOptions);
+    if (loadOptions.pleCacheBytes)
+      std::cout << "ple_ssd_cache=" << (model.streamedTable() ? "streamed" : "ignored") << '\n';
     ops::ExecutionPlans operators(backend.capabilities());
     model::ModelMemoryPlan executorPlan =
         model::plannedRuntimeMemory(model, operators, format, stateFormat);
@@ -2173,7 +2185,8 @@ int main(int argc, char **argv) {
           model.targetActualAllocatedBytes(),
           model.draft.actualAllocatedBytes,
           model.vision.actualAllocatedBytes,
-          executorPlan, 0, aneFfnBytes};
+          executorPlan, 0, aneFfnBytes,
+          model.streamedTable() ? model.streamedTable()->committedBytes() : 0};
       ModelMemoryProfile profile{
           model.name(), model.maximumContextTokens(),
           model.targetKvLayout(format), footprint, stateFormat};
@@ -2238,7 +2251,7 @@ int main(int argc, char **argv) {
     const uint64_t elasticGrowthCeiling = budget.hardBudgetBytes -
         budget.pipelineReserveBytes - budget.runtimeOverheadReserveBytes;
     MemoryGovernor governor(backend, elasticGrowthCeiling, hostReserveBytes,
-                            queryHostAvailableMemory, 0);
+                            queryHostAvailableMemory, 0, budget.streamedTableBytes);
     std::cout << "ane_ffn_share=" << (aneFfn ? aneFfn->share() : 0.0)
               << " ane_ffn_minimum_rows=" << (aneFfn ? aneFfn->minimumRows() : 0) << '\n';
     const metal::AllocationAdmission governed =
