@@ -19,7 +19,6 @@ constexpr float kPooledWeight = 2.0F;
 // whole vocabulary about 0.15 (its head alone 0.05), of the draft
 // vocabulary 0.10, and each lane's proposal, whose row its draft step and
 // the verify route to experts, 0.10.
-constexpr std::array<double, 4> kPriorRatios = {1.0, 0.15, 0.10, 0.10};
 // How far the fit may stray from the prior, as standard deviations relative
 // to the cycle's scale, and a cycle's measurement noise.
 constexpr std::array<double, 4> kPriorDeviation = {0.5, 0.05, 0.05, 0.05};
@@ -53,6 +52,22 @@ std::array<double, 4> solve(std::array<std::array<double, 4>, 4> m, std::array<d
 }
 
 } // namespace
+
+MtpCostModel::MtpCostModel(std::array<double, 4> prior) : priorRatios_(prior) {
+  if (!(prior[0] > 0.0) || std::ranges::any_of(prior, [](double x) { return !std::isfinite(x) || x < 0.0; }))
+    throw std::invalid_argument("invalid MTP cost prior");
+}
+
+uint32_t probeMtpDepth(uint32_t depth, uint32_t &idleCycles, uint32_t interval) noexcept {
+  if (!depth && interval && ++idleCycles >= interval) depth = 1;
+  if (depth) idleCycles = 0;
+  return depth;
+}
+
+uint32_t exploreMtpDepth(uint32_t depth, uint32_t maximum, uint64_t cycle, uint64_t interval) noexcept {
+  if (!interval || !cycle || cycle % interval) return depth;
+  return (cycle / interval) % 2 ? std::min(depth + 1, maximum) : (depth ? depth - 1 : std::min(1u, maximum));
+}
 
 void MtpAcceptance::record(uint32_t drafted, uint32_t kept) noexcept {
   drafted = std::min(drafted, kMtpPlannerPositions);
@@ -91,7 +106,7 @@ void MtpCostModel::observe(const Cycle &cycle, double seconds) noexcept {
   if (!fit.count) {
     // The scale of this width's cycles: its first one, by the prior's ratios.
     double ratio = 0.0;
-    for (int i = 0; i < 4; ++i) ratio += kPriorRatios[i] * x[i];
+    for (int i = 0; i < 4; ++i) ratio += priorRatios_[i] * x[i];
     fit.scale = seconds / ratio;
   }
   const double weight = 1.0 / (kNoise * fit.scale * kNoise * fit.scale);
@@ -107,7 +122,7 @@ void MtpCostModel::observe(const Cycle &cycle, double seconds) noexcept {
     const double deviation = kPriorDeviation[i] * fit.scale;
     const double precision = 1.0 / (deviation * deviation);
     m[i][i] += precision;
-    v[i] += precision * kPriorRatios[i] * fit.scale;
+    v[i] += precision * priorRatios_[i] * fit.scale;
   }
   fit.theta = solve(m, v);
   // A cost never falls below nothing.
@@ -115,7 +130,7 @@ void MtpCostModel::observe(const Cycle &cycle, double seconds) noexcept {
 }
 
 std::array<double, 4> MtpCostModel::coefficients(uint32_t lanes, bool measured) const noexcept {
-  if (!measured || !lanes || lanes > kMtpPlannerLanes || !fits_[lanes - 1].count) return kPriorRatios;
+  if (!measured || !lanes || lanes > kMtpPlannerLanes || !fits_[lanes - 1].count) return priorRatios_;
   return fits_[lanes - 1].theta;
 }
 

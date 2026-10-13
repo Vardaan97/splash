@@ -13,6 +13,18 @@ namespace splash::model {
 inline constexpr uint32_t kMtpPlannerPositions = 7;
 inline constexpr uint32_t kMtpPlannerLanes = 4;
 
+// Component parameters: production uses these defaults, tests can shorten
+// probe/exploration intervals and choose an explicit prior. Zero disables
+// the respective interval.
+struct MtpDepthParameters final {
+  uint32_t probeCycles = 8;
+  uint64_t exploreCycles = 32;
+  std::array<double, 4> priorRatios{1.0, 0.15, 0.10, 0.10};
+};
+[[nodiscard]] uint32_t probeMtpDepth(uint32_t depth, uint32_t &idleCycles, uint32_t interval) noexcept;
+[[nodiscard]] uint32_t exploreMtpDepth(uint32_t depth, uint32_t maximum, uint64_t cycle,
+                                     uint64_t interval) noexcept;
+
 // A request's decayed counts of the proposals the target judged and kept at
 // each draft position (a cycle judges its proposals up to the first it
 // rejects), and over all positions. A position with few judgments leans on
@@ -41,9 +53,10 @@ struct MtpAcceptance final {
 // the verify: a + b steps + c laneSteps, per batch width. Fit to the
 // cycles' measured seconds by ridge regression toward a prior with
 // forgetting; `measured` false asks for the prior's ratios alone, which no
-// measurement moves (a request that samples alone repeats its output).
+// measurement moves. Sampled batches use the upstream rule instead.
 class MtpCostModel final {
 public:
+  explicit MtpCostModel(std::array<double, 4> prior = MtpDepthParameters{}.priorRatios);
   struct Cycle {
     uint32_t lanes = 1;
     uint32_t steps = 0;
@@ -65,6 +78,7 @@ private:
     uint64_t count = 0;
     std::array<double, 4> theta{};
   };
+  std::array<double, 4> priorRatios_;
   std::array<Fit, kMtpPlannerLanes> fits_{};
 };
 
