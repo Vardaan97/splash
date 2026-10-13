@@ -80,6 +80,7 @@ MODEL_CONFIGS := dev/tests/fixtures/model-configs
 TEST_KV_PAGE_CACHE_TEST := $(ENGINE_TEST_BUILD)/kv-page-cache
 TEST_ENGINE_CACHE_TEST := $(ENGINE_TEST_BUILD)/engine-cache
 TEST_DRAFT_CONTEXT_PLAN_TEST := $(ENGINE_TEST_BUILD)/draft-context-plan
+TEST_QWEN4_DRAFT_CONTEXT := $(ENGINE_TEST_BUILD)/qwen4-draft-context
 TEST_RAGGED_SCHEDULER_TEST := $(ENGINE_TEST_BUILD)/ragged-scheduler
 TEST_ENGINE_TEST := $(ENGINE_TEST_BUILD)/engine
 TEST_ELASTIC_KV_TEST := $(ENGINE_TEST_BUILD)/elastic-kv-pool
@@ -160,6 +161,7 @@ TEST_CPU_TARGETS := $(TEST_SLOT_FILE) $(TEST_CACHE_DIRECTORY) $(TEST_DISK_SPACE)
 	$(TEST_ENGINE_CACHE_TEST) \
 	$(TEST_PERSISTENT_CACHE) \
 	$(TEST_DRAFT_CONTEXT_PLAN_TEST) \
+	$(TEST_QWEN4_DRAFT_CONTEXT) \
 	$(TEST_RAGGED_SCHEDULER_TEST) \
 	$(TEST_ENGINE_TEST) \
 	$(TEST_ELASTIC_KV_TEST) \
@@ -255,6 +257,8 @@ $(TEST_KV_PAGE_CACHE_TEST): runtime/engine/KvPool.cpp \
 $(TEST_DRAFT_CONTEXT_PLAN_TEST): runtime/model/DraftContextPlan.cpp \
 		dev/benchmarks/PrefillWork.hpp \
 		dev/tests/engine/draft_context_plan_test.cpp
+$(TEST_QWEN4_DRAFT_CONTEXT): runtime/model/Qwen4DraftVocabulary.cpp \
+		runtime/model/Qwen4DraftVocabularyData.cpp dev/tests/engine/qwen4_draft_context_test.cpp
 $(TEST_RAGGED_SCHEDULER_TEST): runtime/engine/Scheduler.cpp \
 		dev/tests/engine/ragged_scheduler_test.cpp
 $(TEST_ELASTIC_KV_TEST): runtime/engine/KvPool.cpp \
@@ -280,7 +284,7 @@ $(TEST_DISK_SPACE): runtime/engine/DiskSpace.cpp runtime/engine/CacheDirectory.c
 $(TEST_LEGACY_WEIGHT_CACHE): dev/tests/engine/legacy_weight_cache_test.cpp
 
 $(TEST_WEIGHT_SOURCE) $(TEST_GGUF_FILE) $(TEST_MEMORY_TEST) $(TEST_KV_PAGE_CACHE_TEST) \
-		$(TEST_DRAFT_CONTEXT_PLAN_TEST) $(TEST_RAGGED_SCHEDULER_TEST) \
+		$(TEST_DRAFT_CONTEXT_PLAN_TEST) $(TEST_QWEN4_DRAFT_CONTEXT) $(TEST_RAGGED_SCHEDULER_TEST) \
 		$(TEST_ELASTIC_KV_TEST) $(TEST_NATIVE_LOOP_TEST) $(TEST_METRICS_TEST) \
 		$(TEST_MEMORY_AUDIT_TEST) $(TEST_MEMORY_GOVERNOR_TEST) $(TEST_STATUS_TEST) \
 		$(TEST_Q8_CPU_TEST) $(TEST_SLOT_FILE) $(TEST_CACHE_DIRECTORY) $(TEST_DISK_SPACE) \
@@ -492,6 +496,7 @@ test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP)
 	$(TEST_ENGINE_CACHE_TEST)
 	$(TEST_PERSISTENT_CACHE)
 	$(TEST_DRAFT_CONTEXT_PLAN_TEST)
+	$(TEST_QWEN4_DRAFT_CONTEXT)
 	$(TEST_RAGGED_SCHEDULER_TEST)
 	$(TEST_ENGINE_TEST)
 	$(TEST_ELASTIC_KV_TEST)

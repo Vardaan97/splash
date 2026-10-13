@@ -12,8 +12,9 @@ namespace splash::model {
 // tool-call tokens among them. Qwen3.8-Flash-Next's MTP head drafts its
 // argmax over them alone (Qwen4ExpLayout::mtpDraftTokens): it reads their rows
 // of the vocabulary projection, an eighth of it, at each draft step. A draft
-// is a proposal the verify judges with the whole vocabulary, so outputs are
-// those of drafting from every token; a token outside it is never proposed.
+// is a proposal the verify judges with the whole vocabulary. Greedy output
+// remains target-controlled; sampled batches use the whole head instead.
+// A token outside this set and the context is never proposed by this head.
 inline constexpr uint32_t kQwen4DraftVocabularyTokens = 32768;
 // The vocabulary it is of: Qwen3.8's tokenizer.
 inline constexpr uint32_t kQwen4DraftVocabularySource = 248320;

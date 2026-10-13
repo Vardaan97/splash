@@ -350,7 +350,8 @@ enum class DecodeTensor : uint32_t {
   DraftContextTokens,
   DraftContextCopies,
   // Indexed by decode lane: a draft step's logits of the lane's context
-  // rows, and its context (count, logits row stride, state lane, 0).
+  // rows, and its context (count, state lane, 0, 0). The logits stride is
+  // passed separately to the argmax.
   DraftContextLogits,
   DraftContextInfo,
   // One tensor per ops::kMoeScratchFields entry, in its order (moeScratchTensor).
