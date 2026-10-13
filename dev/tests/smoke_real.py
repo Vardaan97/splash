@@ -992,7 +992,7 @@ def run_protocol_extensions(port: int, model: str, vision: bool = True) -> None:
             "model": model,
             "messages": messages,
             "max_tokens": 256,
-            "thinking": {"type": "enabled", "display": "omitted"},
+            "thinking": {"type": "adaptive", "display": "omitted"},
             "output_config": {"effort": "low"},
         },
     )
