@@ -74,6 +74,29 @@ ComputeDispatch addition(const MetalBuffer &buffer, const uint32_t &count,
 
 // A shared input forks to disjoint views of one allocation, then each result
 // is consumed and overwritten. Both submission paths must join the group.
+// Empty-body launches (count=0), alternating serial/concurrent/concurrent/serial.
+// Invoked only in an exclusive M5 window, never as part of make check.
+void dispatchFloor(const char *library, unsigned seconds) {
+    MetalBackend backend(library);
+    auto source = backend.allocateBuffer(4, BufferStorage::Shared, "floor-input");
+    auto output = backend.allocateBuffer(4, BufferStorage::Shared, "floor-output");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+    uint64_t sample = 0;
+    do {
+      for (bool concurrent : {false, true, true, false}) {
+        splash::metal::CommandGraph graph;
+        constexpr unsigned count = 1500;
+        for (unsigned i = 0; i < count; ++i)
+          graph.add("test_copy_u32", {source, output}, uint32_t{0}, {1, 1, 1}, {1, 1, 1});
+        if (concurrent) graph.independent(0, count);
+        const auto timing = backend.submitCommandAsync(graph.command()).wait();
+        std::cout << "{\"sample\":" << sample++ << ",\"concurrent\":" << (concurrent ? "true" : "false")
+                  << ",\"dispatches\":" << count << ",\"gpu_us_per_dispatch\":" << timing.gpuSeconds * 1e6 / count
+                  << ",\"wall_us_per_dispatch\":" << timing.wallSeconds * 1e6 / count << "}\n";
+      }
+    } while (std::chrono::steady_clock::now() < deadline);
+}
+
 void independentDispatches(const char *library) {
     MetalBackend backend(library);
     constexpr uint32_t count = 1024;
@@ -1974,6 +1997,10 @@ void run(const std::string &metallibPath) {
 
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
+        if (argc == 4 && std::string_view(argv[2]) == "--dispatch-floor") {
+          dispatchFloor(argv[1], static_cast<unsigned>(std::strtoul(argv[3], nullptr, 10)));
+          return 0;
+        }
         if (argc != 2) {
             std::cerr << "usage: metal_backend_test <test.metallib>\n";
             return 2;

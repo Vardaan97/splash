@@ -7,6 +7,7 @@
 #include "model/Qwen4DraftVocabulary.hpp"
 #include "model/QwenState.hpp"
 #include "model/Runtime.hpp"
+#include "model/SparseRowStore.hpp"
 
 #include <algorithm>
 #include <array>
@@ -21,6 +22,19 @@ using namespace splash::model;
 using splash::test::require;
 
 namespace {
+class MemoryPleRows final : public RowReader {
+  std::vector<uint8_t> bytes_;
+public:
+  explicit MemoryPleRows(std::span<const uint16_t> rows) : bytes_(rows.size_bytes()) {
+    std::memcpy(bytes_.data(), rows.data(), bytes_.size());
+  }
+  void read(uint64_t offset, std::span<uint8_t> out) override {
+    require(offset + out.size() <= bytes_.size(), "synthetic PLE read bound");
+    std::memcpy(out.data(), bytes_.data() + offset, out.size());
+  }
+  void checkUnchanged() override {}
+  uint64_t size() const override { return bytes_.size(); }
+};
 constexpr uint32_t hidden = 256, vocabulary = 512;
 
 std::vector<uint32_t> contextTokens() {
@@ -82,11 +96,11 @@ struct Fixture {
     return {floats(16, hidden).blocks().segments.front(), floats(1, hidden).blocks().segments.front(),
             forward, forward, down};
   }
-  explicit Fixture(const char *library, bool adaptive = true, bool withContext = false, bool zeroDepth = false, bool lookup = false, bool mtpLookup = false)
+  explicit Fixture(const char *library, bool adaptive = true, bool withContext = false, bool zeroDepth = false, bool lookup = false, bool mtpLookup = false, const char *depth = "cost", bool streamed = false)
       : backend(library), contextWeights(withContext), operators(backend.capabilities()) {
     setenv("SPLASH_MTP_ADAPTIVE", adaptive ? "1" : "0", 1);
     setenv("SPLASH_MTP_DRAFTS", "7", 1);
-    setenv("SPLASH_MTP_DEPTH", "cost", 1);
+    setenv("SPLASH_MTP_DEPTH", depth, 1);
     setenv("SPLASH_MTP_LOOKUP", mtpLookup ? "1" : "0", 1);
     Qwen4ExpWeights weights;
     auto &layout = weights.layout;
@@ -137,6 +151,12 @@ struct Fixture {
       for (uint32_t row = 0; row < pleRows; ++row)
         std::fill_n(pleTable.begin() + row * 256, 256, row % 2 ? 0xbf80 : 0x3f80);
     weights.pleTable = {pleRows, 256, {upload(pleTable), GGUF_FMT_BF16}};
+    if (streamed) {
+      weights.pleStore = std::make_shared<SparseRowStore>(SparseRowTable{"synthetic", pleRows, 512, 0},
+          std::make_unique<MemoryPleRows>(pleTable),
+          SparseRowStoreOptions{SparseRowStore::cacheBytesFor(pleRows, 512) + SparseRowStore::workingBytes(512, 64), 2, 64});
+      weights.pleFormat = GGUF_FMT_BF16;
+    }
     trunk.ple = Qwen4PleWeights{floats(4 * hidden, 256), floats(hidden, 256),
                                norm(4 * hidden), norm(4 * hidden), norm(4 * hidden),
                                upload(std::vector<float>(2 * 4 * hidden))};
@@ -276,6 +296,61 @@ void lookupMixing(const char *library) {
   f.prefill(f.request(ids[0], {10}), lanes[1]);
   require(f.decode(ids[0], lanes[1]).failure.empty(), "lookup request ID and lane reuse succeeds");
   std::cout << "runtime_mtp_lookup_mix=PASS\n";
+}
+
+void ruleLaneIdentity(const char *library) {
+  for (bool sampled : {false, true}) {
+    std::vector<uint32_t> reference;
+    std::vector<uint32_t> referenceDepths;
+    for (const char *depth : {"rule", "lane"}) {
+      Fixture f(library, true, false, false, false, false, depth);
+      auto request = f.request(71, {11});
+      if (sampled) { request.sampling.temperature = 0.6F; request.sampling.seed = 1; }
+      f.prefill(request, 2);
+      std::vector<uint32_t> output, depths;
+      for (uint32_t i = 0; i < 8; ++i) {
+        const auto result = f.decode(71, 2);
+        require(result.failure.empty(), "B1 rule/lane succeeds");
+        output.insert(output.end(), result.outputTokens.begin(), result.outputTokens.end());
+        depths.push_back(result.draftedTokens);
+      }
+      if (std::string_view(depth) == "rule") { reference = output; referenceDepths = depths; }
+      else require(output == reference && depths == referenceDepths, "B1 rule/lane byte and depth identity");
+    }
+  }
+  Fixture f(library, true, false, false, false, false, "lane");
+  const std::array<uint64_t, 4> ids{81, 82, 83, 84};
+  const std::array<uint32_t, 4> lanes{0, 1, 2, 3};
+  for (uint32_t i = 0; i < 4; ++i) f.prefill(f.request(ids[i], {i % 2 ? 11U : 10U}), lanes[i]);
+  bool unequal = false;
+  for (uint32_t i = 0; i < 8; ++i) {
+    const auto result = f.submit(ids, lanes)->wait();
+    unequal |= result[0].draftedTokens != result[1].draftedTokens;
+    for (uint32_t j = 0; j < 4; ++j) {
+      require(result[j].failure.empty() && result[j].acceptedDraftTokens <= result[j].draftedTokens,
+              "B4 lane proposals and retention stay within live rows");
+      for (uint32_t token : result[j].outputTokens) require(token == j % 2, "B4 lane target token identity");
+    }
+  }
+  require(unequal, "B4 rule uses unequal lane depths");
+}
+
+void streamedPrefetch(const char *library) {
+  std::vector<uint32_t> reference;
+  for (bool enabled : {false, true}) {
+    setenv("SPLASH_PLE_PREFETCH", enabled ? "1" : "0", 1);
+    Fixture f(library, true, false, false, false, false, "rule", true);
+    f.prefill(f.request(91, {10}), 1);
+    std::vector<uint32_t> output;
+    for (uint32_t i = 0; i < 8; ++i) {
+      auto result = f.decode(91, 1);
+      require(result.failure.empty(), "streamed prefetch cycle succeeds");
+      output.insert(output.end(), result.outputTokens.begin(), result.outputTokens.end());
+    }
+    if (!enabled) reference = output;
+    else require(output == reference, "midpoint prefetch preserves streamed target tokens");
+  }
+  unsetenv("SPLASH_PLE_PREFETCH");
 }
 
 void unequalCommit(const char *library) {
@@ -483,7 +558,7 @@ void constrainedTransitions(const char *library) {
 int main(int argc, char **argv) {
   try {
     require(argc == 2, "usage: mtp-runtime METALLIB");
-    lookupMixing(argv[1]); unequalCommit(argv[1]); thinkingZeroDepth(argv[1]); thinkingCutoff(argv[1]); contextLifetime(argv[1]); constrainedTransitions(argv[1]);
+    ruleLaneIdentity(argv[1]); streamedPrefetch(argv[1]); lookupMixing(argv[1]); unequalCommit(argv[1]); thinkingZeroDepth(argv[1]); thinkingCutoff(argv[1]); contextLifetime(argv[1]); constrainedTransitions(argv[1]);
   } catch (const std::exception &error) {
     std::cerr << "mtp-runtime: FAIL: " << error.what() << '\n'; return 1;
   }
