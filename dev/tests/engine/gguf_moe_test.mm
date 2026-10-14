@@ -940,7 +940,9 @@ int moe(MetalBackend &backend) {
 
 // Concentrated and skewed loads: a router whose expert e scores 4 x[e], and
 // rows whose first kExperts inputs rank the experts, the first at 1, the next
-// expert at 0.5 and expert e otherwise at 0.01 e. Every row (Concentrated) or
+// expert at 0.5. When experts outnumber hidden columns, paired experts read
+// the same column with opposite signs; the remaining inputs stay below 0.5.
+// Every row (Concentrated) or
 // six of every eight (Skewed) route to experts 0 and 1 first, the others to
 // expert row % kExperts and the next. On the staged 32-row tiles of the
 // Q4_K gate/up model, 1, 12 and 48 rows leave ragged tiles of 8- and 16-row
@@ -950,7 +952,11 @@ int routingLoads(MetalBackend &backend) {
   enum class Load { Concentrated, Skewed };
   Model m = makeModel(backend, Q4K, true);
   m.router.values.assign(uint64_t{kExperts} * kHidden, 0.0f);
-  for (uint32_t e = 0; e < kExperts; ++e) m.router.values[uint64_t{e} * kHidden + e] = 4.0f;
+  static_assert(kExperts <= 2 * kHidden, "the routing fixture holds two experts per input column");
+  const auto column = [](uint32_t expert) { return expert % kHidden; };
+  const auto sign = [](uint32_t expert) { return expert < kHidden ? 1.0f : -1.0f; };
+  for (uint32_t e = 0; e < kExperts; ++e)
+    m.router.values[uint64_t{e} * kHidden + column(e)] = 4.0f * sign(e);
   m.router.segment = floatSegment(backend, m.router.values, kExperts, kHidden);
   m.weights.router = m.router.segment;
   std::string formats;
@@ -965,8 +971,11 @@ int routingLoads(MetalBackend &backend) {
     for (float &v : b.residual) v = bf16(0.1f * v);
     for (uint32_t r = 0; r < kMaximumRows; ++r) {
       const uint32_t first = load == Load::Concentrated || r % 8 < 6 ? 0 : r % kExperts;
-      for (uint32_t e = 0; e < kExperts; ++e)
-        b.input[uint64_t{r} * kHidden + e] = bf16(e == first ? 1.0 : e == (first + 1) % kExperts ? 0.5 : 0.01 * e);
+      const uint32_t next = (first + 1) % kExperts;
+      for (uint32_t c = 0; c < std::min(kExperts, kHidden); ++c)
+        b.input[uint64_t{r} * kHidden + c] = bf16(0.01 * c * std::min(1.0, 16.0 / kExperts));
+      b.input[uint64_t{r} * kHidden + column(first)] = sign(first);
+      b.input[uint64_t{r} * kHidden + column(next)] = bf16(0.5f * sign(next));
     }
     b.moe.input = bfloatBuffer(backend, b.input, "moe-input");
     b.moe.residual = bfloatBuffer(backend, b.residual, "moe-residual");
@@ -979,6 +988,12 @@ int routingLoads(MetalBackend &backend) {
       const MoePlan plan = MoE::prefillPlan(shape, rows, MoeConfig{MoeExpertTile::M32});
       const std::string label = formats + " " + name + " prefill rows=" + std::to_string(rows);
       const std::vector<uint16_t> result = runPlan(backend, m, b, plan, true, true, products, stats, label);
+      const auto *selected = static_cast<const uint32_t *>(b.moe.scratch.selectedExperts.contents());
+      for (uint32_t r = 0; r < rows; ++r) {
+        const uint32_t first = load == Load::Concentrated || r % 8 < 6 ? 0 : r % kExperts;
+        require(selected[r * kRoutes] == first && selected[r * kRoutes + 1] == (first + 1) % kExperts,
+                label + ": fixture routes to its intended first two experts");
+      }
       if (widest.empty()) widest = result;
       else if (!std::equal(result.begin(), result.end(), widest.begin())) {
         printf("  %s: rows differ from the 256-row chunk FAIL\n", label.c_str());
