@@ -365,7 +365,7 @@ void streamedPrefetch(const char *library) {
   std::vector<uint32_t> reference;
   for (bool enabled : {false, true}) {
     setenv("SPLASH_PLE_PREFETCH", enabled ? "1" : "0", 1);
-    Fixture f(library, true, false, false, false, false, "rule", true);
+    Fixture f(library, true, false, true, false, false, "rule", true);
     f.prefill(f.request(91, {10}), 1);
     std::vector<uint32_t> output;
     for (uint32_t i = 0; i < 8; ++i) {
@@ -374,7 +374,11 @@ void streamedPrefetch(const char *library) {
       output.insert(output.end(), result.outputTokens.begin(), result.outputTokens.end());
     }
     if (!enabled) reference = output;
-    else require(output == reference, "midpoint prefetch preserves streamed target tokens");
+    else {
+      require(output == reference, "midpoint prefetch preserves streamed target tokens");
+      require(f.model.streamedTable()->stats().prefetchRequestedRows > 8,
+              "midpoint listener requests proposal rows in addition to eight anchors");
+    }
   }
   unsetenv("SPLASH_PLE_PREFETCH");
 }
