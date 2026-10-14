@@ -707,7 +707,7 @@ struct MetalBackend::Impl {
         return result;
     }
 
-    PreparedCommand prepare(std::span<const ComputeDispatch> dispatches) {
+    PreparedCommand prepareFresh(std::span<const ComputeDispatch> dispatches) {
         if (dispatches.empty()) {
             throw MetalBackendError("Metal command must contain a dispatch");
         }
@@ -836,6 +836,89 @@ struct MetalBackend::Impl {
         for (const std::shared_ptr<MetalAllocation> *owner : bound)
             command.retainedAllocations.push_back(*owner);
         return command;
+    }
+
+    struct GraphCacheEntry {
+        std::string key;
+        PreparedCommand command;
+        size_t bytes = 0;
+    };
+    std::deque<GraphCacheEntry> graphCache;
+    size_t graphCacheBytes = 0;
+    static constexpr size_t maximumGraphCacheBytes = 32 * 1024 * 1024;
+
+    PreparedCommand prepare(std::span<const ComputeDispatch> dispatches) {
+        const char *mode = std::getenv("SPLASH_GRAPH_CACHE");
+        // Diagnostic permutation is applied only by the fresh path.
+        if (!mode || (std::string_view(mode) != "1" && std::string_view(mode) != "verify") ||
+            std::getenv("SPLASH_DISPATCH_VERIFY") || dispatches.size() < 64 || dispatches.size() > 16384)
+            return prepareFresh(dispatches);
+        std::string key;
+        const auto field = [&](const auto &value) {
+            key.append(reinterpret_cast<const char *>(&value), sizeof(value));
+        };
+        const auto buffer = [&](const MetalBuffer &view) {
+            const bool present = static_cast<bool>(view);
+            field(present);
+            if (!present) return;
+            // Validate residency on every hit; retained allocations do not
+            // imply a released/restored Metal resource is the same pipeline input.
+            if (!view.impl_->allocation->buffer) throw MetalBackendError("cached graph binds released memory");
+            field(view.impl_->allocation.get());
+            field(view.impl_->offsetBytes);
+            field(view.impl_->lengthBytes);
+        };
+        for (const auto &d : dispatches) {
+            field(d.pipelineName.size()); key += d.pipelineName;
+            field(d.threadgroups.x); field(d.threadgroups.y); field(d.threadgroups.z);
+            field(d.threadsPerThreadgroup.x); field(d.threadsPerThreadgroup.y); field(d.threadsPerThreadgroup.z);
+            field(d.independentOfPrevious);
+            field(d.buffers.size());
+            for (const auto &b : d.buffers) { field(b.index); buffer(b.buffer); }
+            field(d.bytes.size());
+            for (const auto &b : d.bytes) {
+                if (!b.data || !b.sizeBytes) throw MetalBackendError("cached graph byte binding is empty");
+                field(b.index); field(b.sizeBytes);
+            }
+            buffer(d.indirectThreadgroups.buffer); field(d.indirectThreadgroups.offsetBytes);
+        }
+        for (auto it = graphCache.begin(); it != graphCache.end(); ++it) {
+            if (it->key != key) continue;
+            PreparedCommand result = it->command;
+            // Rebind to this cycle's graph-owned payloads. This patches every
+            // byte struct, including position, parity, live rows and lookup
+            // policy; data-dependent grids are part of the key and miss safely.
+            for (size_t i = 0; i < result.dispatches.size(); ++i) result.dispatches[i].source = &dispatches[i];
+            if (std::string_view(mode) == "verify") {
+                const auto fresh = prepareFresh(dispatches);
+                if (fresh.dispatches.size() != result.dispatches.size() ||
+                    fresh.retainedAllocations != result.retainedAllocations)
+                    throw MetalBackendError("cached graph allocation verification failed");
+                for (size_t i = 0; i < result.dispatches.size(); ++i) {
+                    const auto &a = fresh.dispatches[i], &b = result.dispatches[i];
+                    if (a.pipeline != b.pipeline || a.bufferIndices != b.bufferIndices ||
+                        a.threadCount != b.threadCount || a.groups.width != b.groups.width ||
+                        a.groups.height != b.groups.height || a.groups.depth != b.groups.depth ||
+                        a.threads.width != b.threads.width || a.threads.height != b.threads.height ||
+                        a.threads.depth != b.threads.depth)
+                        throw MetalBackendError("cached graph dispatch verification failed");
+                }
+            }
+            auto entry = std::move(*it); graphCache.erase(it); graphCache.push_back(std::move(entry));
+            return result;
+        }
+        PreparedCommand fresh = prepareFresh(dispatches);
+        const size_t bytes = key.size() + fresh.dispatches.size() * sizeof(PreparedDispatch) +
+                             fresh.retainedAllocations.size() * sizeof(std::shared_ptr<MetalAllocation>);
+        if (bytes <= maximumGraphCacheBytes) {
+            while (!graphCache.empty() && (graphCache.size() >= 64 || graphCacheBytes + bytes > maximumGraphCacheBytes)) {
+                graphCacheBytes -= graphCache.front().bytes; graphCache.pop_front();
+            }
+            auto retained = fresh;
+            for (auto &item : retained.dispatches) item.source = nullptr;
+            graphCache.push_back({std::move(key), std::move(retained), bytes}); graphCacheBytes += bytes;
+        }
+        return fresh;
     }
 
     // Encodes prepared dispatches and the event steps between them into
