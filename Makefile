@@ -47,6 +47,14 @@ PRODUCTION_KERNEL_SOURCES := $(sort $(wildcard \
 	runtime/metal/kernels/prefill/*.metal \
 	runtime/metal/kernels/decode/*.metal \
 	runtime/metal/kernels/shared/*.metal))
+# Append opt-in kernels after existing inputs so metallib linking preserves
+# the original modules' anonymous type names for the strict AIR identity gate.
+PREFILL_CANDIDATE_SOURCES := runtime/metal/kernels/decode/paged_attention_qk2.metal \
+	runtime/metal/kernels/decode/paged_attention_prob2.metal \
+	runtime/metal/kernels/prefill/paged_attention_qk2.metal \
+	runtime/metal/kernels/prefill/paged_attention_prob2.metal \
+	runtime/metal/kernels/prefill/paged_attention_rows4.metal
+PRODUCTION_KERNEL_SOURCES := $(filter-out $(PREFILL_CANDIDATE_SOURCES),$(PRODUCTION_KERNEL_SOURCES)) $(PREFILL_CANDIDATE_SOURCES)
 PRODUCTION_KERNEL_NAMES := \
 	$(patsubst runtime/metal/kernels/%.metal,%,$(PRODUCTION_KERNEL_SOURCES))
 PRODUCTION_AIRS := $(addprefix $(METAL_BUILD)/, \
@@ -390,7 +398,7 @@ force-build-config:
 # while source-set changes only relink the production metallib.
 KERNEL_HEADER_NAMES_DIGEST := $(shell printf '%s\0' $(sort $(KERNEL_HEADERS)) \
 	| shasum -a 256 | cut -c1-16)
-KERNEL_SOURCE_NAMES_DIGEST := $(shell printf '%s\0' $(sort $(PRODUCTION_KERNEL_SOURCES)) \
+KERNEL_SOURCE_NAMES_DIGEST := $(shell printf '%s\0' $(PRODUCTION_KERNEL_SOURCES) \
 	| shasum -a 256 | cut -c1-16)
 PRODUCTION_AIR_CONFIG := $(CONFIG_DIGEST)-$(KERNEL_HEADER_NAMES_DIGEST)
 PRODUCTION_LIB_CONFIG := $(PRODUCTION_AIR_CONFIG)-$(KERNEL_SOURCE_NAMES_DIGEST)
