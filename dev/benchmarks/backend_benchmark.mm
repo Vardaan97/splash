@@ -114,6 +114,10 @@ public:
     return found->second;
   }
 
+  [[nodiscard]] const Observation *find(uint64_t id) const {
+    const auto it = observations_.find(id);
+    return it == observations_.end() ? nullptr : &it->second;
+  }
   [[nodiscard]] uint64_t batchSequence() const noexcept {
     return batchSequence_;
   }
@@ -763,6 +767,7 @@ struct BenchmarkScenarios final {
   bool transcripts = false;
   bool context = true;
   bool exact = false;
+  bool contended = false;
 };
 
 BenchmarkScenarios parseScenarios(std::string_view value) {
@@ -775,6 +780,7 @@ BenchmarkScenarios parseScenarios(std::string_view value) {
                      : name == "short"       ? &selected.shortPrompts
                      : name == "transcripts" ? &selected.transcripts
                      : name == "context"     ? &selected.context
+                     : name == "contended"   ? &selected.contended
                      : name == "exact"       ? &selected.exact
                                              : nullptr;
     if (!scenario)
@@ -801,7 +807,7 @@ int main(int argc, char **argv) {
                    "[--samples COUNT] [--progress PATH] "
                    "[--scenario NAME[,NAME...]] [--ane-ffn-share SHARE "
                    "[--ane-ffn-minimum-rows ROWS]] [--max-context TOKENS]\n"
-                   "  NAME: decode, partial, short, transcripts, context or exact "
+                   "  NAME: decode, partial, short, transcripts, context, exact or contended "
                    "(default: decode,partial,context)\n"
                    "  SHARE: the prefill FFN's Neural Engine share in [0, 1) "
                    "to run instead of calibrating one (0: GPU alone)\n"
@@ -945,6 +951,82 @@ int main(int argc, char **argv) {
     engine::Engine engine(engineConfig, resources->cache(),
                                   *executor, events);
     Driver driver(engine, events);
+
+    // An explicit native PF2 scenario. Three streams are decoding before
+    // the fourth lane starts its cold suffix; stop peers at the target's
+    // first token so a fixed output limit cannot shorten contention.
+    if (selected.contended) {
+      for (uint32_t sample = 0; sample < samples; ++sample)
+        for (uint32_t rows : {32768u, 100000u}) {
+          evictAllCache(resources->cache());
+          const uint64_t base = 1000 + uint64_t{sample} * 100 + rows;
+          for (uint32_t lane = 0; lane < 3; ++lane) {
+            EngineRequest peer;
+            peer.id = base + lane;
+            peer.prompt = prompt(512, lane + 123);
+            peer.maxNewTokens = 16384;
+            peer.flags = RequestIgnoreEndOfSequence;
+            peer.deadlineMilliseconds = milliseconds(Clock::now() + std::chrono::hours(2));
+            engine.submit(std::move(peer));
+          }
+          bool submitted = false, stopped = false;
+          Clock::time_point began{}, lastDecode{}, ended{};
+          std::vector<double> decodeSteps;
+          uint64_t decoded = 0;
+          const auto before = executor->telemetry();
+          driver.untilIdle([&](const BatchObservation &batch) {
+            const auto now = Clock::now();
+            if (!submitted && batch.kind == WorkKind::Decode && batch.width == 3) {
+              EngineRequest target;
+              target.id = base + 3;
+              target.prompt = prompt(rows, 456);
+              target.maxNewTokens = 1;
+              target.deadlineMilliseconds = milliseconds(now + std::chrono::hours(2));
+              engine.submit(std::move(target));
+              began = lastDecode = now;
+              submitted = true;
+              return;
+            }
+            if (!submitted || stopped) return;
+            if (batch.kind == WorkKind::Decode) {
+              if (batch.width != 3) throw std::runtime_error("contended peers did not remain B3");
+              decodeSteps.push_back(milliseconds(now) - milliseconds(lastDecode));
+              lastDecode = now;
+              decoded += batch.outputTokens;
+            }
+            if (const auto *target = events.find(base + 3); target && target->firstToken) {
+              ended = *target->firstToken;
+              stopped = true;
+              for (uint32_t lane = 0; lane < 3; ++lane) engine.cancel(base + lane);
+            }
+          });
+          const auto *target = events.find(base + 3);
+          if (!submitted || !stopped || decodeSteps.empty() || !target || !target->failure.empty())
+            throw std::runtime_error("incomplete contended scenario");
+          for (uint32_t lane = 0; lane < 3; ++lane)
+            if (!events.get(base + lane).failure.empty()) throw std::runtime_error("contended peer failed");
+          std::sort(decodeSteps.begin(), decodeSteps.end());
+          const double elapsed = milliseconds(ended) - milliseconds(began);
+          const auto after = executor->telemetry();
+          std::cout << "PF2 {\"rows\":" << rows << ",\"sample\":" << sample
+                    << ",\"prefill_wall_ms\":" << elapsed
+                    << ",\"prefill_gpu_ms\":" << (after.totalPrefillGpuSeconds-before.totalPrefillGpuSeconds)*1000
+                    << ",\"decode_step_p95_ms\":" << decodeSteps[(decodeSteps.size()*95-1)/100]
+                    << ",\"decode_tok_s\":" << decoded*1000.0/elapsed
+                    << ",\"target_tokens\":[";
+          for (size_t i = 0; i < target->outputTokens.size(); ++i)
+            std::cout << (i ? "," : "") << target->outputTokens[i];
+          std::cout << "],\"peer_tokens\":[";
+          for (uint32_t lane = 0; lane < 3; ++lane) {
+            std::cout << (lane ? ",[" : "[");
+            const auto &tokens = events.get(base + lane).outputTokens;
+            for (size_t i = 0; i < tokens.size(); ++i) std::cout << (i ? "," : "") << tokens[i];
+            std::cout << ']';
+          }
+          std::cout << "]}\n";
+        }
+      return 0;
+    }
 
     // All four widths receive the same production-token payload. Different
     // batch kernels may round differently; report their actual output hashes
