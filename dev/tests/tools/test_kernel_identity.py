@@ -109,6 +109,16 @@ class KernelIdentityTests(unittest.TestCase):
             ],
         )
 
+    def test_allow_new_still_rejects_changed_and_missing_kernels(self):
+        base = {"decode_sample": MODULE.format("decode_sample")}
+        candidate = {**base, "decode_variant": MODULE.format("decode_variant")}
+        self.assertEqual(self.run_main(base, candidate)[0], 1)
+        self.assertEqual(self.run_main(base, candidate, "--allow-new")[0], 0)
+        candidate["decode_sample"] += "; changed"
+        self.assertEqual(self.run_main(base, candidate, "--allow-new")[0], 1)
+        del candidate["decode_sample"]
+        self.assertEqual(self.run_main(base, candidate, "--allow-new")[0], 1)
+
     def test_a_pattern_that_matches_nothing_is_an_error(self):
         functions = {"decode_sample": MODULE.format("decode_sample")}
         with (

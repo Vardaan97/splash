@@ -101,6 +101,11 @@ def main(argv=None) -> int:
         help="compare the functions whose name matches; repeatable "
         "(default: the kernels the decode path may run)",
     )
+    parser.add_argument(
+        "--allow-new",
+        action="store_true",
+        help="allow candidate-only kernels; existing kernels must remain identical",
+    )
     args = parser.parse_args(argv)
     try:
         libraries = [library(args.baseline), library(args.candidate)]
@@ -122,9 +127,13 @@ def main(argv=None) -> int:
         parser.error("no function matches")
     for name, verdict in verdicts.items():
         print(f"{verdict}: {name}")
-    differing = sum(verdict != "identical" for verdict in verdicts.values())
+    differing = sum(
+        verdict != "identical"
+        and not (args.allow_new and verdict == "only in candidate")
+        for verdict in verdicts.values()
+    )
     print(
-        f"kernel identity: {len(verdicts) - differing} of {len(verdicts)} "
+        f"kernel identity: {sum(v == 'identical' for v in verdicts.values())} of {len(verdicts)} "
         f"identical ({libraries[0]} against {libraries[1]})"
     )
     return 1 if differing else 0
