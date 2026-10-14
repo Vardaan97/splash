@@ -27,12 +27,18 @@ std::vector<uint32_t> draftTokens(uint32_t size, const uint64_t *words) {
 
 std::span<const uint32_t> qwen4DraftVocabulary(uint32_t tokens) {
   if (!tokens) return {};
-  static const auto small = draftTokens(32768, detail::kQwen4DraftVocabularyWords);
-  static const auto medium = draftTokens(49152, detail::kQwen4DraftVocabularyWords49152);
-  static const auto large = draftTokens(65536, detail::kQwen4DraftVocabularyWords65536);
-  if (tokens == 32768) return small;
-  if (tokens == 49152) return medium;
-  if (tokens == 65536) return large;
+  if (tokens == 32768) {
+    static const auto set = draftTokens(32768, detail::kQwen4DraftVocabularyWords);
+    return set;
+  }
+  if (tokens == 49152) {
+    static const auto set = draftTokens(49152, detail::kQwen4DraftVocabularyWords49152);
+    return set;
+  }
+  if (tokens == 65536) {
+    static const auto set = draftTokens(65536, detail::kQwen4DraftVocabularyWords65536);
+    return set;
+  }
   throw std::invalid_argument("no draft vocabulary has that size");
 }
 
