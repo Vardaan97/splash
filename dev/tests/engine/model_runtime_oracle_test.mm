@@ -12,6 +12,7 @@
 #include "model/Runtime.hpp"
 #include "model/QwenState.hpp"
 #include "ops/PageStorage.hpp"
+#include "ops/Linear.hpp"
 #include "ops/Sampling.hpp"
 #include "ops/Vision.hpp"
 
@@ -23,6 +24,7 @@
 #include <filesystem>
 #include <iostream>
 #include <iterator>
+#include <iomanip>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -2282,6 +2284,7 @@ void warmupEos(model::RuntimeContext context, model::LoadedModel &model) {
 // continuing from the earlier grid state must match a cold edited prompt.
 // Boundaries are command ends, preserving the cold prefill partition exactly.
 void requireGridCheckpointEditReplay(model::Runtime &executor,
+                                     const metal::MetalBackend &backend,
                                      const model::QwenStateStorage &states,
                                      std::span<const uint32_t> chat) {
   constexpr uint32_t boundary = 2048, end = 3072, edit = 2301;
@@ -2325,6 +2328,9 @@ void requireGridCheckpointEditReplay(model::Runtime &executor,
               executor.telemetry().targetPrefillRows - before == end - boundary,
           "grid edit replay did not match the cold edited prompt bitwise");
   executor.end(903);
+  std::cout << "gdn_grid_restore cell=bitwise\n"
+            << "gdn_grid_edit_replay=PASS shared=" << edit << " restored=" << boundary
+            << " replayed=" << end - boundary << " cell_and_logits=bitwise\n";
   if (fp32) {
     // Capture the fallback separately: an inside-command GDN capture splits
     // its scan. Including it in 901 would change the purported same-partition
@@ -2334,20 +2340,115 @@ void requireGridCheckpointEditReplay(model::Runtime &executor,
     const auto fallback = prefillChunk(executor, 905, 0, std::span(prompt).first(boundary),
                                       pages, {}, insideGrid);
     require(fallback.capturedStates.size() == 2, "fallback capture was not returned");
+    // Same upstream projection/attention rows as the grid reference: this
+    // isolates the GDN scan split from repartitioning the whole model.
+    require(bytesOf(states.current(1).stateBase) == gridCell,
+            "inside-command capture changed the fp32 scan's complete cell");
+    std::cout << "gdn_inside_command_capture cell=bitwise\n";
     executor.end(905);
-    // fp32 register carry survives an arbitrary mid-command split bitwise.
+    // A restore after 1024 changes whole-model commands from 2048+1024 to
+    // 1024+2048. Lossless GDN register carry does not imply that projections,
+    // attention and later layers recomputed with different row counts agree.
     beginCold(executor, scoring(904, prompt), 1);
     restoreActivePrefix(executor, 904, end, 1024, fallback.capturedStates.front());
     const auto partitioned = prefillChunk(executor, 904, 1024, std::span(prompt).subspan(1024), pages);
-    require(partitioned.failure.empty() && partitioned.scoreLogits == cold.scoreLogits &&
-                states.metadata(1).lengths == coldLengths && bytesOf(states.current(1).stateBase) == coldCell,
-            "fp32 earlier grid restore changed the complete cell or logits bitwise");
-    std::cout << "gdn_grid_partition cell_and_logits=bitwise\n";
+    require(partitioned.failure.empty() && states.metadata(1).lengths == coldLengths &&
+                partitioned.scoreLogits.size() == cold.scoreLogits.size(),
+            "earlier grid restore failed or changed logical state/logit shape");
+    const auto replayCell = bytesOf(states.current(1).stateBase);
+    const auto &layout = states.layout().target;
+    require(replayCell.size() == coldCell.size() && replayCell.size() == layout.cellBytes(),
+            "earlier grid restore changed the complete cell shape");
+    SimilarityAccumulator cell, convolution, recurrent, auxiliary, logits;
+    // Compare every element, not the sampled buffer helper: max-absolute is
+    // over the entire semantic cell. Flash-Next auxiliary PLE/MTP carry is fp32.
+    const auto range = [&](uint64_t offset, uint64_t bytes, bool bf16,
+                           SimilarityAccumulator &part) {
+      const uint32_t width = bf16 ? 2 : 4;
+      require(bytes % width == 0 && offset + bytes <= replayCell.size(), "cell metric extent");
+      for (uint64_t i = offset; i < offset + bytes; i += width) {
+        float a, b;
+        if (bf16) {
+          uint16_t x, y;
+          std::memcpy(&x, replayCell.data() + i, 2);
+          std::memcpy(&y, coldCell.data() + i, 2);
+          a = test::bf16ToFloat(x); b = test::bf16ToFloat(y);
+        } else {
+          std::memcpy(&a, replayCell.data() + i, 4);
+          std::memcpy(&b, coldCell.data() + i, 4);
+        }
+        require(std::isfinite(a) && std::isfinite(b), "non-finite partition cell");
+        part.add(a, b); cell.add(a, b);
+      }
+    };
+    range(0, layout.convolutionBytes(), true, convolution);
+    range(layout.convolutionBytes(), layout.recurrentBytes(), false, recurrent);
+    range(layout.convolutionBytes() + layout.recurrentBytes(), layout.auxiliaryBytes, false, auxiliary);
+    for (size_t i = 0; i < cold.scoreLogits.size(); ++i) {
+      require(std::isfinite(partitioned.scoreLogits[i]) && std::isfinite(cold.scoreLogits[i]),
+              "non-finite partition logits");
+      logits.add(partitioned.scoreLogits[i], cold.scoreLogits[i]);
+    }
+    const bool bitwise = partitioned.scoreLogits == cold.scoreLogits && replayCell == coldCell;
+    const ops::Linear linear(backend.capabilities());
+    const uint32_t gateWidth = 2 * layout.recurrentGroups;
+    const auto firstTile = linear.ggufFloatTile(1024, gateWidth);
+    const auto secondTile = linear.ggufFloatTile(2048, gateWidth);
+    // On the measured 40-core Apple10, F32 alpha/beta's N=96 switches
+    // from SIMD at 1024 rows to the neural accelerator at 2048. These
+    // accumulate differently before the register-carried GDN scan starts.
+    const bool measuredApple10Partition = backend.capabilities().appleGpuFamily == 10 &&
+                                         firstTile != secondTile;
+    const auto print = [&](const char *name, const SimilarityAccumulator &values) {
+      const auto value = values.result();
+      std::cout << ' ' << name << "_cos=" << value.cosine << ' ' << name
+                << "_max_abs=" << value.maximumAbsolute;
+    };
+    std::cout << std::setprecision(17) << "gdn_grid_partition apple_gpu_family=" << backend.capabilities().appleGpuFamily
+              << " state=fp32 reference_commands=2048+1024 replay_commands=1024+2048"
+              << " bitwise=" << bitwise << " gpu_cores=" << backend.capabilities().gpuCoreCount
+              << " gate_width=" << gateWidth
+              << " gate_1024=" << (firstTile == ops::FloatTile::Simdgroup ? "simd" : "neural_accelerator")
+              << " gate_2048=" << (secondTile == ops::FloatTile::Simdgroup ? "simd" : "neural_accelerator");
+    print("cell", cell); print("conv", convolution); print("recurrent", recurrent);
+    print("auxiliary", auxiliary); print("logits", logits);
+    std::cout << " bound=0.999\n";
     executor.end(904);
+    // A 1024 restore with the same whole-model command partition must stay
+    // exact on every device. This distinguishes copy/carry corruption from
+    // the cross-partition comparison above; no numeric tolerance here.
+    const std::array<uint32_t, 1> matchedBoundary{1024};
+    beginCold(executor, scoring(906, prompt), 1);
+    executor.setDraftContextPlan(906, planDraftContext(0, end, matchedBoundary));
+    const auto matchedPrefix = prefillChunk(executor, 906, 0, std::span(prompt).first(1024),
+                                          pages, {}, matchedBoundary);
+    require(matchedPrefix.failure.empty() && matchedPrefix.capturedStates.size() == 1, "matched prefix capture missing");
+    const auto matchedPrefixCell = bytesOf(states.current(1).stateBase);
+    const auto matchedCold = prefillChunk(executor, 906, 1024, std::span(prompt).subspan(1024), pages);
+    const auto matchedColdCell = bytesOf(states.current(1).stateBase);
+    executor.end(906);
+    beginCold(executor, scoring(907, prompt), 1);
+    restoreActivePrefix(executor, 907, end, 1024, matchedPrefix.capturedStates.front());
+    require(bytesOf(states.current(1).stateBase) == matchedPrefixCell,
+            "1024 restore changed the captured cell bytes");
+    const auto matchedReplay = prefillChunk(executor, 907, 1024, std::span(prompt).subspan(1024), pages);
+    require(matchedCold.failure.empty() && matchedReplay.failure.empty() &&
+                matchedReplay.scoreLogits == matchedCold.scoreLogits &&
+                states.metadata(1).lengths == coldLengths &&
+                bytesOf(states.current(1).stateBase) == matchedColdCell,
+            "same-partition 1024 restore changed the complete cell or logits bitwise");
+    std::cout << "gdn_restore_1024_same_partition cell_and_logits=bitwise\n";
+    executor.end(907);
+    // Only this differently partitioned fallback gets the existing fp32
+    // partition tolerance on the measured Apple10 family. All same-partition
+    // grid/capture assertions and every other oracle assertion remain exact.
+    require(bitwise || (measuredApple10Partition && cell.result().cosine > 0.999 &&
+                convolution.result().cosine > 0.999 && recurrent.result().cosine > 0.999 &&
+                auxiliary.result().cosine > 0.999 && logits.result().cosine > 0.999),
+            "fp32 earlier grid restore left its device's partition invariant");
+
   }
   executor.end(902);
-  std::cout << "gdn_grid_edit_replay=PASS shared=" << edit << " restored=" << boundary
-            << " replayed=" << end - boundary << " cell_and_logits=bitwise\n";
 }
 
 } // namespace
@@ -2694,7 +2795,7 @@ int main(int argc, char **argv) {
     if (gdnCheckpointsOnly) {
       const std::array<uint32_t, 16> chat{248045, 8678, 198, 24342, 286, 4879, 369, 716,
                                          310, 830, 11553, 13, 5044, 1683, 15060, 1472};
-      requireGridCheckpointEditReplay(executor, states, chat);
+      requireGridCheckpointEditReplay(executor, backend, states, chat);
       std::cout << "model_runtime_oracle_test: PASS scope=gdn-checkpoints\n";
       return 0;
     }
@@ -2865,7 +2966,7 @@ int main(int argc, char **argv) {
     requireConstrainedThinkingEndWaitsForItsMask(executor);
 // This Flash-Next fixture uses GDN composite state and its token IDs.
     if (std::holds_alternative<model::Qwen4ExpWeights>(model.target))
-      requireGridCheckpointEditReplay(executor, states, samplingSeedTokens);
+      requireGridCheckpointEditReplay(executor, backend, states, samplingSeedTokens);
     requireStatesCapturedInsideCommands(executor, backend, pages, states, aneFfn.get(), samplingSeedTokens);
     requireCapturesOutliveTheirItems(executor, states, samplingSeedTokens);
 

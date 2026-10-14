@@ -8,6 +8,7 @@
 #include "../../../runtime/metal/CommandGraph.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
 #include "../../../runtime/ops/GDN.hpp"
+#include "ops/Linear.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/GDN.h"
 
@@ -22,6 +23,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <iomanip>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -534,11 +536,12 @@ struct RaggedRun final {
 // a prefill split there stores, byte for byte, convolution carry and
 // recurrent state, and the whole command equals the split; with an fp32
 // state, whose segments are invisible, it also equals the single pass.
-void runCapturedStatesCase(MetalBackend &backend, const GdnShape &shape, GdnStateFormat format) {
+void runCapturedStatesCase(MetalBackend &backend, const GdnShape &shape, GdnStateFormat format, bool aligned = false) {
   const std::string label = "vh" + std::to_string(shape.valueHeads) + " " +
                             std::string(splash::ops::formatName(format)) + " captured states: ";
-  const std::vector<RaggedLane> lanes{
-      {0, 37, {17}}, {37, 1000, {1, 333, 998}}, {1037, 611, {300, 302}}, {1648, 400, {}}};
+  const std::vector<RaggedLane> lanes = aligned
+      ? std::vector<RaggedLane>{{0, 2048, {1024}}}
+      : std::vector<RaggedLane>{{0, 37, {17}}, {37, 1000, {1, 333, 998}}, {1037, 611, {300, 302}}, {1648, 400, {}}};
   const uint32_t tokens = 2048;
   GdnPrefillBuffers source = randomPrefill(backend, shape, tokens);
   const uint64_t elements = source.recurrentIn.sizeBytes() / 4;
@@ -651,6 +654,28 @@ void runCapturedStatesCase(MetalBackend &backend, const GdnShape &shape, GdnStat
   sameRows(captured, split, "the split");
   if (format == GdnStateFormat::Float32)
     sameRows(captured, single, "the single pass");
+  if (aligned) {
+    double dot = 0, leftSquare = 0, rightSquare = 0, maximum = 0;
+    const auto add = [&](float a, float b) {
+      require(std::isfinite(a) && std::isfinite(b), "non-finite synthetic captured cell");
+      dot += double(a) * b; leftSquare += double(a) * a; rightSquare += double(b) * b;
+      maximum = std::max(maximum, std::abs(double(a) - b));
+    };
+    const auto &a = captured.captures[0][0], &b = split.captures[0][0];
+    for (uint64_t i = 0; i < a.convolution.sizeBytes() / 2; ++i)
+      add(fromBf16(data<uint16_t>(a.convolution)[i]), fromBf16(data<uint16_t>(b.convolution)[i]));
+    for (uint64_t i = 0; i < a.recurrent.sizeBytes() / splash::ops::elementBytes(format); ++i)
+      if (format == GdnStateFormat::Float32)
+        add(data<float>(a.recurrent)[i], data<float>(b.recurrent)[i]);
+      else
+        add(fromBf16(data<uint16_t>(a.recurrent)[i]), fromBf16(data<uint16_t>(b.recurrent)[i]));
+    require(leftSquare > 0 && rightSquare > 0, "vacuous synthetic captured cell");
+    std::cout << std::setprecision(17) << "gdn_capture_1024_synthetic state=" << splash::ops::formatName(format)
+              << " packed_width=" << shape.packedWidth << " captured_vs_split=bitwise"
+              << " full_scan_bitwise_checked=" << (format == GdnStateFormat::Float32)
+              << " captured_cell_cos=" << dot / std::sqrt(leftSquare * rightSquare)
+              << " captured_cell_max_abs=" << maximum << '\n';
+  }
   std::cout << label << "each captured state is the split's, and the command "
             << (format == GdnStateFormat::Float32 ? "the single pass\n" : "the split\n");
 }
@@ -764,8 +789,27 @@ void bufferExtents(MetalBackend &backend, const GdnShape &shape, bool float32,
                                 });
 }
 
-void run(const std::string &metallib) {
+void run(const std::string &metallib, bool capturesOnly = false) {
   MetalBackend backend(metallib);
+  if (capturesOnly) {
+    std::cout << "gdn_capture_host apple_gpu_family=" << backend.capabilities().appleGpuFamily
+              << " gpu_cores=" << backend.capabilities().gpuCoreCount << '\n';
+    // Host production-planner observation, not an M5 GPU measurement.
+    for (uint32_t family : {9u, 10u}) {
+      splash::DeviceCapabilities device;
+      device.appleGpuFamily = family; device.gpuCoreCount = 40;
+      const splash::ops::Linear linear(device);
+      for (uint32_t rows : {544u, 1024u, 1056u, 1632u, 2048u})
+        std::cout << "gate_planner_host family=" << family << " cores=40 outputs=96 rows=" << rows
+                  << " tile=" << (linear.ggufFloatTile(rows, 96) == splash::ops::FloatTile::Simdgroup
+                                      ? "simd" : "neural_accelerator") << '\n';
+    }
+    for (const GdnShape &shape : {GdnShape{16, 48, 128, 10240, 16512}, GdnShape{16, 32, 128, 8192, 12544}})
+      for (GdnStateFormat format : {GdnStateFormat::Float32, GdnStateFormat::BFloat16})
+        runCapturedStatesCase(backend, shape, format, true);
+    std::cout << "gdn_metal_test PASS scope=capture-1024\n";
+    return;
+  }
   for (const GdnShape &shape :
        {GdnShape{16, 48, 128, 10240, 16640}, GdnShape{16, 32, 128, 8192, 12544},
         GdnShape{16, 48, 128, 10240, 16512}}) {
@@ -782,8 +826,10 @@ void run(const std::string &metallib) {
       runTiledCase(backend, shape, tokens);
     for (uint32_t tokens : {1u, 37u, 1000u})
       runBfloatStateCase(backend, shape, tokens);
-    for (GdnStateFormat format : {GdnStateFormat::Float32, GdnStateFormat::BFloat16})
+    for (GdnStateFormat format : {GdnStateFormat::Float32, GdnStateFormat::BFloat16}) {
       runCapturedStatesCase(backend, shape, format);
+      runCapturedStatesCase(backend, shape, format, true);
+    }
   }
   std::cout << "gdn_metal_test passed\n";
 }
@@ -792,12 +838,12 @@ void run(const std::string &metallib) {
 
 int main(int argc, const char *argv[]) {
   @autoreleasepool {
-    if (argc != 2) {
-      std::cerr << "usage: gdn_metal_test <metallib>\n";
+    if (argc != 2 && !(argc == 3 && std::string(argv[2]) == "--captures-only")) {
+      std::cerr << "usage: gdn_metal_test <metallib> [--captures-only]\n";
       return 2;
     }
     try {
-      run(argv[1]);
+      run(argv[1], argc == 3);
     } catch (const std::exception &error) {
       std::cerr << "FAIL: unexpected exception: " << error.what() << '\n';
       return 1;
