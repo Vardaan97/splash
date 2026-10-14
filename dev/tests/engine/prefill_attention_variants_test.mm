@@ -22,7 +22,7 @@ int main(int argc, char **argv) {
       return 0;
     }
     const bool full = argc > 2 && std::string_view(argv[2]) == "--full";
-    const std::vector<uint32_t> histories = full ? std::vector<uint32_t>{0,2048,4096,32768,65536,131072,200704} : std::vector<uint32_t>{0,257};
+    const std::vector<uint32_t> histories = full ? std::vector<uint32_t>{0,25,31,257,2048,4096,32768,65536,131071,131072,200704} : std::vector<uint32_t>{0,257};
     const std::vector<uint32_t> rowCounts = full ? std::vector<uint32_t>{1,4,7,8,9,16,17,32,128,129,2048} : std::vector<uint32_t>{1,8,17,32};
     uint64_t cases = 0;
     for (const auto format : {kv::Format::Int8, kv::Format::BFloat16})

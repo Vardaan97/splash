@@ -185,7 +185,4 @@ inline void splash_verify_attention_reduce_phase(
         partials, statistics, output, params, group, thread_index, weights,    \
         group_values);                                                         \
   }
-PAGED_VERIFY_REDUCE(PF_ENTRY(verify_attention_reduce), 4, 6)
-PAGED_VERIFY_REDUCE(PF_ENTRY(verify_attention_reduce_kv2_g8), 2, 8)
-PAGED_VERIFY_REDUCE(PF_ENTRY(verify_attention_reduce_kv2_g12), 2, 12)
 #undef PAGED_VERIFY_REDUCE

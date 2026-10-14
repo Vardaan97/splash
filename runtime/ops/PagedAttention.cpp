@@ -66,7 +66,7 @@ constexpr std::pair<std::string_view, std::string_view> kGroup12Kernels[] = {
 
 // The GQA-12 split kernels, which also bind the QSA bitmaps.
 bool masked(std::string_view pipeline) noexcept {
-  return pipeline.ends_with("_split_kv2_g12");
+  return pipeline.find("_split_kv2_g12") != std::string_view::npos;
 }
 
 std::string_view pipeline(KernelLayout layout, std::string_view kv4Group6,
@@ -157,20 +157,21 @@ PrefillAttentionPlan PagedAttention::prefillPlan(
   const KernelLayout kernel = attentionKernelLayout(queryHeads, layout);
   if (!rows || rows > kv::kChunkedPrefillMaximumRows)
     throw std::invalid_argument("invalid attention workspace rows");
-  const uint32_t tileRows = attentionPipeRows();
+  const auto pipe = attentionPipeSelection();
+  const uint32_t tileRows = attentionPipeRows(pipe);
   const uint32_t tiles = (rows + tileRows - 1) / tileRows;
   const uint32_t splits = prefillSplits(kv::prefillAttentionTiles(rows));
   const uint32_t fusedRows = tileRows * (queryHeads / layout.kvHeads);
   return {rows, splits,
           attentionWorkspace(uint64_t{tiles} * splits * layout.kvHeads * fusedRows,
                              layout.headDimension),
-          layout.format == kv::Format::BFloat16
+          attentionPipePipeline(layout.format == kv::Format::BFloat16
               ? pipeline(kernel, "prefill_attention_bf16_split",
                          "prefill_attention_bf16_split_kv2_g8")
               : pipeline(kernel, "prefill_attention_q8_split",
-                         "prefill_attention_q8_split_kv2_g8"),
+                         "prefill_attention_q8_split_kv2_g8"), pipe),
           attentionPipeReduce(pipeline(kernel, "prefill_attention_reduce",
-                   "prefill_attention_reduce_kv2_g8")),
+                   "prefill_attention_reduce_kv2_g8"), pipe),
           {layout.kvHeads, tiles, splits}, {layout.kvHeads, fusedRows, tiles}, layout, queryHeads};
 }
 
@@ -182,6 +183,7 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
     throw std::invalid_argument("invalid attention workspace batch width");
   if (historyTokens.size() != lanes)
     throw std::invalid_argument("invalid verify attention history vector");
+  const auto pipe = attentionPipeSelection();
   std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> laneSplits{};
   uint32_t splits = 0;
   for (uint32_t lane = 0; lane < lanes; ++lane) {
@@ -194,11 +196,11 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
   }
   return {lanes, laneSplits, splits,
           verifyWorkspaceBound(lanes, queryHeads, layout),
-          layout.format == kv::Format::BFloat16
+          attentionPipePipeline(layout.format == kv::Format::BFloat16
               ? pipeline(kernel, "verify_attention_bf16_split",
                          "verify_attention_bf16_split_kv2_g8")
               : pipeline(kernel, "verify_attention_q8_split",
-                         "verify_attention_q8_split_kv2_g8"),
+                         "verify_attention_q8_split_kv2_g8"), pipe),
           pipeline(kernel, "verify_attention_reduce",
                    "verify_attention_reduce_kv2_g8"),
           {layout.kvHeads, splits, lanes},
@@ -402,7 +404,7 @@ void PagedAttention::addPrefill(
   const kv::PrefillAttentionParams params{
       chunk.committed_tokens, chunk.chunk_tokens, chunk.chunk_stride,
       chunk.page_table_entries, layer, plan.splits};
-  const std::string splitName = attentionPipePipeline(plan.splitPipeline);
+  const std::string splitName(plan.splitPipeline);
   if (masked(plan.splitPipeline))
     graph.add(splitName,
               {std::move(queries), partials, statistics, std::move(pageTable)}, params,
@@ -480,13 +482,13 @@ void PagedAttention::addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
              tables[3]},
             stores, plan.storeGroups_, plan.storeThreads_);
   if (masked(plan.splitPipeline))
-    graph.add(attentionPipePipeline(plan.splitPipeline),
+    graph.add(std::string(plan.splitPipeline),
               {buffers.queries, buffers.partials, buffers.statistics, tables[0],
                tables[1], tables[2], tables[3]},
               attention, {mask.words ? mask.bits : buffers.partials},
               Qwen4QsaMaskParams{mask.words, mask.row0}, plan.splitGroups);
   else
-    graph.add(attentionPipePipeline(plan.splitPipeline),
+    graph.add(std::string(plan.splitPipeline),
               {buffers.queries, buffers.partials, buffers.statistics, tables[0],
                tables[1], tables[2], tables[3]},
               attention, plan.splitGroups);

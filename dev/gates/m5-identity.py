@@ -10,6 +10,10 @@ import sys
 if os.environ.get('M5_WINDOW') != '1':
     sys.exit('Requires M5_WINDOW=1 from the main-session queue')
 root = Path(sys.argv[1]).resolve()
+if subprocess.check_output(['git','-C',str(root),'rev-parse','HEAD'],text=True).strip() != (root/'build/pf-m4.sha').read_text().strip():
+    sys.exit('Source SHA differs from M4 receipt')
+if subprocess.check_output(['git','-C',str(root),'status','--porcelain'],text=True).strip():
+    sys.exit('Candidate source tree is dirty')
 package = sys.argv[2]
 out = Path(os.environ['OUT']).resolve()
 out.mkdir(parents=True, exist_ok=True)

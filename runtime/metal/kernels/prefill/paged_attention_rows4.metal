@@ -41,7 +41,10 @@ inline void splash_prefill_attention_split_phase(
       partials, statistics, slot, scores, probabilities, row_max, row_sum,
       previous_scale, rescale, thread_index,
       mask_words ? block_mask + ulong(mask_row0 + tile_start) * mask_words : nullptr,
-      mask_words);
+      mask_words, params.committed_tokens +
+          (tile_start / SPLASH_PREFILL_ATTENTION_TILE_ROWS) * SPLASH_PREFILL_ATTENTION_TILE_ROWS +
+          min(uint(SPLASH_PREFILL_ATTENTION_TILE_ROWS), params.rows -
+              (tile_start / SPLASH_PREFILL_ATTENTION_TILE_ROWS) * SPLASH_PREFILL_ATTENTION_TILE_ROWS));
 }
 
 template <uint KVHeads, uint QueryHeadsPerKVHead>
@@ -64,12 +67,16 @@ inline void splash_prefill_attention_reduce_phase(
   uint active_rows = min(SPLASH_PREFILL_PIPE_TILE_ROWS, params.rows - tile_start);
   ulong tile_offset = (ulong(kv_head) * params.chunk_stride + tile_start) *
                       QueryHeadsPerKVHead * D;
-  splash_attention_reduce_row<QueryHeadsPerKVHead,
+  splash_attention_pipe_reduce_row<QueryHeadsPerKVHead,
                               SPLASH_PREFILL_PIPE_TILE_ROWS>(
       partials, statistics, output + tile_offset,
       params.committed_tokens + tile_start, active_rows, params.split_count,
       (ulong(tile) * KVHeads + kv_head) * params.split_count, fused_row,
-      thread_index, weights, group_values);
+      thread_index, weights, group_values,
+      params.committed_tokens +
+          (tile_start / SPLASH_PREFILL_ATTENTION_TILE_ROWS) * SPLASH_PREFILL_ATTENTION_TILE_ROWS +
+          min(uint(SPLASH_PREFILL_ATTENTION_TILE_ROWS), params.rows -
+              (tile_start / SPLASH_PREFILL_ATTENTION_TILE_ROWS) * SPLASH_PREFILL_ATTENTION_TILE_ROWS));
 }
 
 #define PAGED_PREFILL_SPLIT(Name, Heads, Group, CacheElement)                  \

@@ -10,13 +10,14 @@ inline void splash_paged_attention_pipe_tile(
     threadgroup float *scores, threadgroup bfloat *probabilities,
     threadgroup float *row_max, threadgroup float *row_sum,
     threadgroup float *previous_scale, threadgroup atomic_uint *rescale_storage,
-    uint thread_index, device const uint *block_mask = nullptr, uint mask_words = 0) {
+    uint thread_index, device const uint *block_mask = nullptr, uint mask_words = 0,
+    uint partition_visible = 0) {
   constexpr ushort M = RowsPerTile * QueryHeadsPerKVHead;
   constexpr bool Quantized = is_same<CacheElement, int8_t>::value;
   constexpr ushort N = SplashKvPageTokens;
   constexpr ushort D = SplashKvHeadDimension;
   uint visible_tokens = committed_tokens + active_rows;
-  uint pages = splash_attention_pages(visible_tokens);
+  uint pages = splash_attention_pages(partition_visible ? partition_visible : visible_tokens);
   uint per_split = splash_attention_pages_per_split(pages, splits);
   uint page_begin = split * per_split;
   if (page_begin >= pages)
@@ -138,4 +139,44 @@ inline void splash_paged_attention_pipe_tile(
     statistics[(slot * M + thread_index) * 2] = row_max[thread_index];
     statistics[(slot * M + thread_index) * 2 + 1] = row_sum[thread_index];
   }
+}
+
+// Four-row subtiles retain the original eight-row tile's page partition.
+template <uint QueryHeadsPerKVHead, uint RowsPerTile>
+inline void splash_attention_pipe_reduce_row(
+    device const float *partials, device const float *statistics,
+    device bfloat *tile_output, uint committed_tokens, uint active_rows,
+    uint splits, ulong head_slot, uint fused_row, uint thread_index,
+    threadgroup float *weights, threadgroup float *group_values, uint partition_visible) {
+  constexpr uint M = RowsPerTile * QueryHeadsPerKVHead;
+  constexpr uint D = SplashKvHeadDimension;
+  if (fused_row / QueryHeadsPerKVHead >= active_rows) {
+    tile_output[fused_row * D + thread_index] = bfloat(0.0f);
+    return;
+  }
+  const uint pages = splash_attention_pages(partition_visible ? partition_visible : committed_tokens + active_rows);
+  const uint per_split = splash_attention_pages_per_split(pages, splits);
+  const uint written = (pages + per_split - 1) / per_split;
+  const uint lane = thread_index % 32, sg = thread_index / 32;
+  const ulong stat = ((head_slot + thread_index) * M + fused_row) * 2;
+  const float maximum = thread_index < written ? statistics[stat] : -INFINITY;
+  const float group_maximum = simd_max(maximum);
+  if (lane == 0) group_values[sg] = group_maximum;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float row_maximum = simd_max(lane < 8 ? group_values[lane] : -INFINITY);
+  if (thread_index < written)
+    weights[thread_index] = fast::exp(maximum - row_maximum);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float numerator = 0.0f, denominator = 0.0f;
+  // Keep both accumulations in the original split order. A parallel sum of
+  // the denominator changes speculative acceptance on real model prompts.
+  for (uint split = 0; split < written; ++split) {
+    const float weight = weights[split];
+    const ulong stat = ((head_slot + split) * M + fused_row) * 2;
+    numerator += weight *
+        partials[((head_slot + split) * M + fused_row) * D + thread_index];
+    denominator += weight * statistics[stat + 1];
+  }
+  tile_output[fused_row * D + thread_index] =
+      bfloat(denominator > 0.0f ? numerator / denominator : 0.0f);
 }

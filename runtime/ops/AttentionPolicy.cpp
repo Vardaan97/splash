@@ -24,11 +24,15 @@ const std::string &requested() {
 }
 }
 void attentionPipeBaseline(bool baseline) { baselineOnly = baseline; }
-uint32_t attentionPipeRows() {
-  return !baselineOnly && passed.load() && requested() == "rows4" ? SPLASH_PREFILL_PIPE_TILE_ROWS : kv::kPrefillAttentionTileRows;
+AttentionPipe attentionPipeSelection() {
+  if (baselineOnly || requested().empty() || !passed.load()) return AttentionPipe::Off;
+  return requested() == "rows4" ? AttentionPipe::Rows4 : requested() == "qk2" ? AttentionPipe::Qk2 : AttentionPipe::Prob2;
 }
-std::string_view attentionPipeReduce(std::string_view baseline) {
-  if (attentionPipeRows() == kv::kPrefillAttentionTileRows) return baseline;
+uint32_t attentionPipeRows(AttentionPipe mode) {
+  return mode == AttentionPipe::Rows4 ? SPLASH_PREFILL_PIPE_TILE_ROWS : kv::kPrefillAttentionTileRows;
+}
+std::string_view attentionPipeReduce(std::string_view baseline, AttentionPipe mode) {
+  if (attentionPipeRows(mode) == kv::kPrefillAttentionTileRows) return baseline;
   if (baseline == "prefill_attention_reduce") return "prefill_attention_reduce_rows4";
   if (baseline == "prefill_attention_reduce_kv2_g8") return "prefill_attention_reduce_kv2_g8_rows4";
   return "prefill_attention_reduce_kv2_g12_rows4";
@@ -62,19 +66,75 @@ void logAttentionPages(metal::MetalBackend &backend, uint64_t request, const voi
               << " committed=" << committed << " attended_pages=" << attended << " total_pages=" << pages << '\n';
   }
 }
-std::string attentionPipePipeline(std::string_view baseline) {
-  const bool enabled = !baselineOnly && passed.load() && !requested().empty() &&
-      (requested() != "rows4" || baseline.starts_with("prefill_"));
-  return std::string(baseline) + (enabled ? "_" + requested() : "");
+std::string_view attentionPipePipeline(std::string_view baseline, AttentionPipe mode) {
+  if (mode == AttentionPipe::Off ||
+      (mode == AttentionPipe::Rows4 && !baseline.starts_with("prefill_"))) return baseline;
+  if (baseline == "prefill_attention_q8_split") {
+    if (mode == AttentionPipe::Qk2) return "prefill_attention_q8_split_qk2";
+    if (mode == AttentionPipe::Prob2) return "prefill_attention_q8_split_prob2";
+    if (mode == AttentionPipe::Rows4) return "prefill_attention_q8_split_rows4";
+  }
+  if (baseline == "prefill_attention_q8_split_kv2_g8") {
+    if (mode == AttentionPipe::Qk2) return "prefill_attention_q8_split_kv2_g8_qk2";
+    if (mode == AttentionPipe::Prob2) return "prefill_attention_q8_split_kv2_g8_prob2";
+    if (mode == AttentionPipe::Rows4) return "prefill_attention_q8_split_kv2_g8_rows4";
+  }
+  if (baseline == "prefill_attention_q8_split_kv2_g12") {
+    if (mode == AttentionPipe::Qk2) return "prefill_attention_q8_split_kv2_g12_qk2";
+    if (mode == AttentionPipe::Prob2) return "prefill_attention_q8_split_kv2_g12_prob2";
+    if (mode == AttentionPipe::Rows4) return "prefill_attention_q8_split_kv2_g12_rows4";
+  }
+  if (baseline == "prefill_attention_bf16_split") {
+    if (mode == AttentionPipe::Qk2) return "prefill_attention_bf16_split_qk2";
+    if (mode == AttentionPipe::Prob2) return "prefill_attention_bf16_split_prob2";
+    if (mode == AttentionPipe::Rows4) return "prefill_attention_bf16_split_rows4";
+  }
+  if (baseline == "prefill_attention_bf16_split_kv2_g8") {
+    if (mode == AttentionPipe::Qk2) return "prefill_attention_bf16_split_kv2_g8_qk2";
+    if (mode == AttentionPipe::Prob2) return "prefill_attention_bf16_split_kv2_g8_prob2";
+    if (mode == AttentionPipe::Rows4) return "prefill_attention_bf16_split_kv2_g8_rows4";
+  }
+  if (baseline == "prefill_attention_bf16_split_kv2_g12") {
+    if (mode == AttentionPipe::Qk2) return "prefill_attention_bf16_split_kv2_g12_qk2";
+    if (mode == AttentionPipe::Prob2) return "prefill_attention_bf16_split_kv2_g12_prob2";
+    if (mode == AttentionPipe::Rows4) return "prefill_attention_bf16_split_kv2_g12_rows4";
+  }
+  if (baseline == "verify_attention_q8_split") {
+    if (mode == AttentionPipe::Qk2) return "verify_attention_q8_split_qk2";
+    if (mode == AttentionPipe::Prob2) return "verify_attention_q8_split_prob2";
+  }
+  if (baseline == "verify_attention_q8_split_kv2_g8") {
+    if (mode == AttentionPipe::Qk2) return "verify_attention_q8_split_kv2_g8_qk2";
+    if (mode == AttentionPipe::Prob2) return "verify_attention_q8_split_kv2_g8_prob2";
+  }
+  if (baseline == "verify_attention_q8_split_kv2_g12") {
+    if (mode == AttentionPipe::Qk2) return "verify_attention_q8_split_kv2_g12_qk2";
+    if (mode == AttentionPipe::Prob2) return "verify_attention_q8_split_kv2_g12_prob2";
+  }
+  if (baseline == "verify_attention_bf16_split") {
+    if (mode == AttentionPipe::Qk2) return "verify_attention_bf16_split_qk2";
+    if (mode == AttentionPipe::Prob2) return "verify_attention_bf16_split_prob2";
+  }
+  if (baseline == "verify_attention_bf16_split_kv2_g8") {
+    if (mode == AttentionPipe::Qk2) return "verify_attention_bf16_split_kv2_g8_qk2";
+    if (mode == AttentionPipe::Prob2) return "verify_attention_bf16_split_kv2_g8_prob2";
+  }
+  if (baseline == "verify_attention_bf16_split_kv2_g12") {
+    if (mode == AttentionPipe::Qk2) return "verify_attention_bf16_split_kv2_g12_qk2";
+    if (mode == AttentionPipe::Prob2) return "verify_attention_bf16_split_kv2_g12_prob2";
+  }
+  return baseline;
 }
+
 namespace {
 bool probe(metal::MetalBackend &backend, const std::string &mode) {
   using namespace metal;
+  for (uint32_t history : {25u,257u}) {
   for (const auto format : {kv::Format::Int8, kv::Format::BFloat16}) {
     for (const uint32_t heads : {16u, 24u}) {
       for (const uint32_t kvHeads : {2u, 4u}) {
         if (kvHeads == 4 && heads != 24) continue;
-        constexpr uint32_t pages = 16, stride = 32, rows = 8, history = 257;
+        constexpr uint32_t pages = 16, stride = 32, rows = 8;
         const uint32_t data = kvHeads * SPLASH_TARGET_KV_BLOCK_TOKENS * SPLASH_KV_HEAD_DIMENSION *
                               (format == kv::Format::Int8 ? 1 : 2);
         const uint32_t scale = format == kv::Format::Int8 ? kvHeads * SPLASH_TARGET_KV_BLOCK_TOKENS * 4 : 0;
@@ -124,19 +184,31 @@ bool probe(metal::MetalBackend &backend, const std::string &mode) {
               splash_kv_layer(pages, data, scale, 0), splits};
           auto output = allocate(queries.sizeBytes());
           std::vector<std::byte> referencePartial(partialBytes), referenceStats(statBytes), referenceOutput(output.sizeBytes());
+          for (bool verify : {false,true}) {
+            if (verify && mode == "rows4") continue;
           for (uint32_t arm = 0; arm < 2; ++arm) {
             std::memset(partial.contents(), 0xa5, partialBytes);
             std::memset(stats.contents(), 0xa5, statBytes);
             std::memset(output.contents(), 0, output.sizeBytes());
             CommandGraph graph;
-            const std::string name = baseline + (arm ? "_" + mode : "");
+            const std::string name = (verify ? "verify"+baseline.substr(7) : baseline) + (arm ? "_" + mode : "");
             const bool rows4 = arm && mode == "rows4";
             const uint32_t tiles = rows4 ? 2 : 1;
-            if (kvHeads == 2 && heads == 24)
-              graph.add(name, {queries, partial, stats, table}, p, {mask}, Qwen4QsaMaskParams{4, 0}, {kvHeads, tiles, splits});
-            else graph.add(name, {queries, partial, stats, table}, p, {kvHeads, tiles, splits});
-            graph.add("prefill_attention_reduce" + suffix + (rows4 ? "_rows4" : ""),
-                      {partial, stats, output}, p, {kvHeads, rows4 ? fused/2 : fused, tiles});
+            if (verify) {
+              std::array<SplashVerifyAttentionParams,SPLASH_MAXIMUM_BATCH_WIDTH> lanes{};
+              lanes[0] = {history,pages,p.kv,splits,splits};
+              if (kvHeads == 2 && heads == 24)
+                graph.add(name, {queries,partial,stats,table,table,table,table}, lanes,
+                          {mask}, Qwen4QsaMaskParams{4,0}, {kvHeads,splits,1});
+              else graph.add(name, {queries,partial,stats,table,table,table,table}, lanes, {kvHeads,splits,1});
+              graph.add("verify_attention_reduce"+suffix, {partial,stats,output}, lanes, {kvHeads,fused,1});
+            } else {
+              if (kvHeads == 2 && heads == 24)
+                graph.add(name, {queries, partial, stats, table}, p, {mask}, Qwen4QsaMaskParams{4, 0}, {kvHeads, tiles, splits});
+              else graph.add(name, {queries, partial, stats, table}, p, {kvHeads, tiles, splits});
+              graph.add("prefill_attention_reduce" + suffix + (rows4 ? "_rows4" : ""),
+                        {partial, stats, output}, p, {kvHeads, rows4 ? fused/2 : fused, tiles});
+            }
             (void)backend.submitCommandAsync(graph.command()).wait();
             if (!arm) {
               std::memcpy(referencePartial.data(), partial.contents(), partialBytes);
@@ -147,9 +219,11 @@ bool probe(metal::MetalBackend &backend, const std::string &mode) {
             } else if (std::memcmp(referencePartial.data(), partial.contents(), partialBytes) ||
                        std::memcmp(referenceStats.data(), stats.contents(), statBytes)) return false;
           }
+          }
         }
       }
     }
+  }
   }
   return true;
 }
