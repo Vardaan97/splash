@@ -64,6 +64,10 @@ Real model identity, streaming and speed remain pending the exclusive M5
 gates in `~/Developer/max-stack`; those scripts never build or download.
 M4 validation commands and receipts are recorded in that directory's STATUS.
 
+The native transcript tool also reads D's environment flag through the same
+validated parser as `serve-native`; without that integration its bootstrap
+would silently leave the grid off. It uses fp32 state by default.
+
 ## Reserved follow-up slots
 
 Leave 2–4 subsequent topics for explicit items in
