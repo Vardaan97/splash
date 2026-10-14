@@ -808,7 +808,8 @@ int main(int argc, char **argv) {
                    "  ROWS: the least rows of a chunk that share takes "
                    "(default: 512)\n"
                    "  TOKENS: the context the engine serves, as serve's "
-                   "--max-context (default: what memory holds)\n";
+                   "--max-context (default: what memory holds)\n"
+                   "  --ple-ssd-cache BYTES: stream PLE through a cache (minimum 67108864)\n";
       return 2;
     }
     uint32_t samples = 1;
@@ -817,6 +818,7 @@ int main(int argc, char **argv) {
     std::optional<double> aneFfnShare;
     std::optional<uint32_t> aneFfnMinimumRows;
     uint32_t maxContext = 0;
+    uint64_t pleCacheBytes = 0;
     for (int index = 3; index < argc; index += 2) {
       if (index + 1 >= argc)
         throw std::invalid_argument("benchmark option requires a value");
@@ -833,6 +835,11 @@ int main(int argc, char **argv) {
         aneFfnMinimumRows = parseAneFfnMinimumRows(argv[index + 1]);
       } else if (option == "--max-context") {
         maxContext = parseMaxContext(argv[index + 1]);
+      } else if (option == "--ple-ssd-cache") {
+        const std::string_view value(argv[index + 1]);
+        const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), pleCacheBytes);
+        if (error != std::errc{} || end != value.data() + value.size() || pleCacheBytes < kMinimumPleCacheBytes)
+          throw std::invalid_argument("--ple-ssd-cache takes a byte count of at least 67108864");
       } else {
         throw std::invalid_argument("unknown benchmark option");
       }
@@ -847,6 +854,7 @@ int main(int argc, char **argv) {
     config.metallibPath = std::filesystem::path(argv[1]);
     config.modelRoot = std::filesystem::path(argv[2]);
     config.model = model::inspectModelRoot(config.modelRoot);
+    config.pleCacheBytes = pleCacheBytes;
     config.buildId = SPLASH_BUILD_ID;
     config.aneFfn = engine::AneFfnSetting::fromGiven(aneFfnShare, aneFfnMinimumRows);
     bootstrapConfig.nativeLoop.engine.maxContext = maxContext;
