@@ -1237,6 +1237,13 @@ void QwenTarget::addMtpDraft(metal::CommandGraph &graph, QwenTargetVerifyBuffers
                                vocabulary, buffers.proposalsPerLane, buffers.candidatesPerProposal, j - 1, j == steps,
                                draftHead ? draftHead->tokens : metal::MetalBuffer{});
     }
+    if (buffers.plePrefetchEvent && j == (steps + 1) / 2) {
+      // Raw bf16-sized copy: two halfwords per token, no conversion.
+      // Later graft/cutoff writes cannot race the listener's snapshot.
+      ops::RowCopy::add(graph, buffers.proposals, {0, 2 * buffers.proposalsPerLane, 0},
+                       buffers.plePrefetchTokens, {0, 2 * buffers.proposalsPerLane, 0}, lanes, 2 * j);
+      graph.signal(buffers.plePrefetchEvent, 1);
+    }
     if (buffers.mtpConfidence) {
       Qwen4MtpParams confidence{lanes * laneRows, 0, 0, laneRows, 0, vocabulary,
                                   buffers.proposalsPerLane, 0, j - 1, 0, draftHead ? 1u : 0u, context ? 1u : 0u};

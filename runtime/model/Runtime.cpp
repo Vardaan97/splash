@@ -32,6 +32,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <future>
 #include <list>
 #include <numeric>
 #include <optional>
@@ -665,6 +666,14 @@ struct Runtime::Impl {
   // (--ple-ssd-cache): every command stages the rows it gathers before it is
   // submitted (stagePleRows), so the GPU never waits for the CPU within one.
   SparseRowStore *pleStore = nullptr;
+  bool plePrefetch = [] {
+    const char *value = std::getenv("SPLASH_PLE_PREFETCH");
+    return value && std::string_view(value) == "1";
+  }();
+  metal::SharedEvent plePrefetchEvent;
+  uint32_t plePrefetchSteps = 0;
+  MetalBuffer plePrefetchTokens;
+
   // Whether a prefill command reads ahead the PLE rows of the prompt tokens
   // after its own (prefetchNextPrefillRows): SPLASH_PLE_SSD_READAHEAD=0 turns
   // it off.
@@ -1997,7 +2006,7 @@ struct Runtime::Impl {
     stagePleRows(decodeArena->batchSlice(DecodeTensor::PleIndices, width),
                  decodeArena->batchSlice(DecodeTensor::PleSlots, width),
                  decodeArena->batchSlice(DecodeTensor::PleStaging, width),
-                 width * kDecodeRows * geometry.target.pleHeads(), SparseRowUse::Decode, false);
+                 width * kDecodeRows * geometry.target.pleHeads(), SparseRowUse::Decode, plePrefetch);
   }
 
   // The QSA blocks whose last token is one of `rows` rows from `position`,
@@ -2338,6 +2347,22 @@ struct Runtime::Impl {
         steps = std::max(steps, depths[lane]);
       }
       if (draftVocabulary && targetModel.hasMtpDraftVocabulary()) bindDraftContext(buffers, entries.first(lanes));
+      plePrefetchEvent = {};
+      if (plePrefetch && pleStore) {
+        plePrefetchEvent = backend.newSharedEvent();
+        plePrefetchSteps = (steps + 1) / 2;
+        buffers.plePrefetchEvent = plePrefetchEvent;
+        plePrefetchTokens = backend.allocateBuffer(lanes * kDraftProposalTokens * sizeof(uint32_t),
+                                                   BufferStorage::Shared, "PLE proposal snapshot");
+        buffers.plePrefetchTokens = plePrefetchTokens;
+        std::vector<uint32_t> anchorRows(lanes * geometry.target.pleHeads());
+        for (uint32_t lane = 0; lane < lanes; ++lane) {
+          const uint32_t token = *entries[lane]->pendingToken;
+          plePromptRows(*entries[lane], items[lane].logicalPosition, {&token, 1},
+                        anchorRows.data() + lane * geometry.target.pleHeads());
+        }
+        pleStore->prefetch(anchorRows);
+      }
       targetModel.addMtpDraft(graph, std::move(buffers), kvPages.layers(), std::span(chunks).first(lanes), lanes,
                               steps, draftVocabulary, std::span(depths).first(lanes));
       return;
@@ -2626,9 +2651,65 @@ struct Runtime::Impl {
                        std::function<void()> completion)
         : impl_(impl), lanes_(std::move(lanes)), items_(items.begin(), items.end()), encodeSeconds_(encodeSeconds),
           wake_(std::move(completion)) {
-      command_ = impl_.backend.submitCommandAsync(draft.dispatches(), wake_);
+      if (impl_.plePrefetch && impl_.plePrefetchEvent) {
+        const auto &weights = *impl_.targetModel.qwen4();
+        const auto hash = weights.pleHash;
+        const auto layout = weights.layout;
+        const uint32_t steps = impl_.plePrefetchSteps;
+        std::vector<std::vector<uint32_t>> histories;
+        for (const auto &lane : lanes_) {
+          const auto &tokens = lane.request->tokens;
+          histories.emplace_back(tokens.end() - std::min<size_t>(3, tokens.size()), tokens.end());
+          histories.back().push_back(*lane.request->pendingToken);
+        }
+        const auto proposals = impl_.plePrefetchTokens;
+        SparseRowStore *store = impl_.pleStore;
+        auto done = std::make_shared<std::promise<void>>();
+        prefetched_ = done->get_future();
+        impl_.plePrefetchEvent.notify(1, [hash, layout, steps, histories = std::move(histories),
+                                        proposals, store, done]() mutable {
+          try {
+            std::vector<uint32_t> ids;
+            const auto *tokens = static_cast<const uint32_t *>(proposals.contents());
+            for (size_t lane = 0; lane < histories.size(); ++lane) {
+              auto &history = histories[lane];
+              for (uint32_t j = 0; j < steps; ++j) {
+                history.push_back(tokens[lane * kDraftProposalTokens + j]);
+                for (uint32_t gram = 2; gram <= layout.pleNgram; ++gram) {
+                  uint64_t mixed = uint64_t{history.back()} * hash.multipliers[0];
+                  bool cut = false;
+                  for (uint32_t back = 1; back < gram; ++back) {
+                    const uint32_t token = history.size() > back ? history[history.size() - back - 1] : layout.pleEosToken;
+                    cut = cut || token == layout.pleEosToken;
+                    mixed ^= uint64_t{cut ? layout.pleEosToken : token} * hash.multipliers[back];
+                  }
+                  for (uint32_t g = 0; g < layout.pleHeadsPerNgram; ++g) {
+                    const uint32_t head = (gram - 2) * layout.pleHeadsPerNgram + g;
+                    ids.push_back(mixed % hash.headVocabularies[head] + hash.headOffsets[head]);
+                  }
+                }
+              }
+            }
+            store->prefetch(ids);
+          } catch (...) {
+            // Best effort: synchronous staging remains authoritative.
+          }
+          done->set_value();
+        });
+      }
+      try {
+        command_ = impl_.backend.submitCommandAsync(draft.command(), wake_);
+      } catch (...) {
+        if (prefetched_.valid()) {
+          impl_.plePrefetchEvent.signal(1);
+          prefetched_.wait();
+        }
+        throw;
+      }
       target_ = impl_.backend.encodeCommand(target.command());
     }
+
+    ~StagedVerifyTicket() override { if (prefetched_.valid()) prefetched_.wait(); }
 
     std::vector<ModelMaskRequest> takeMaskRequests() override {
       if (stage_ == Stage::Draft && command_.ready()) verify();
@@ -2657,6 +2738,7 @@ struct Runtime::Impl {
       // The host's staging between the two commands counts as the cycle's
       // encoding, as a constrained cycle's verify inputs do.
       const auto encodeStart = AwakeClock::now();
+      if (prefetched_.valid()) prefetched_.wait();
       impl_.stageDecodePleRows(static_cast<uint32_t>(lanes_.size()));
       encodeSeconds_ += std::chrono::duration<double>(AwakeClock::now() - encodeStart).count();
       command_ = impl_.backend.submitEncoded(std::move(target_), wake_);
@@ -2668,6 +2750,7 @@ struct Runtime::Impl {
       timing_.wallSeconds += value.wallSeconds;
     }
 
+    std::future<void> prefetched_;
     Impl &impl_;
     std::vector<DecodeLaneResult> lanes_;
     std::vector<ModelBatchItem> items_;
