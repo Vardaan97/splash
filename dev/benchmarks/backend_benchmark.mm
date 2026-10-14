@@ -1,6 +1,7 @@
 #include "engine/Engine.hpp"
 #include "engine/Bootstrap.hpp"
 #include "engine/Json.hpp"
+#include "engine/NativeArguments.hpp"
 #include "engine/RuntimeResources.hpp"
 #include "model/Runtime.hpp"
 #include "PrefillWork.hpp"
@@ -14,6 +15,7 @@
 #include <thread>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -848,6 +850,11 @@ int main(int argc, char **argv) {
     config.buildId = SPLASH_BUILD_ID;
     config.aneFfn = engine::AneFfnSetting::fromGiven(aneFfnShare, aneFfnMinimumRows);
     bootstrapConfig.nativeLoop.engine.maxContext = maxContext;
+    // Use the serve-native grid in transcript identity gates too; otherwise
+    // an enabled environment would silently exercise the off path here.
+    if (const char *grid = std::getenv("SPLASH_GDN_CHECKPOINT_TOKENS"))
+      bootstrapConfig.nativeLoop.engine.retainedCheckpointTokens =
+          engine::parseRetainedCheckpointTokens(grid);
     const std::string modelRoot = config.modelRoot.string();
     const auto &capabilities = config.model.capabilities;
     // Complete production warmup and memory audit before measuring. Retry
