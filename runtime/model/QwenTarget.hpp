@@ -327,6 +327,9 @@ struct QwenTargetVerifyBuffers final {
   metal::MetalBuffer proposals;
   metal::MetalBuffer mtpConfidence;
   metal::MetalBuffer candidates;
+  // Optional midpoint notification; GPU only signals, never waits on host I/O.
+  metal::SharedEvent plePrefetchEvent;
+  metal::MetalBuffer plePrefetchTokens;
   uint32_t proposalsPerLane = 0;
   uint32_t candidatesPerProposal = 0;
   // With the draft vocabulary, each lane's context rows beside it
