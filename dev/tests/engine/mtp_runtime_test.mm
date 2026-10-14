@@ -356,7 +356,7 @@ void slicedPrefillIdentity(const char *library) {
             for (uint32_t page : table)
               for (const auto span : f.pages->spans(page)) actualKv.insert(actualKv.end(), span.begin(), span.end());
             std::vector<std::byte> logits(result.scoreLogits.size() * sizeof(float));
-            std::memcpy(logits.data(), result.scoreLogits.data(), logits.size());
+            if (!logits.empty()) std::memcpy(logits.data(), result.scoreLogits.data(), logits.size());
             for (uint32_t token : result.outputTokens) {
               const auto *p = reinterpret_cast<const std::byte *>(&token);
               logits.insert(logits.end(), p, p + sizeof(token));
