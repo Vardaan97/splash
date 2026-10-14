@@ -46,8 +46,9 @@ still stores KV and QSA keys; it drops only unread attention output.
 
 E2 uses one design: G1 (mask 1) attention/indexer projections; G4 (8) float
 packed columns beside a **single**, unrotated, no-epilogue quantized dispatch;
-G5 (16) single-dispatch PLE key/value; G6 (32) disjoint per-lane MTP input and
-carry slices. Multi-dispatch shared scratch remains ordered. QSA project/pool
+G5 (16) single-dispatch **scratch-free float** PLE key/value; G6 (32) disjoint per-lane MTP input and
+carry slices. Quantized PLE pairs share split scratch even with one dispatch each and stay
+ordered; multi-dispatch shared scratch also remains ordered. QSA project/pool
 across lanes needs pooled-page alias proof; QSA select needs scratch renaming.
 Context-head projections and EH use shared scratch and stay ordered. No
 speculative independence annotations were added. Shuffle operates on whole

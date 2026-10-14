@@ -351,7 +351,7 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
       // requireSegments proves disjoint packed columns. Float kernels use
       // no split scratch; allow only a single quantized dispatch, unrotated
       // plain input (no in-place normalization/preparation dependency).
-      if (metal::decodeDispatchSite(8) && w.rows <= 32 && !p.rotation && !gate &&
+      if (metal::decodeDispatchSite(8) && w.phase == LinearPhase::Decode && w.rows <= 32 && !p.rotation && !gate &&
           w.epilogue == LinearEpilogue::None && quantBegin > floatBegin &&
           graph.dispatches().size() == quantBegin + 1)
         graph.independent(floatBegin, graph.dispatches().size());

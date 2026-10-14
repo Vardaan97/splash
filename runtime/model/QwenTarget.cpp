@@ -1049,8 +1049,12 @@ void QwenTarget::addQwen4Verify(VerifyStep &step, const Qwen4ExpWeights &weights
       project(h.pleRows, ple.key, h.gate);
       const size_t valueBegin = step.graph.dispatches().size();
       project(h.pleRows, ple.value, h.pleValue);
+      // Two single quantized dispatches can still share split partials and
+      // counters. Only the scratch-free float kernels are safe together.
       if (metal::decodeDispatchSite(16) && valueBegin == keyBegin + 1 &&
-          step.graph.dispatches().size() == valueBegin + 1)
+          step.graph.dispatches().size() == valueBegin + 1 &&
+          step.graph.dispatches()[keyBegin].pipelineName.starts_with("gguf_float_") &&
+          step.graph.dispatches()[valueBegin].pipelineName.starts_with("gguf_float_"))
         step.graph.independent(keyBegin, step.graph.dispatches().size());
       ops::Qwen4::addPleGate(step.graph, h.gate, h.pleValue, h.streams, ple.keyNorm, ple.queryNorm,
                              ple.convolutionNorm, h.pleGated, h.pleConvolution, ps, rows);
