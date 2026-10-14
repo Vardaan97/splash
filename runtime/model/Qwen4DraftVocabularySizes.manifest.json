@@ -8,5 +8,6 @@
     49152,
     65536
   ],
-  "source_sha256": "f99fcb08a72ded812b5e4b8a7f4348b6da9e35ba87eb9b72325806ef045fb5b1"
+  "source_sha256": "f99fcb08a72ded812b5e4b8a7f4348b6da9e35ba87eb9b72325806ef045fb5b1",
+  "exact_expansion_invocation": "python dev/tools/expand_draft_vocabulary.py"
 }
