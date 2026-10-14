@@ -217,6 +217,10 @@ void LinearPlan::requireConfiguration() const {
   const uint32_t k = workload_.matrix.inputSize;
   const LinearConfig &c = config_;
   const bool decode = workload_.phase == LinearPhase::Decode;
+  if (workload_.epilogue == LinearEpilogue::HyperMix &&
+      (!decode || c.tile != LinearTile::GgufStaged || c.splits != 1 ||
+       destination_ != FloatOutput::BFloat16 || workload_.matrix.outputSize % 256))
+    throw std::invalid_argument("hyper mix takes an unsplit staged four-stream decode plan");
   if (workload_.epilogue == LinearEpilogue::HyperLow &&
       (!decode || c.tile != LinearTile::GgufStaged || destination_ != FloatOutput::BFloat16))
     throw std::invalid_argument("hyper low takes a staged bf16 decode plan");
@@ -264,6 +268,8 @@ LinearScratchSize LinearPlan::scratchSize() const noexcept {
   // a one-pass gate/up's of both tensors, and one counter per column tile (a
   // tile covers every row of the dispatch): 64 columns, 32 in one pass. The
   // prefill tile never splits.
+  if (workload_.epilogue == LinearEpilogue::HyperMix)
+    return {0, 0, 0, uint64_t{n / (4 * GGUF_TILE_COLUMNS)} * sizeof(uint32_t)};
   const uint64_t columns = config_.oneGateUpPass ? 2 * uint64_t{n} : n;
   const uint32_t tile = config_.oneGateUpPass ? GGUF_STAGED_COLUMNS : GGUF_TILE_COLUMNS;
   return config_.splits > 1
@@ -337,7 +343,7 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
   requireSegments(p, w.matrix);
   if (gate) requireSegments(*gate, w.matrix);
   const std::vector<QuantizedSegment> &segments = p.blocks().segments;
-  if (w.epilogue == LinearEpilogue::HyperLow &&
+  if ((w.epilogue == LinearEpilogue::HyperLow || w.epilogue == LinearEpilogue::HyperMix) &&
       (segments.size() != 1 || segments.front().formatId != GGUF_FMT_Q80))
     throw std::invalid_argument("hyper low takes one Q8_0 tensor");
   // The fused kernels have no fp32 instance.
@@ -405,6 +411,15 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
   const std::vector<QuantizedSegment> &segments = p.blocks().segments;
   const uint32_t rows = plan.storageRows(), splits = config.splits;
   const auto [partials, counters] = splitScratch(b, splits);
+  if (w.epilogue == LinearEpilogue::HyperMix) {
+    const auto &s = segments.front();
+    graph.add("gguf_decode_q80_m" + std::to_string(rows) + "_hcmix",
+              {b.input, s.plane0, s.plane1Slot(), s.meta, b.output, b.scratch.counters,
+               b.hyperNormalized, b.hyperMixed},
+              GgufDecodeParams{k, 1, n, 0, config.spread},
+              {n / GGUF_TILE_COLUMNS, 1, 1}, {GGUF_STAGED_THREADS, 1, 1});
+    return;
+  }
   const auto tensor = [&](const QuantizedSegment &s, char epilogue, const metal::MetalBuffer &output,
                           const metal::MetalBuffer &aux) {
     graph.add(kernelInstance(decodeKernel(s.name(), rows, epilogue), plan.destination()),

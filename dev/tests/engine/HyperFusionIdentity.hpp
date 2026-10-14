@@ -63,5 +63,44 @@ inline void hyperFusionIdentity(metal::MetalBackend &backend) {
         for (uint64_t i = 0; i < size.counters / 4; ++i)
           if (counts[i]) throw std::runtime_error("hyper low leaves counters nonzero");
       }
+  const auto up = projection(10240, 320);
+  for (uint32_t rows : {8u, 16u, 24u, 32u})
+    for (bool spread : {false, true})
+      for (uint32_t inject : {0u, 1u}) {
+        const LinearConfig config{.tile = LinearTile::GgufStaged, .spread = spread};
+        auto plain = Linear::plan({{10240, 320}, rows, LinearPhase::Decode}, config, FloatOutput::BFloat16);
+        auto fused = Linear::plan({{10240, 320}, rows, LinearPhase::Decode, LinearEpilogue::HyperMix},
+                                  config, FloatOutput::BFloat16);
+        const uint32_t storage = plain.storageRows();
+        std::vector<uint16_t> x(storage * 320), norm(storage * 10240);
+        for (auto &v : x) v = floatToBf16(float(int(rng() % 2001) - 1000) / 1000);
+        for (auto &v : norm) v = floatToBf16(float(int(rng() % 2001) - 1000) / 500);
+        auto input = upload(x), normalized = upload(norm);
+        auto gateRef = buffer(storage * 10240 * 2), gateGot = buffer(storage * 10240 * 2);
+        auto mixedRef = buffer(storage * 2560 * 2), mixedGot = buffer(storage * 2560 * 2);
+        auto counters = buffer(fused.scratchSize().counters);
+        std::memset(counters.contents(), 0, counters.sizeBytes());
+        std::vector<float> stream(storage * 10240), norms(10240, 1.0f), injection(4 * 10240, 0.01f);
+        for (auto &v : stream) v = float(int(rng() % 2001) - 1000) / 500;
+        auto streams = upload(stream), normWeights = upload(norms), injectWeights = upload(injection);
+        auto weights = buffer(storage * 4 * sizeof(float));
+        metal::CommandGraph graph;
+        Qwen4::addNorm(graph, streams, {normWeights, true}, inject ? injectWeights : metal::MetalBuffer{},
+                      normalized, weights, {2560, 4, 320}, storage);
+        linear.add(graph, {.input = input, .output = gateRef}, up, plain);
+        Qwen4::addMix(graph, normalized, gateRef, mixedRef, {2560, 4, 320}, storage);
+        linear.add(graph, {.input = input, .output = gateGot, .scratch = {.counters = counters},
+                          .hyperNormalized = normalized, .hyperMixed = mixedGot}, up, fused);
+        // Reuse the arrival counters in the same command, testing reset.
+        linear.add(graph, {.input = input, .output = gateGot, .scratch = {.counters = counters},
+                          .hyperNormalized = normalized, .hyperMixed = mixedGot}, up, fused);
+        static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+        same(gateRef, gateGot, uint64_t(storage) * 10240 * 2, "hyper gate differs bitwise");
+        same(mixedRef, mixedGot, uint64_t(storage) * 2560 * 2, "hyper mixed differs bitwise");
+        const auto *counts = static_cast<const uint32_t *>(counters.contents());
+        for (uint64_t i = 0; i < counters.sizeBytes() / 4; ++i)
+          if (counts[i]) throw std::runtime_error("hyper mix leaves counters nonzero");
+      }
+
 }
 } // namespace splash::test

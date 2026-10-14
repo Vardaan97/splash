@@ -961,6 +961,16 @@ ops::PreparedInput QwenTarget::addQwen4VerifyMix(VerifyStep &step, const Qwen4Hy
     project(h.normalized, hyper.down, h.low, std::move(prepared));
     prepared = ops::Qwen4::addLow(step.graph, h.low, hs, step.rows, scratch, layout(hyper.up));
   }
+  const bool fuseMix = (ops::hyperFusionBits() & 2) && hs.streams == 4 && hs.hidden % 64 == 0 &&
+      linear.supportsHyperEpilogue(hyper.up, step.lanes, ops::LinearEpilogue::HyperMix) &&
+      (!next || layout(*next) == ops::LinearInput::Plain);
+  if (fuseMix) {
+    linear.add(step.graph, {.input = h.low, .output = h.gate, .scratch = scratch,
+                            .prepared = std::move(prepared), .hyperNormalized = h.normalized,
+                            .hyperMixed = output}, hyper.up,
+               linear.decodePlan(hyper.up, step.lanes, ops::LinearEpilogue::HyperMix));
+    return {};
+  }
   project(h.low, hyper.up, h.gate, std::move(prepared));
   return ops::Qwen4::addMix(step.graph, h.normalized, h.gate, std::move(output), hs, step.rows, scratch,
                             next ? layout(*next) : ops::LinearInput::Plain);

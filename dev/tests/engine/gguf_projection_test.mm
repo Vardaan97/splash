@@ -101,6 +101,7 @@ const char *epilogueName(LinearEpilogue e) {
     case LinearEpilogue::GateUp: return "gate/up";
     case LinearEpilogue::UpWithGate: return "up-with-gate";
     case LinearEpilogue::HyperLow: return "hyper-low";
+    case LinearEpilogue::HyperMix: return "hyper-mix";
   }
   return "?";
 }
@@ -368,6 +369,7 @@ void checkValues(const Outcome &out, const std::vector<Dot> &dots, const std::ve
       const uint64_t i = uint64_t{r} * columns + c;
       const Interval p = projected(dots[i], staged);
       switch (w.epilogue) {
+        case LinearEpilogue::HyperMix:
         case LinearEpilogue::HyperLow:
           fail(label + ": hyper epilogues require the bitwise identity fixture");
           return;

@@ -51,7 +51,7 @@ struct LinearMatrix final {
 void requireSegmentPlanes(const QuantizedSegment &segment, std::string_view what, uint32_t planeInputs = 0);
 
 enum class LinearPhase : uint8_t { Prefill, Decode };
-enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate, HyperLow };
+enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate, HyperLow, HyperMix };
 // The tiles run 64 columns per threadgroup; a one-pass gate/up
 // (LinearConfig::oneGateUpPass) runs 32 columns of both tensors per
 // threadgroup of one simdgroup. The staged tiles, GgufStaged and GgufPrefill,
@@ -201,6 +201,8 @@ struct LinearBuffers final {
   // What the scratch table holds (for example after fused RMSNorm). A plan
   // that reads a table prepares one unless this describes its input.
   PreparedInput prepared{};
+  // HyperMix: normalized stream rows and the mixed rows it emits.
+  metal::MetalBuffer hyperNormalized{}, hyperMixed{};
 };
 
 // Missing core metadata uses one intermediate estimate for all families.

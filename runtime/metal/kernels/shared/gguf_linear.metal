@@ -137,6 +137,46 @@ kernel void gguf_decode_low(device bfloat *input [[buffer(0)]], device uchar *w0
 GGUF_LOW(8) GGUF_LOW(16) GGUF_LOW(32)
 #undef GGUF_LOW
 
+// Four stream tiles publish their bf16 gates before the last tile reads
+// them. Each slice owns one counter, covers every row, and sums s=0..3.
+template <ushort Rows>
+[[max_total_threads_per_threadgroup(GGUF_STAGED_THREADS)]]
+kernel void gguf_decode_hcmix(device bfloat *input [[buffer(0)]], device uchar *w0 [[buffer(1)]],
+    device uchar *w1 [[buffer(2)]], device uchar *meta [[buffer(3)]],
+    device coherent(device) bfloat *gate [[buffer(4)]], device atomic_uint *counters [[buffer(5)]],
+    device const bfloat *normalized [[buffer(6)]], device bfloat *mixed [[buffer(7)]],
+    constant GgufDecodeParams &p [[buffer(8)]], uint2 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup half stage[kStagedStages];
+  threadgroup half2 tl[1];
+  threadgroup uint arrival;
+  const uint origin = group.x * GGUF_TILE_COLUMNS + sg * GGUF_STAGED_COLUMNS;
+  auto acc = staged_accumulator<Rows, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(input, p.input_size,
+      stage + sg * kStagedSimdgroupStage);
+  gguf_zero(acc);
+  staged_accumulate<FmtQ80, Rows, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(input, w0, w1, meta, p.input_size,
+      origin, stage + sg * kStagedSimdgroupStage, tl, lane, 0, p.input_size / GGUF_STAGED_STEP,
+      staged_first_step(group.x, 0, p.input_size / GGUF_STAGED_STEP, p.spread), acc);
+  gguf_elements(acc, [&](uint r, uint c, float v) { gate[ulong(r) * p.out_stride + origin + c] = bfloat(v); });
+  const uint hidden = p.out_stride / 4, slice = group.x % (hidden / GGUF_TILE_COLUMNS), tid = sg * 32 + lane;
+  if (!split_arrive_last(counters + slice, 4, tid, &arrival)) return;
+  for (uint r = 0; r < Rows; ++r) {
+    const uint d = slice * GGUF_TILE_COLUMNS + tid;
+    const ulong base = ulong(r) * p.out_stride + d;
+    float sum = 0.0f;
+    for (uint s = 0; s < 4; ++s)
+      sum += float(normalized[base + s * hidden]) * (1.0f / (1.0f + exp(-float(gate[base + s * hidden]))));
+    mixed[ulong(r) * hidden + d] = bfloat(sum / 4u);
+  }
+  split_release(counters + slice, tid);
+}
+#define GGUF_HCMIX(R) \
+  template [[host_name("gguf_decode_q80_m" #R "_hcmix")]] kernel void gguf_decode_hcmix<R>( \
+      device bfloat *, device uchar *, device uchar *, device uchar *, device coherent(device) bfloat *, \
+      device atomic_uint *, device const bfloat *, device bfloat *, constant GgufDecodeParams &, uint2, uint, uint);
+GGUF_HCMIX(8) GGUF_HCMIX(16) GGUF_HCMIX(32)
+#undef GGUF_HCMIX
+
 // Gate/up in one dispatch, where gate and up share their format (ops::Linear, LinearConfig::oneGateUpPass): grid
 // (32-column tiles, K partitions), threadgroups of one simdgroup that stages the gate's and the up's same 32 columns
 // (gguf_staged_pair_steps), so the per-step latency of a tile's chain serves both tensors. Each walks from the step its

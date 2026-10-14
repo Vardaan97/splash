@@ -1,4 +1,5 @@
 #include "Linear.hpp"
+#include "ops/Qwen4.hpp"
 
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Gguf.h"
@@ -168,10 +169,13 @@ LinearPlan Linear::decodePlan(const Projection &p, uint32_t lanes, LinearEpilogu
   return plan(decode({p.outputSize, p.inputSize}, lanes, epilogue), p, gate);
 }
 bool Linear::supportsHyperEpilogue(const Projection &p, uint32_t lanes, LinearEpilogue epilogue) const {
-  if (epilogue != LinearEpilogue::HyperLow || p.blocks().segments.size() != 1 ||
+  if ((epilogue != LinearEpilogue::HyperLow && epilogue != LinearEpilogue::HyperMix) ||
+      p.blocks().segments.size() != 1 ||
       p.blocks().segments.front().formatId != GGUF_FMT_Q80)
     return false;
-  return decodePlan(p, lanes).configuration().tile == LinearTile::GgufStaged;
+  const auto config = decodePlan(p, lanes).configuration();
+  return config.tile == LinearTile::GgufStaged &&
+      (epilogue != LinearEpilogue::HyperMix || (config.splits == 1 && p.outputSize % 256 == 0));
 }
 LinearPlan Linear::prefillPlan(const Projection &p, uint32_t rows, LinearEpilogue epilogue) const {
   return plan({{p.outputSize, p.inputSize}, rows, LinearPhase::Prefill, epilogue}, p);
@@ -182,6 +186,10 @@ LinearScratchSize Linear::decodeScratchSize(ProjectionShape shape) const {
   for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
     for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp})
       bound.include(ggufDecodeScratchSize(decode({shape.outputSize, shape.inputSize}, lanes, epilogue)));
+  // Arrival-group counters share the serial decode workspace. Only the
+  // opt-in mix allocates them; the memory plan consumes this same bound.
+  if ((hyperFusionBits() & 2) && shape.outputSize % 256 == 0)
+    bound.counters = std::max(bound.counters, uint64_t{shape.outputSize / 256} * sizeof(uint32_t));
   // Decode plans store at most every lane's rows.
   if (shape.rotated) bound.rotated = rotatedBytes(shape.inputSize, kMaximumDecodeTileRows);
   return bound;
@@ -216,6 +224,10 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
   const uint64_t rows = selected.storageRows();
   requireBytes(b.input, rows * k * 2, "projection input");
   requireBytes(b.output, rows * n * elementBytes(selected.destination()), "projection output");
+  if (w.epilogue == LinearEpilogue::HyperMix) {
+    requireBytes(b.hyperNormalized, rows * n * 2, "hyper normalized");
+    requireBytes(b.hyperMixed, rows * (n / 4) * 2, "hyper mixed");
+  }
   if (w.epilogue == LinearEpilogue::Residual) requireBytes(b.residual, rows * n * 2, "projection residual");
   requireBytes(b.gateScratch, selected.gateScratchBytes(), "projection gate scratch");
   const LinearScratchSize scratch = selected.scratchSize();
