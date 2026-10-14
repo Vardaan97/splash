@@ -1,3 +1,4 @@
+#include "ops/AttentionPolicy.hpp"
 #include "model/Runtime.hpp"
 #include "model/PrefillPolicy.hpp"
 #include "AwakeClock.hpp"
@@ -3359,6 +3360,17 @@ Runtime::prefillAsync(const BatchPlan &plan,
     for (uint32_t lane = 0; lane < items.size(); ++lane)
       finite[lane] = Impl::finiteRow(outputs.lastRows[lane]);
 
+    // Diagnostic CPU count after completion: the final attention layer's
+    // bitmap is still current. B1 only, so the bitmap starts at row zero.
+    if (ops::attentionStatsEnabled() && items.size() == 1 && impl->targetModel.qwen4()) {
+      const auto &item = items[0];
+      const uint32_t words = qsaMaskWords(impl->geometry.target.maximumContextTokens);
+      ops::logAttentionPages(impl->backend, item.requestId,
+          impl->prefillArena->get(PrefillTensor::QsaMask).contents(), words,
+          static_cast<uint32_t>(item.logicalPosition), item.tokenCount,
+          ops::Qwen4::qsaSparse(static_cast<uint32_t>(item.logicalPosition), item.tokenCount,
+                               impl->targetModel.qwen4()->layout.indexerTopBlocks));
+    }
     std::vector<ModelStepResult> results;
     results.reserve(items.size());
     for (uint32_t lane = 0; lane < items.size(); ++lane) {

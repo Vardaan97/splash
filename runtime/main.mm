@@ -1,4 +1,5 @@
 #include "metal/MoePrefillPolicy.hpp"
+#include "metal/MetalBackend.hpp"
 #include "AwakeClock.hpp"
 #include "LegacyWeightCache.hpp"
 #include "StderrLine.hpp"
@@ -415,9 +416,12 @@ int checkModel(int argc, char **argv) {
 int main(int argc, char **argv) {
   @autoreleasepool {
     try {
-      if (argc == 3 && std::string_view(argv[1]) == "--kernel-selftest") {
-        splash::metal::MetalBackend backend(argv[2]);
-        return splash::metal::moePrefillSelfTest(backend) ? 0 : 1;
+      if ((argc == 2 || argc == 3) && std::string_view(argv[1]) == "--kernel-selftest") {
+        setenv("SPLASH_KERNEL_SELFTEST", "1", 1);
+        const std::string library = argc == 3 ? argv[2] :
+            (std::filesystem::path(argv[0]).parent_path() / "splash.metallib").string();
+        splash::metal::MetalBackend backend(library);
+        return backend.capabilities().moePrefillM64Verified ? 0 : 1;
       }
       if (argc == 2 && std::string_view(argv[1]) == "device-check")
         return splash::checkDevice();

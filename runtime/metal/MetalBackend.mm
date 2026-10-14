@@ -1,4 +1,5 @@
 #include "metal/MoePrefillPolicy.hpp"
+#include "ops/AttentionPolicy.hpp"
 #import "MetalBackend.hpp"
 #include "AwakeClock.hpp"
 #include "CommandWatchdog.hpp"
@@ -1481,6 +1482,7 @@ MetalBackend::MetalBackend(std::string metallibPath, double residencyKeepAliveSe
     impl_->sampleDeviceMemory();
     if (moePrefillSelfTestRequested())
         impl_->capabilities.moePrefillM64Verified = moePrefillSelfTest(*this);
+    ops::attentionKernelSelfTest(*this);
 }
 
 MetalBackend::~MetalBackend() = default;

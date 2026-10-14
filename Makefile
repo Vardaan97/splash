@@ -231,6 +231,7 @@ ENGINE_INSTRUMENTED_ANE_OBJECT := $(ENGINE_BUILD)/ane/ProgramInstrumented.o
 ENGINE_CPP_SOURCES := \
 	runtime/metal/MoePrefillPolicy.cpp \
 	runtime/metal/MoePrefillSelfTest.cpp \
+	runtime/ops/AttentionPolicy.cpp \
 	runtime/ops/AneFfn.cpp \
 	runtime/ops/AneFfnCalibration.cpp \
 	runtime/ops/AneFfnMeasurement.cpp \

@@ -1,4 +1,5 @@
 #include "ops/PagedAttention.hpp"
+#include "ops/AttentionPolicy.hpp"
 
 #include "metal/abi/RoPE.h"
 #include "ops/BufferExtent.hpp"
@@ -156,10 +157,10 @@ PrefillAttentionPlan PagedAttention::prefillPlan(
   const KernelLayout kernel = attentionKernelLayout(queryHeads, layout);
   if (!rows || rows > kv::kChunkedPrefillMaximumRows)
     throw std::invalid_argument("invalid attention workspace rows");
-  const uint32_t tiles = kv::prefillAttentionTiles(rows);
-  const uint32_t splits = prefillSplits(tiles);
-  const uint32_t fusedRows =
-      kv::kPrefillAttentionTileRows * (queryHeads / layout.kvHeads);
+  const uint32_t tileRows = attentionPipeRows();
+  const uint32_t tiles = (rows + tileRows - 1) / tileRows;
+  const uint32_t splits = prefillSplits(kv::prefillAttentionTiles(rows));
+  const uint32_t fusedRows = tileRows * (queryHeads / layout.kvHeads);
   return {rows, splits,
           attentionWorkspace(uint64_t{tiles} * splits * layout.kvHeads * fusedRows,
                              layout.headDimension),
@@ -168,8 +169,8 @@ PrefillAttentionPlan PagedAttention::prefillPlan(
                          "prefill_attention_bf16_split_kv2_g8")
               : pipeline(kernel, "prefill_attention_q8_split",
                          "prefill_attention_q8_split_kv2_g8"),
-          pipeline(kernel, "prefill_attention_reduce",
-                   "prefill_attention_reduce_kv2_g8"),
+          attentionPipeReduce(pipeline(kernel, "prefill_attention_reduce",
+                   "prefill_attention_reduce_kv2_g8")),
           {layout.kvHeads, tiles, splits}, {layout.kvHeads, fusedRows, tiles}, layout, queryHeads};
 }
 
@@ -401,13 +402,14 @@ void PagedAttention::addPrefill(
   const kv::PrefillAttentionParams params{
       chunk.committed_tokens, chunk.chunk_tokens, chunk.chunk_stride,
       chunk.page_table_entries, layer, plan.splits};
+  const std::string splitName = attentionPipePipeline(plan.splitPipeline);
   if (masked(plan.splitPipeline))
-    graph.add(std::string(plan.splitPipeline),
+    graph.add(splitName,
               {std::move(queries), partials, statistics, std::move(pageTable)}, params,
               {mask.words ? mask.bits : partials}, Qwen4QsaMaskParams{mask.words, mask.row0},
               plan.splitGroups);
   else
-    graph.add(std::string(plan.splitPipeline),
+    graph.add(splitName,
               {std::move(queries), partials, statistics, std::move(pageTable)},
               params, plan.splitGroups);
   graph.add(std::string(plan.reducePipeline),
@@ -478,13 +480,13 @@ void PagedAttention::addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
              tables[3]},
             stores, plan.storeGroups_, plan.storeThreads_);
   if (masked(plan.splitPipeline))
-    graph.add(std::string(plan.splitPipeline),
+    graph.add(attentionPipePipeline(plan.splitPipeline),
               {buffers.queries, buffers.partials, buffers.statistics, tables[0],
                tables[1], tables[2], tables[3]},
               attention, {mask.words ? mask.bits : buffers.partials},
               Qwen4QsaMaskParams{mask.words, mask.row0}, plan.splitGroups);
   else
-    graph.add(std::string(plan.splitPipeline),
+    graph.add(attentionPipePipeline(plan.splitPipeline),
               {buffers.queries, buffers.partials, buffers.statistics, tables[0],
                tables[1], tables[2], tables[3]},
               attention, plan.splitGroups);

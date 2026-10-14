@@ -682,3 +682,6 @@ test-sanitizers: $(SANITIZER_CONFIG_TARGETS)
 # Standalone MTL3 encoder floor and dependency-chain probe.
 $(TEST_DISPATCH_FLOOR_BENCHMARK): dev/benchmarks/dispatch_floor_benchmark.mm $(LIB) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LINKFLAGS) -o $@
+# Default-off attention candidates: untimed device identity/tolerance matrix.
+$(ENGINE_TEST_BUILD)/prefill-attention-variants: dev/tests/engine/prefill_attention_variants_test.mm $(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
