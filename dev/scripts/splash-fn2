@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""Isolated, prebuilt Flash-Next server. See `splash-fn2 --help`.
+No installer/build invocation; FN2_MODEL_ROOT is the prepared model assembly.
+"""
+import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+
+GIB = 1024 ** 3
+
+def configuration():
+    env = os.environ
+    tree = Path(env.get('FN2_TREE', str(Path(__file__).resolve().parents[2]))).expanduser().resolve()
+    quant = env.get('FN2_QUANT', 'UD-IQ4_XS')
+    if quant not in ('UD-IQ4_XS', 'Balanced-PLE8'):
+        raise ValueError('FN2_QUANT must be UD-IQ4_XS or Balanced-PLE8')
+    model = ('unsloth/Qwen3.8-Flash-Next-GGUF:UD-IQ4_XS' if quant == 'UD-IQ4_XS'
+             else 'Vardaan97/Qwen3.8-Flash-Next-Splash-GGUF:Balanced-PLE8')
+    port = int(env.get('FN2_PORT', '8004'))
+    if not 1024 <= port <= 65535 or port in (4096, 8003):
+        raise ValueError('FN2_PORT must be 1024..65535, excluding 4096 and old launcher port 8003')
+    grid = int(env.get('FN2_GRID', '0'))
+    if grid not in (0, 8192, 16384):
+        raise ValueError('FN2_GRID must be 0, 8192 or 16384 (recommend 16384 after D gates)')
+    cache = Path(env.get('FN2_CACHE_DIR', '~/Library/Caches/Splash/fn2-prefix')).expanduser().resolve()
+    parent = cache
+    while not parent.exists():
+        parent = parent.parent
+    if parent.stat().st_dev != Path.home().stat().st_dev:
+        raise ValueError('FN2_CACHE_DIR must be on the internal home volume')
+    free = shutil.disk_usage(parent).free
+    # Leave >=32 GiB free; use at most a quarter of currently available space.
+    size = env.get('FN2_CACHE_SIZE', '0')
+    if size == '0G':
+        raise ValueError('Too little free space for persistent cache; set FN2_CACHE_SIZE=0 for memory only')
+    import re
+    if not re.fullmatch(r'0|[1-9][0-9]*G', size):
+        raise ValueError('FN2_CACHE_SIZE must be 0 or an integer GiB size such as 16G')
+    if size != '0' and int(size[:-1]) * GIB > free - 32 * GIB:
+        raise ValueError('Cache quota must leave 32 GiB free; reduce FN2_CACHE_SIZE')
+    root = Path(env.get('FN2_MODEL_ROOT', '~/Library/Application Support/Splash/fn2-model')).expanduser().resolve()
+    stream = env.get('FN2_PLE_STREAM', '1')
+    if stream not in ('0', '1'):
+        raise ValueError('FN2_PLE_STREAM must be 0 (resident/no table) or 1 (stream table)')
+    command = [str(tree / '.venv/bin/python'), '-u', '-P', '-m', 'server.server', str(root),
+               '--tokenizer', str(root / 'tokenizer'), '--model', model,
+               '--binary', str(tree / 'build/splash'), '--host', '127.0.0.1', '--port', str(port),
+               '--no-webui', '--served-model-name', 'splash-flashnext', '--kv-format', 'int8',
+               '--state-format', 'fp32', '--max-cache-disk', size, '--request-timeout', '1800']
+    if size != '0':
+        command += ['--persistent-cache', '--cache-dir', str(cache)]
+    if stream == '1':
+        command += ['--ple-ssd-cache', '2G']
+    if env.get('FN2_CTX'):
+        command += ['--max-context', env['FN2_CTX']]
+    state = Path(env.get('FN2_STATE_DIR', '~/.local/share/splash-fn2')).expanduser().resolve()
+    if state == (Path.home() / '.local/share/splash-fn').resolve():
+        raise ValueError('Refusing old launcher state directory')
+    return dict(tree=str(tree), root=str(root), port=port, grid=grid, cache=str(cache),
+                size=size, free_gib=round(free/GIB, 1), command=command, state=str(state))
+
+def identity(pid):
+    p = subprocess.run(['ps', '-p', str(pid), '-o', 'lstart=', '-o', 'command='], capture_output=True, text=True)
+    return p.stdout.strip() if p.returncode == 0 else ''
+
+def owned(record):
+    return bool(record and identity(record['pid']) == record['identity'] and record['identity'])
+
+def stop(record, record_path):
+    if not owned(record):
+        raise RuntimeError('No verified fn2 process; no signals sent')
+    os.killpg(record['pid'], signal.SIGTERM)
+    for _ in range(120):
+        if not owned(record):
+            record_path.unlink(missing_ok=True)
+            print('stopped fn2')
+            return
+        time.sleep(1)
+    raise RuntimeError('Graceful stop timed out; process retained, no forced kill')
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, epilog='Env: FN2_TREE, FN2_MODEL_ROOT (prepared assembly required), FN2_QUANT, FN2_PORT=8004, FN2_CACHE_DIR, FN2_CACHE_SIZE=auto up to 16G, FN2_GRID=0, FN2_PLE_STREAM=1 (0 for resident/no streamed table), FN2_CTX, FN2_STATE_DIR. plan is read-only. start requires a prebuilt tree; never builds/downloads.')
+    parser.add_argument('action', choices=['start', 'stop', 'status', 'plan'])
+    args = parser.parse_args()
+    # Lifecycle uses saved identity/config even if current environment changed.
+    state = Path(os.environ.get('FN2_STATE_DIR', '~/.local/share/splash-fn2')).expanduser().resolve()
+    if state == (Path.home() / '.local/share/splash-fn').resolve():
+        raise ValueError('Refusing old launcher state directory')
+    if args.action == 'plan':
+        print(json.dumps(configuration(), indent=2)); return
+    state.mkdir(parents=True, exist_ok=True)
+    with (state / 'control.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        record_path = state / 'process.json'
+        record = json.loads(record_path.read_text()) if record_path.exists() else None
+        if record and record['port'] in (4096, 8003):
+            raise ValueError('Refusing protected port in saved record')
+        if args.action == 'stop':
+            if not record:
+                print('fn2 is not running'); return
+            stop(record, record_path); return
+        if args.action == 'status':
+            if not owned(record):
+                print('fn2 is not running (no verified process)'); return
+            with urllib.request.urlopen(f"http://127.0.0.1:{record['port']}/status", timeout=3) as r:
+                print(json.dumps(json.load(r), indent=2))
+            return
+        if owned(record):
+            raise RuntimeError('fn2 already running')
+        c = configuration()
+        tree, root = Path(c['tree']), Path(c['root'])
+        for p in (tree / '.venv/bin/python', tree / 'build/splash'):
+            if not p.is_file() or not os.access(p, os.X_OK):
+                raise ValueError(f'Prebuilt executable required: {p}')
+        if not (root / 'tokenizer').is_dir():
+            raise ValueError('Set FN2_MODEL_ROOT to the installed/prepared model assembly with tokenizer/')
+        if c['grid'] and 'SPLASH_GDN_CHECKPOINT_TOKENS' not in (tree / 'runtime/main.mm').read_text():
+            raise ValueError('Selected tree lacks D; choose a prebuilt D integration tree')
+        with socket.socket() as probe:
+            probe.bind(('127.0.0.1', c['port']))
+        environment = dict(os.environ, PYTHONPATH=str(tree), SPLASH_GDN_CHECKPOINT_TOKENS=str(c['grid']), HF_HUB_OFFLINE='1')
+        if c['size'] != '0':
+            Path(c['cache']).mkdir(parents=True, exist_ok=True)
+        with (state / 'server.log').open('ab') as log:
+            proc = subprocess.Popen(c['command'], cwd=tree, env=environment, stdin=subprocess.DEVNULL,
+                                    stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        record = dict(pid=proc.pid, identity=identity(proc.pid), port=c['port'], config=c)
+        record_path.write_text(json.dumps(record, indent=2))
+        try:
+            for _ in range(600):
+                if proc.poll() is not None:
+                    raise RuntimeError(f"Server exited; see {state / 'server.log'}")
+                try:
+                    with urllib.request.urlopen(f"http://127.0.0.1:{c['port']}/v1/models", timeout=2) as r:
+                        json.load(r)
+                    print(f"fn2 ready on :{c['port']}; cache={c['size']} grid={c['grid']}"); return
+                except (OSError, ValueError):
+                    time.sleep(2)
+            raise RuntimeError('Readiness timed out')
+        except BaseException:
+            if owned(record):
+                stop(record, record_path)
+            raise
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, ValueError, RuntimeError) as exc:
+        sys.exit(str(exc))
