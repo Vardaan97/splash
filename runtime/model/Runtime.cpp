@@ -1886,6 +1886,24 @@ struct Runtime::Impl {
                                d(DecodeTensor::ProposedTokens));
   }
 
+  // Without a DFlash draft, the proposals the MTP head drafted or the CPU
+  // wrote (prepareDecodeLane) take the end tokens of each lane whose
+  // thinking cutoff is at row 0, as the draft's selection's do
+  // (encodeDraftBatchGraph).
+  void encodeThinkingDrafts(CommandGraph &graph,
+                            std::span<Request *const> entries) {
+    if (entries.empty() || entries.size() > kLaneCount)
+      throw std::invalid_argument("invalid thinking draft batch");
+    const uint32_t lanes = static_cast<uint32_t>(entries.size());
+    std::array<ops::SamplingPolicy, kLaneCount> policies{};
+    for (uint32_t lane = 0; lane < lanes; ++lane)
+      policies[lane] = samplingPolicy(laneEntry(entries, lane));
+    sampling.addThinkingDrafts(
+        graph, std::span(policies).first(lanes),
+        decodeArena->batchSlice(DecodeTensor::ProposedTokens,
+                                targetModel.decodeStorageLanes(lanes)));
+  }
+
   // The target's verify forward or, with `mtpDraft`, the MTP head's draft
   // steps over the same rows (QwenTarget::addMtpDraft).
   void encodeTargetVerifyBatchForward(CommandGraph &graph,
@@ -2897,14 +2915,17 @@ Runtime::decodeAsync(const BatchPlan &plan,
                                 DecodeTensor::DraftHidden0, width);
     impl_->encodeDraftBatchGraph(commandGraph, entries,
                                  {logicalPositions.data(), width});
-  } else if (impl_->targetModel.hasMtp()) {
-    impl_->encodeTargetVerifyBatchForward(commandGraph, entries, items, true);
-    if (const uint32_t liveRows = impl_->verifyLiveRows(entries)) {
-      for (uint32_t lane = 0; lane < width; ++lane) {
-        lanes[lane].maximumRetained = std::min(lanes[lane].maximumRetained, liveRows);
-        maximumRetained[lane] = lanes[lane].maximumRetained;
+  } else {
+    if (impl_->targetModel.hasMtp()) {
+      impl_->encodeTargetVerifyBatchForward(commandGraph, entries, items, true);
+      if (const uint32_t liveRows = impl_->verifyLiveRows(entries)) {
+        for (uint32_t lane = 0; lane < width; ++lane) {
+          lanes[lane].maximumRetained = std::min(lanes[lane].maximumRetained, liveRows);
+          maximumRetained[lane] = lanes[lane].maximumRetained;
+        }
       }
     }
+    impl_->encodeThinkingDrafts(commandGraph, entries);
   }
   if (constrained) {
     return std::make_unique<Impl::ConstrainedDecodeTicket>(
