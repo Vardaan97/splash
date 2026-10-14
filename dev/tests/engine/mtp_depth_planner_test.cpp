@@ -239,6 +239,16 @@ int main() {
     routedWork();
     cadence();
     lookup();
+    require(lookupMatchBucket(5) == 0 && lookupMatchBucket(6) == 1 && lookupMatchBucket(12) == 2 &&
+            lookupMatchBucket(24) == 3, "lookup match bucket boundaries");
+    PromptLookup bounded;
+    std::vector<uint32_t> longPrompt(262144);
+    for (size_t i = 0; i < longPrompt.size(); ++i) longPrompt[i] = i % 512;
+    require(bounded.sync(longPrompt, false, false, 8192) == 8192 && bounded.indexedKeys() <= 8192,
+            "configurable scan bounds work and nodes at 262K");
+    uint32_t matched = 0;
+    (void)bounded.propose(longPrompt, 0, 7, &matched);
+    require(matched >= 24, "lookup extends a repeated suffix to its true match bucket");
   } catch (const std::exception &error) {
     std::cerr << "MTP depth planner tests FAILED: " << error.what() << '\n';
     return 1;

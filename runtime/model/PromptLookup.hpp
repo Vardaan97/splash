@@ -54,11 +54,13 @@ public:
   [[nodiscard]] static bool usableLane(bool sampled, bool thinkingCutoff) noexcept {
     return !sampled && !thinkingCutoff;
   }
-  size_t sync(std::span<const uint32_t> history, bool sampled = false, bool thinkingCutoff = false) {
+  size_t sync(std::span<const uint32_t> history, bool sampled = false, bool thinkingCutoff = false,
+              size_t budget = maximumTokensPerSync) {
+    budget = std::clamp<size_t>(budget, 1, 8192);
     if (!usableLane(sampled, thinkingCutoff)) return 0;
     if (history.size() < scanned_) { latest_.clear(); complete_.clear(); scanned_ = 0; }
-    const size_t begin = std::max(scanned_, history.size() > maximumTokensPerSync
-                                              ? history.size() - maximumTokensPerSync : 0);
+    const size_t begin = std::max(scanned_, history.size() > budget
+                                              ? history.size() - budget : 0);
     for (size_t i = begin; i < history.size(); ++i) {
       // Index an occurrence only once it has a committed successor.
       if (i)
@@ -76,7 +78,8 @@ public:
     return history.size() - begin;
   }
   [[nodiscard]] std::vector<uint32_t> propose(std::span<const uint32_t> history, uint32_t anchor,
-                                               uint32_t maximum = 7) const {
+                                               uint32_t maximum = 7, uint32_t *matched = nullptr) const {
+    if (matched) *matched = 0;
     maximum = std::min(maximum, 7u);
     for (uint32_t k = std::min<size_t>(4, history.size() + 1); k; --k) {
       const auto found = latest_.find(suffix(history, anchor, k));
@@ -85,6 +88,13 @@ public:
       if (history.size() - next < maximum) {
         const auto complete = complete_.find(found->first);
         if (complete != complete_.end()) next = complete->second;
+      }
+      if (matched) {
+        *matched = k;
+        // Extend the suffix backwards, excluding the pending anchor already
+        // represented by the indexed key. Cap host work on repeated prompts.
+        while (*matched < 8192 && next > *matched && history.size() + 1 > *matched &&
+               history[next - *matched - 1] == history[history.size() - *matched]) ++*matched;
       }
       const size_t count = std::min<size_t>(maximum, history.size() - next);
       return {history.begin() + next, history.begin() + next + count};
@@ -96,6 +106,10 @@ public:
 // Shadow first-token accuracy on emitted target tokens, even while the head
 // drafts. No optimistic prior: stale evidence decays on every emitted token,
 // including tokens without a match. Suspension keeps this request-local state.
+inline uint32_t lookupMatchBucket(uint32_t matched) noexcept {
+  return matched < 6 ? 0 : matched < 12 ? 1 : matched < 24 ? 2 : 3;
+}
+
 struct LookupAcceptance final {
   float accepted = 0.0F, judged = 0.0F;
   void record(std::span<const uint32_t> proposal, uint32_t selected) noexcept {
