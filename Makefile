@@ -53,7 +53,8 @@ PREFILL_CANDIDATE_SOURCES := runtime/metal/kernels/decode/paged_attention_qk2.me
 	runtime/metal/kernels/decode/paged_attention_prob2.metal \
 	runtime/metal/kernels/prefill/paged_attention_qk2.metal \
 	runtime/metal/kernels/prefill/paged_attention_prob2.metal \
-	runtime/metal/kernels/prefill/paged_attention_rows4.metal
+	runtime/metal/kernels/prefill/paged_attention_rows4.metal \
+	runtime/metal/kernels/prefill/paged_attention_compact.metal
 PRODUCTION_KERNEL_SOURCES := $(filter-out $(PREFILL_CANDIDATE_SOURCES),$(PRODUCTION_KERNEL_SOURCES)) $(PREFILL_CANDIDATE_SOURCES)
 PRODUCTION_KERNEL_NAMES := \
 	$(patsubst runtime/metal/kernels/%.metal,%,$(PRODUCTION_KERNEL_SOURCES))
