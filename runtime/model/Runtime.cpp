@@ -565,7 +565,8 @@ struct Runtime::Impl {
     }
     if (targetModel.hasMtpDraftVocabulary())
       for (Request *entry : entries) entry->draftContext.scan(entry->tokens, geometry.target.vocabularySize, kQwen4DraftContextTokens,
-                                 targetModel.qwen4()->layout.mtpDraftTokens);
+                                 targetModel.qwen4()->layout.mtpDraftTokens < 32768 ? kQwen4DraftVocabularyTokens
+                                                                               : targetModel.qwen4()->layout.mtpDraftTokens);
     const bool sampled = std::ranges::any_of(entries, [](const Request *entry) { return samplingEnabled(*entry); });
     const bool draftVocabulary = useDraftVocabulary(entries);
     if (!mtpAdaptive) {
