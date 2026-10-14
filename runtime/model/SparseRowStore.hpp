@@ -148,9 +148,9 @@ public:
   [[nodiscard]] static uint64_t cacheRowsFor(uint64_t cacheBytes, uint32_t rowBytes) noexcept;
   // The committed bytes of a cache of `rows` rows.
   [[nodiscard]] static uint64_t cacheBytesFor(uint64_t rows, uint32_t rowBytes) noexcept;
-  // Reservation beside the cache: prefetch row payloads and stage scratch
-  // for kSparseRowStageRows ids. Larger stages grow the scratch. This does
-  // not count prefetch dedupe scratch, excess vector capacity, job/queue
+  // Reservation beside the cache: prefetch row payloads and stage and
+  // prefetch dedupe scratch for kSparseRowStageRows ids. Larger calls grow
+  // the scratch. This does not count excess vector capacity, job/queue
   // metadata, allocator overhead or reader thread stacks.
   [[nodiscard]] static uint64_t workingBytes(uint32_t rowBytes, uint32_t prefetchRows) noexcept;
 
