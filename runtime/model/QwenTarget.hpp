@@ -485,10 +485,12 @@ private:
   // first takes the table the mix writes (the returned input).
   ops::PreparedInput addQwen4VerifyMix(VerifyStep &step, const Qwen4HyperWeights &hyper, metal::MetalBuffer streams,
                                        metal::MetalBuffer output, const ops::Projection *next = nullptr) const;
-  // A full-attention block over the step's rows into hyper.branch.
+  // A full-attention block over the step's rows into hyper.branch; without
+  // `attend` only what later steps read of it: the rows' KV and QSA index
+  // keys.
   void addQwen4VerifyAttention(VerifyStep &step, const Qwen4ExpLayerWeights &layer,
                                const QwenAttentionWeights &mixer, uint32_t attentionLayer,
-                               ops::PreparedInput input = {}) const;
+                               ops::PreparedInput input = {}, bool attend = true) const;
   // The MTP head over each lane's rows: its inputs (`embedding` rows paired
   // with the carried streams and `history`), its attention block (writing
   // its KV) and, when `full`, its FFN, its head mix and logits: of the whole

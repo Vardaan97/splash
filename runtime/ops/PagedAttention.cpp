@@ -415,6 +415,32 @@ void PagedAttention::addPrefill(
             params, plan.reduceGroups);
 }
 
+void PagedAttention::addVerifyStore(metal::CommandGraph &graph, SplashKvLayer layer,
+                                    PagedVerifyBuffers buffers,
+                                    std::span<const kv::ChunkedPrefillParams> chunks,
+                                    const VerifyAttentionPlan &plan) {
+  constexpr uint32_t maximumLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
+  if (chunks.size() != plan.lanes || buffers.pageTables.size() != maximumLanes) {
+    throw std::invalid_argument("invalid paged verify batch");
+  }
+  const Staging staging = verifyStaging(plan.lanes, plan.layout);
+  const uint32_t headDimension = plan.layout.headDimension;
+  requireBytes(buffers.chunkKeys, staging.rowBytes(1, headDimension), "attention key");
+  requireBytes(buffers.chunkValues, staging.valueBytes(headDimension), "attention value");
+  for (uint32_t lane = 0; lane < plan.lanes; ++lane)
+    requirePageTable(buffers.pageTables[lane], chunks[lane]);
+  std::array<kv::ChunkedPrefillParams, maximumLanes> stores{};
+  for (uint32_t lane = 0; lane < plan.lanes; ++lane) {
+    stores[lane] = chunks[lane];
+    stores[lane].kv = layer;
+  }
+  const auto &tables = buffers.pageTables;
+  graph.add(std::string(plan.storePipeline_),
+            {buffers.chunkKeys, buffers.chunkValues, tables[0], tables[1], tables[2],
+             tables[3]},
+            stores, plan.storeGroups_, plan.storeThreads_);
+}
+
 void PagedAttention::addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
                                PagedVerifyBuffers buffers,
                                std::span<const kv::ChunkedPrefillParams> chunks,
