@@ -23,6 +23,8 @@
 #include <limits>
 #include <mutex>
 #include <new>
+#include <random>
+#include <cstdlib>
 #include <sstream>
 #include <string_view>
 #include <unordered_map>
@@ -792,6 +794,18 @@ struct MetalBackend::Impl {
             command.dispatches.push_back(item);
         }
 
+        if (const char *verify = std::getenv("SPLASH_DISPATCH_VERIFY");
+            verify && std::string_view(verify).starts_with("shuffle:")) {
+            std::mt19937 rng(static_cast<unsigned>(std::strtoul(verify + 8, nullptr, 10)));
+            for (size_t begin = 0; begin < command.dispatches.size();) {
+                size_t end = begin + 1;
+                while (end < command.dispatches.size() &&
+                       command.dispatches[end].source->independentOfPrevious) ++end;
+                std::shuffle(command.dispatches.begin() + begin, command.dispatches.begin() + end, rng);
+                begin = end;
+            }
+        }
+
         for (PreparedDispatch &item : command.dispatches) {
             item.pipeline = pipeline(item.source->pipelineName);
             if (item.threadCount >
@@ -886,7 +900,8 @@ struct MetalBackend::Impl {
             };
             // Indexed by argument table entry. The ticket and the dispatches
             // keep the buffers alive.
-            const bool concurrent = std::ranges::any_of(dispatches, [](const PreparedDispatch &item) {
+            const char *verify = std::getenv("SPLASH_DISPATCH_VERIFY");
+            const bool concurrent = !verify && std::ranges::any_of(dispatches, [](const PreparedDispatch &item) {
                 return item.source->independentOfPrevious;
             });
             __unsafe_unretained id<MTLBuffer> buffers[kBufferArgumentEntries];
@@ -1061,7 +1076,8 @@ struct MetalBackend::Impl {
             };
             // Indexed by argument table entry. The ticket and the dispatches
             // keep the buffers alive.
-            const bool concurrent = std::ranges::any_of(dispatches, [](const PreparedDispatch &item) {
+            const char *verify = std::getenv("SPLASH_DISPATCH_VERIFY");
+            const bool concurrent = !verify && std::ranges::any_of(dispatches, [](const PreparedDispatch &item) {
                 return item.source->independentOfPrevious;
             });
             __unsafe_unretained id<MTLBuffer> buffers[kBufferArgumentEntries];
