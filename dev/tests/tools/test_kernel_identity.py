@@ -121,11 +121,23 @@ class KernelIdentityTests(unittest.TestCase):
 
     def test_allow_new_does_not_allow_changed_or_removed_functions(self):
         baseline = {"moe_expert_gguf_m32_a": MODULE.format("moe_expert_gguf_m32_a")}
-        candidate = {**baseline, "moe_expert_gguf_m64_a": MODULE.format("moe_expert_gguf_m64_a")}
+        candidate = {
+            **baseline,
+            "moe_expert_gguf_m64_a": MODULE.format("moe_expert_gguf_m64_a"),
+        }
         self.assertEqual(self.run_main(baseline, candidate)[0], 1)
         status, lines = self.run_main(baseline, candidate, "--allow-new")
         self.assertEqual(status, 0)
-        self.assertEqual(self.run_main(baseline, candidate, "--allow-new", "--objdump", "/toolchain/metal-objdump")[0], 0)
+        self.assertEqual(
+            self.run_main(
+                baseline,
+                candidate,
+                "--allow-new",
+                "--objdump",
+                "/toolchain/metal-objdump",
+            )[0],
+            0,
+        )
         self.assertTrue(lines[-1].startswith("kernel identity: 1 of 2 identical"))
         candidate["moe_expert_gguf_m32_a"] += "; changed\n"
         self.assertEqual(self.run_main(baseline, candidate, "--allow-new")[0], 1)

@@ -107,14 +107,18 @@ def main(argv=None) -> int:
         action="store_true",
         help="allow candidate-only kernels; existing kernels must remain identical",
     )
-    parser.add_argument("--objdump", type=Path, help="metal-objdump from the build toolchain")
+    parser.add_argument(
+        "--objdump", type=Path, help="metal-objdump from the build toolchain"
+    )
     args = parser.parse_args(argv)
     try:
         libraries = [library(args.baseline), library(args.candidate)]
     except FileNotFoundError as error:
         parser.error(str(error))
     try:
-        baseline, candidate = (functions(metallib, args.objdump) for metallib in libraries)
+        baseline, candidate = (
+            functions(metallib, args.objdump) for metallib in libraries
+        )
     except subprocess.CalledProcessError as error:
         print(f"kernel identity: {error.stderr.strip()}", file=sys.stderr)
         return 2
