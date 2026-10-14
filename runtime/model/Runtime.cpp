@@ -324,6 +324,8 @@ struct Runtime::Impl {
     uint32_t mtpHeadSteps = 0;
     PromptLookup lookup;
     LookupAcceptance lookupAcceptance;
+    std::array<LookupAcceptance, 4> lookupBuckets{{{3.0F, 4.0F}, {3.52F, 4.0F}, {3.72F, 4.0F}, {3.84F, 4.0F}}};
+    uint32_t lookupBucket = 0;
     std::vector<uint32_t> lookupTokens;
     uint32_t lookupBegin = kDraftProposalTokens;
 
@@ -418,6 +420,22 @@ struct Runtime::Impl {
     const char *value = std::getenv("SPLASH_MTP_LOOKUP");
     return value && std::string_view(value) == "1";
   }();
+  bool mtpLookupBuckets = [] {
+    const char *value = std::getenv("SPLASH_MTP_LOOKUP_BUCKETS");
+    return value && std::string_view(value) == "1";
+  }();
+  size_t mtpLookupScan = [] {
+    const char *value = std::getenv("SPLASH_MTP_LOOKUP_SCAN");
+    return value ? std::clamp<long>(std::strtol(value, nullptr, 10), 1, 8192) : 256L;
+  }();
+  bool mtpLookupReprobe = [] {
+    const char *value = std::getenv("SPLASH_MTP_LOOKUP_REPROBE");
+    return value && std::string_view(value) == "1";
+  }();
+  std::array<uint64_t, kLaneCount> mtpLookupLastProbe{};
+  const LookupAcceptance &lookupAccuracy(const Request &entry) const {
+    return mtpLookupBuckets ? entry.lookupBuckets[entry.lookupBucket] : entry.lookupAcceptance;
+  }
   bool mtpAdaptive = mtpAdaptiveFromEnvironment();
   uint32_t mtpDraftSteps = mtpDraftStepsFromEnvironment(mtpAdaptive);
   static bool mtpAdaptiveFromEnvironment() {
@@ -531,14 +549,16 @@ struct Runtime::Impl {
       entry.lookupBegin = kDraftProposalTokens;
       entry.lookupTokens.clear();
       if (!mtpLookup || !PromptLookup::usableLane(samplingEnabled(entry), samplingPolicy(entry).thinkingCutoff.has_value())) continue;
-      entry.lookup.sync(entry.tokens, samplingEnabled(entry), samplingPolicy(entry).thinkingCutoff.has_value());
-      entry.lookupTokens = entry.lookup.propose(entry.tokens, *entry.pendingToken, mtpDraftSteps);
-      if (!entry.lookupAcceptance.eligible()) continue;
+      entry.lookup.sync(entry.tokens, samplingEnabled(entry), samplingPolicy(entry).thinkingCutoff.has_value(), mtpLookupScan);
+      uint32_t matched = 0;
+      entry.lookupTokens = entry.lookup.propose(entry.tokens, *entry.pendingToken, mtpDraftSteps, &matched);
+      entry.lookupBucket = lookupMatchBucket(matched);
+      if (!lookupAccuracy(entry).eligible()) continue;
       lookupCounts[lane] = static_cast<uint32_t>(entry.lookupTokens.size());
       double reach = 1.0;
       lookupExpected[lane] = 1.0;
       for (uint32_t i = 0; i < lookupCounts[lane]; ++i) {
-        reach *= entry.lookupAcceptance.rate();
+        reach *= lookupAccuracy(entry).rate();
         lookupExpected[lane] += reach;
       }
     }
@@ -568,7 +588,14 @@ struct Runtime::Impl {
       for (uint32_t lane = 0; lane < lanes; ++lane) {
         Request &entry = *entries[lane];
         lookupChosen[lane] = plan.lookup[lane];
-        uint32_t depth = plan.depths[lane];
+        // Revisit a confident full-span lookup after 300 cost-planned rounds
+        // at this width. Greedy verification remains the sole authority.
+        if (mtpLookupReprobe && lookupCounts[lane] == kDraftProposalTokens &&
+            mtpPlannedCycles >= mtpLookupLastProbe[lanes - 1] + 300)
+          lookupChosen[lane] = true;
+        if (lookupChosen[lane] && lookupCounts[lane] == kDraftProposalTokens)
+          mtpLookupLastProbe[lanes - 1] = mtpPlannedCycles;
+        uint32_t depth = lookupChosen[lane] ? 0 : plan.depths[lane];
         if (!lookupChosen[lane]) depth = probeMtpDepth(depth, entry.mtpIdleCycles, mtpParameters.probeCycles);
         depths[lane] = depth;
       }
@@ -594,7 +621,7 @@ struct Runtime::Impl {
       if (lookupChosen[lane]) entry.lookupBegin = 0;
       // Graft only a matched head prefix; device softmax confidence picks
       // the first low-confidence position after it. Keep the head fallback.
-      else if (mtpLookup && !sampled && entry.lookupAcceptance.eligible(0.65F) &&
+      else if (mtpLookup && !sampled && lookupAccuracy(entry).eligible(0.65F) &&
                depths[lane] > 1 && entry.lookupTokens.size() > 1)
         entry.lookupBegin = 1;
       mtpLookupLanes += entry.lookupBegin == 0;
@@ -1324,8 +1351,13 @@ struct Runtime::Impl {
         PromptLookup::usableLane(samplingEnabled(entry), samplingPolicy(entry).thinkingCutoff.has_value())) {
       for (size_t i = 0; i < tokens.size(); ++i) {
         const uint32_t anchor = i ? tokens[i - 1] : *entry.pendingToken;
-        entry.lookup.sync(entry.tokens, samplingEnabled(entry), samplingPolicy(entry).thinkingCutoff.has_value());
-        entry.lookupAcceptance.record(entry.lookup.propose(entry.tokens, anchor, mtpDraftSteps), tokens[i]);
+        entry.lookup.sync(entry.tokens, samplingEnabled(entry), samplingPolicy(entry).thinkingCutoff.has_value(), mtpLookupScan);
+        uint32_t matched = 0;
+        const auto proposal = entry.lookup.propose(entry.tokens, anchor, mtpDraftSteps, &matched);
+        entry.lookupAcceptance.record(proposal, tokens[i]);
+        for (uint32_t bucket = 0; bucket < entry.lookupBuckets.size(); ++bucket)
+          entry.lookupBuckets[bucket].record(bucket == lookupMatchBucket(matched) ? std::span<const uint32_t>(proposal)
+                                                                                 : std::span<const uint32_t>{}, tokens[i]);
         entry.tokens.push_back(anchor);
       }
     } else {
