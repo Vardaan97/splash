@@ -193,6 +193,29 @@ void lookup() {
           "planner mixes zero-step lookup and head lanes");
 }
 
+// The stale max-stack-174 fixture used rates chosen for threshold .30,
+// then asserted the same depths at width four's .45. Keep that exact input
+// as a regression: .7^3 and .8^4 fall below .45 but above .30.
+void widthRuleRegression() {
+  unsetenv("SPLASH_MTP_WORTHWHILE");
+  const auto thresholds = mtpWorthwhileFromEnvironment();
+  const std::array<float, 4> oldRates{0.5F, 0.7F, 0.99F, 0.8F};
+  const std::array<uint32_t, 4> b1{2, 3, 7, 4}, b4{2, 2, 7, 3};
+  for (size_t i = 0; i < oldRates.size(); ++i) {
+    require(mtpRuleDepth(oldRates[i], 7, thresholds[0]) == b1[i], "legacy B1 rule rates");
+    require(mtpRuleDepth(oldRates[i], 7, thresholds[3]) == b4[i], "width-four threshold changes depth");
+  }
+  for (uint32_t maximum : {1U, 2U, 3U, 4U, 5U, 7U})
+    for (float rate : oldRates)
+      for (float threshold : thresholds) {
+        // Independent definition: retain at least two proposals, then one
+        // more only if the next proposal's reach meets this width's bound.
+        uint32_t expected = std::min(2U, maximum);
+        while (expected < maximum && std::pow(double(rate), expected + 1) >= double(threshold)) ++expected;
+        require(mtpRuleDepth(rate, maximum, threshold) == expected, "rule respects threshold and cap");
+      }
+}
+
 void cadence() {
   uint32_t idle = 0;
   require(probeMtpDepth(0, idle, 2) == 0 && probeMtpDepth(0, idle, 2) == 1 && idle == 0,
@@ -232,6 +255,7 @@ int main() {
     require(rejected, "reject partial threshold list");
     unsetenv("SPLASH_MTP_WORTHWHILE");
     unsetenv("SPLASH_MTP_DEPTH");
+    widthRuleRegression();
     acceptance();
     prior();
     fit();
