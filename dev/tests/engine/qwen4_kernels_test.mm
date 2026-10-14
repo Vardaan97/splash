@@ -659,6 +659,50 @@ void mtpTest(MetalBackend &backend) {
     }
   check(okArgmax, "MTP argmax: the row's argmax as its proposal and every later one");
 
+  auto confidenceBuffer = upload(backend, std::vector<float>(lanes * proposals));
+  Qwen4MtpParams confidenceParams{lanes * laneRows, 0, 0, laneRows, 0, vocabulary, proposals, 0, 4, 0, 0, 0};
+  Qwen4MtpContext noContext{1, 1, {0, 0}};
+  CommandGraph confidenceGraph;
+  ops::Qwen4::addMtpConfidence(confidenceGraph, upload(backend, logits), confidenceBuffer, {}, {}, {}, {},
+                              confidenceParams, noContext);
+  run(backend, confidenceGraph);
+  const auto confidence = download<float>(confidenceBuffer, lanes * proposals);
+  check(std::fabs(confidence[4] - 1.0F) < 1e-5F && std::fabs(confidence[proposals + 4] - 0.5F) < 1e-5F,
+        "MTP confidence handles a dominant logit and tied maxima");
+
+  // Restore a full lookup lane and graft a matching head prefix in another.
+  std::vector<uint32_t> lookup(lanes * laneRows, 0);
+  for (uint32_t l = 0; l < lanes; ++l)
+    for (uint32_t i = 0; i < proposals; ++i) lookup[l * laneRows + 1 + i] = 100 + l * proposals + i;
+  Qwen4LookupParams mix{lanes, proposals, candidates, laneRows, {}, {}};
+  mix.end[0] = proposals; mix.begin[1] = 4; mix.end[1] = proposals;
+  CommandGraph mixing;
+  ops::Qwen4::addMtpLookup(mixing, upload(backend, lookup), proposedBuffer, candidateBuffer, upload(backend, std::vector<float>(lanes * proposals, 0.25F)), mix);
+  run(backend, mixing);
+  const auto mixed = download<uint32_t>(proposedBuffer, lanes * proposals);
+  const auto mixedCandidates = download<uint32_t>(candidateBuffer, lanes * proposals * candidates);
+  bool mixedOk = true;
+  for (uint32_t l = 0; l < lanes; ++l)
+    for (uint32_t i = 0; i < proposals; ++i) {
+      mixedOk &= mixed[l * proposals + i] == lookup[l * laneRows + 1 + i];
+      if (l == 0 || i >= 4) mixedOk &= mixedCandidates[(l * proposals + i) * candidates] == mixed[l * proposals + i];
+    }
+  check(mixedOk, "MTP lookup restores zero-step lanes and grafts matching prefixes");
+  lookup[laneRows + 5] = 777;
+  CommandGraph confident;
+  ops::Qwen4::addMtpLookup(confident, upload(backend, lookup), proposedBuffer, candidateBuffer,
+                          upload(backend, std::vector<float>(lanes * proposals, 0.9F)), mix);
+  run(backend, confident);
+  check(download<uint32_t>(proposedBuffer, lanes * proposals)[proposals + 4] == mixed[proposals + 4],
+        "MTP graft preserves a confident head tail");
+  lookup[laneRows + 1] = 999;
+  lookup[laneRows + 5] = 888;
+  CommandGraph mismatch;
+  ops::Qwen4::addMtpLookup(mismatch, upload(backend, lookup), proposedBuffer, candidateBuffer, upload(backend, std::vector<float>(lanes * proposals, 0.25F)), mix);
+  run(backend, mismatch);
+  check(download<uint32_t>(proposedBuffer, lanes * proposals)[proposals + 4] == mixed[proposals + 4],
+        "MTP graft mismatch preserves head tail");
+
   // Over a draft vocabulary: the argmax's token, ties toward the lower token,
   // and token 0 for a row without a finite logit, as without one.
   const uint32_t drafted = 4096;

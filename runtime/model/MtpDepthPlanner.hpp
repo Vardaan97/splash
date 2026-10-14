@@ -89,6 +89,7 @@ private:
 struct MtpDepthPlan final {
   uint32_t steps = 0;
   std::array<uint32_t, kMtpPlannerLanes> depths{};
+  std::array<bool, kMtpPlannerLanes> lookup{};
 };
 
 // The depths of a batch's lanes, each at most maximumSteps, maximising
@@ -96,6 +97,8 @@ struct MtpDepthPlan final {
 // deepest lane.
 [[nodiscard]] MtpDepthPlan planMtpDepths(std::span<const std::array<double, kMtpPlannerPositions + 1>> expected,
                                          const MtpCostModel &costs, bool measured, bool draftVocabulary,
-                                         uint32_t maximumSteps);
+                                         uint32_t maximumSteps,
+                                         std::span<const uint32_t> lookupCounts = {},
+                                         std::span<const double> lookupExpected = {});
 
 } // namespace splash::model

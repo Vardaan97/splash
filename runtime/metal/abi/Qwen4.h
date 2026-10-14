@@ -161,3 +161,12 @@ struct Qwen4PleHashParams {
   uint32_t vocabularies[QWEN4_PLE_MAXIMUM_HEADS];
   uint32_t offsets[QWEN4_PLE_MAXIMUM_HEADS];
 };
+
+// Lookup proposal mixing after head argmax: preserve the head prefix, graft
+// only when that prefix equals the retrieved continuation. begin == 0 is a
+// zero-head-step lane; begin == end leaves the head untouched.
+struct Qwen4LookupParams {
+  uint32_t lanes, proposals, candidates, lane_rows;
+  uint32_t begin[4];
+  uint32_t end[4];
+};

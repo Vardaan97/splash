@@ -804,3 +804,77 @@ kernel void qwen4_ple_hash(device const uint *tokens [[buffer(0)]],
     }
   }
 }
+
+// One thread per lane; restore CPU proposals even when another lane's head
+// argmax wrote this lane. Candidate zero remains a certain draw.
+kernel void qwen4_mtp_lookup(device const uint *lookup [[buffer(0)]],
+                              device uint *proposals [[buffer(1)]],
+                              device uint *candidates [[buffer(2)]],
+                              device const float *confidence [[buffer(3)]],
+                              constant Qwen4LookupParams &p [[buffer(4)]],
+                              uint lane [[thread_position_in_grid]]) {
+  if (lane >= p.lanes || p.begin[lane] >= p.end[lane]) return;
+  uint begin = p.begin[lane];
+  if (begin) {
+    while (begin < p.end[lane] && confidence[lane * p.proposals + begin] >= 0.5f) ++begin;
+    if (begin == p.end[lane]) return;
+  }
+  for (uint i = 0; i < begin; ++i)
+    if (proposals[lane * p.proposals + i] != lookup[lane * p.lane_rows + 1 + i]) return;
+  for (uint i = begin; i < p.end[lane]; ++i) {
+    const uint token = lookup[lane * p.lane_rows + 1 + i];
+    proposals[lane * p.proposals + i] = token;
+    candidates[(lane * p.proposals + i) * p.candidates] = token;
+  }
+}
+
+// Stable top-1 softmax confidence over the same head and context rows used
+// by argmax. Context rows are disjoint from the mapped head vocabulary.
+kernel void qwen4_mtp_confidence(device const float *logits [[buffer(0)]],
+                                  device float *confidence [[buffer(1)]],
+                                  device const uint *tokens [[buffer(2)]],
+                                  device const float *context_logits [[buffer(3)]],
+                                  device const uint *context_tokens [[buffer(4)]],
+                                  device const Qwen4MtpContextLane *lanes [[buffer(5)]],
+                                  constant Qwen4MtpParams &p [[buffer(6)]],
+                                  constant Qwen4MtpContext &c [[buffer(7)]],
+                                  uint li [[threadgroup_position_in_grid]],
+                                  uint tid [[thread_index_in_threadgroup]],
+                                  uint threads [[threads_per_threadgroup]],
+                                  uint sl [[thread_index_in_simdgroup]],
+                                  uint sg [[simdgroup_index_in_threadgroup]]) {
+  (void)tokens;
+  (void)context_tokens;
+  threadgroup float partial[32];
+  threadgroup float maximum;
+  device const float *x = logits + (ulong(li) * p.lane_rows + p.row) * p.vocabulary;
+  const uint count = p.pad ? min(lanes[li].count, c.capacity) : 0;
+  const ulong offset = ulong(li) * c.logits_slot + ulong(p.row) * c.capacity;
+  float best = -INFINITY;
+  for (uint i = tid; i < p.vocabulary + count; i += threads) {
+    const float v = i < p.vocabulary ? x[i] : context_logits[offset + i - p.vocabulary];
+    if (!qwen4_unselectable_logit(v)) best = max(best, v);
+  }
+  best = simd_max(best);
+  if (sl == 0) partial[sg] = best;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0) {
+    float m = -INFINITY;
+    for (uint i = 0; i < (threads + 31) / 32; ++i) m = max(m, partial[i]);
+    maximum = m;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float sum = 0;
+  for (uint i = tid; i < p.vocabulary + count; i += threads) {
+    const float v = i < p.vocabulary ? x[i] : context_logits[offset + i - p.vocabulary];
+    if (!qwen4_unselectable_logit(v) && isfinite(maximum)) sum += exp(v - maximum);
+  }
+  sum = simd_sum(sum);
+  if (sl == 0) partial[sg] = sum;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0) {
+    float total = 0;
+    for (uint i = 0; i < (threads + 31) / 32; ++i) total += partial[i];
+    confidence[li * p.proposals + p.row] = total > 0 ? 1.0f / total : 0.0f;
+  }
+}

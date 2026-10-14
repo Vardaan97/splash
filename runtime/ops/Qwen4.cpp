@@ -178,6 +178,33 @@ void Qwen4::addMtpWiden(metal::CommandGraph &graph, metal::MetalBuffer projected
             {groups(rows * shape.width()), 1, 1}, {kThreads, 1, 1});
 }
 
+void Qwen4::addMtpLookup(metal::CommandGraph &graph, metal::MetalBuffer lookup,
+                          metal::MetalBuffer proposals, metal::MetalBuffer candidates,
+                          metal::MetalBuffer confidence, const Qwen4LookupParams &params) {
+  if (!params.lanes || params.lanes > 4 || params.lane_rows <= params.proposals || !params.candidates)
+    throw std::invalid_argument("invalid MTP lookup batch");
+  for (uint32_t lane = 0; lane < params.lanes; ++lane)
+    if (params.begin[lane] > params.end[lane] || params.end[lane] > params.proposals)
+      throw std::invalid_argument("invalid MTP lookup span");
+  graph.add("qwen4_mtp_lookup", {std::move(lookup), std::move(proposals), std::move(candidates), std::move(confidence)}, params,
+            {params.lanes, 1, 1}, {params.lanes, 1, 1});
+}
+
+void Qwen4::addMtpConfidence(metal::CommandGraph &graph, metal::MetalBuffer logits,
+                              metal::MetalBuffer confidence, metal::MetalBuffer tokens,
+                              metal::MetalBuffer contextLogits, metal::MetalBuffer contextTokens,
+                              metal::MetalBuffer lanesInfo, const Qwen4MtpParams &params,
+                              const Qwen4MtpContext &context) {
+  // Unused context arguments still bind valid buffers; params.pad disables reads.
+  if (!contextLogits) contextLogits = logits;
+  if (!contextTokens) contextTokens = logits;
+  if (!lanesInfo) lanesInfo = logits;
+  if (!tokens) tokens = logits;
+  graph.add("qwen4_mtp_confidence", {std::move(logits), std::move(confidence), std::move(tokens),
+            std::move(contextLogits), std::move(contextTokens), std::move(lanesInfo)},
+            params, {}, context, {params.rows / params.lane_rows, 1, 1}, {1024, 1, 1});
+}
+
 void Qwen4::addMtpArgmax(metal::CommandGraph &graph, metal::MetalBuffer logits, metal::MetalBuffer proposals,
                          metal::MetalBuffer candidates, uint32_t lanes, uint32_t laneRows, uint32_t vocabulary,
                          uint32_t proposalsPerLane, uint32_t candidatesPerProposal, uint32_t row, bool last,

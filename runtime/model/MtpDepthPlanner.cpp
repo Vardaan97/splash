@@ -157,26 +157,33 @@ uint32_t mtpDraftRoutedRows(std::span<const uint32_t> depths) noexcept {
 }
 
 MtpDepthPlan planMtpDepths(std::span<const std::array<double, kMtpPlannerPositions + 1>> expected,
-                           const MtpCostModel &costs, bool measured, bool draftVocabulary, uint32_t maximumSteps) {
+                           const MtpCostModel &costs, bool measured, bool draftVocabulary, uint32_t maximumSteps,
+                           std::span<const uint32_t> lookupCounts, std::span<const double> lookupExpected) {
   const uint32_t lanes = static_cast<uint32_t>(expected.size());
   if (!lanes || lanes > kMtpPlannerLanes) throw std::invalid_argument("invalid MTP depth plan batch");
+  if ((!lookupCounts.empty() && lookupCounts.size() != lanes) || lookupExpected.size() != lookupCounts.size())
+    throw std::invalid_argument("invalid lookup depth plan batch");
   maximumSteps = std::min(maximumSteps, kMtpPlannerPositions);
   // Every combination of depths: at most 8^4.
   MtpDepthPlan best;
   double bestRate = -1.0;
   std::array<uint32_t, kMtpPlannerLanes> depths{};
   uint64_t combinations = 1;
-  for (uint32_t lane = 0; lane < lanes; ++lane) combinations *= maximumSteps + 1;
+  for (uint32_t lane = 0; lane < lanes; ++lane) combinations *= maximumSteps + 1 + (!lookupCounts.empty() && lookupCounts[lane] ? 1 : 0);
   for (uint64_t index = 0; index < combinations; ++index) {
     uint64_t rest = index;
     uint32_t steps = 0, laneSteps = 0;
+    std::array<bool, kMtpPlannerLanes> lookup{};
     double tokens = 0.0;
     for (uint32_t lane = 0; lane < lanes; ++lane) {
-      depths[lane] = static_cast<uint32_t>(rest % (maximumSteps + 1));
-      rest /= maximumSteps + 1;
+      const uint32_t options = maximumSteps + 1 + (!lookupCounts.empty() && lookupCounts[lane] ? 1 : 0);
+      const uint32_t option = static_cast<uint32_t>(rest % options);
+      rest /= options;
+      lookup[lane] = option > maximumSteps;
+      depths[lane] = lookup[lane] ? 0 : option;
       steps = std::max(steps, depths[lane]);
-      laneSteps += depths[lane];
-      tokens += expected[lane][depths[lane]];
+      laneSteps += lookup[lane] ? lookupCounts[lane] : depths[lane];
+      tokens += lookup[lane] ? lookupExpected[lane] : expected[lane][depths[lane]];
     }
     const double seconds = costs.cost({lanes, steps, laneSteps, draftVocabulary, mtpDraftRoutedRows(std::span(depths).first(lanes))}, measured);
     const double rate = seconds > 0.0 ? tokens / seconds : 0.0;
@@ -185,6 +192,7 @@ MtpDepthPlan planMtpDepths(std::span<const std::array<double, kMtpPlannerPositio
       bestRate = rate;
       best.steps = steps;
       best.depths = depths;
+      best.lookup = lookup;
     }
   }
   return best;
