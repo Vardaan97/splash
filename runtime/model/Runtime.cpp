@@ -3,6 +3,7 @@
 #include "StderrLine.hpp"
 #include "model/QwenState.hpp"
 #include "model/MtpDepthPlanner.hpp"
+#include "model/PromptLookup.hpp"
 #include "model/Qwen4DraftVocabulary.hpp"
 #include "model/Qwen4DraftContext.hpp"
 #include "model/Qwen4Exp.hpp"
@@ -319,6 +320,12 @@ struct Runtime::Impl {
     // is a rate of 0.8 worth five proposals.
     bool mtpPlanned = false;
     uint32_t mtpDrafted = 0;
+    uint32_t mtpHeadSteps = 0;
+    PromptLookup lookup;
+    LookupAcceptance lookupAcceptance;
+    std::vector<uint32_t> lookupTokens;
+    uint32_t lookupBegin = kDraftProposalTokens;
+
     float mtpAccepted = 4.0F;
     float mtpJudged = 5.0F;
     MtpAcceptance mtpAcceptance;
@@ -406,6 +413,10 @@ struct Runtime::Impl {
   // 7, default 7), fewer while a lane's proposals are rejected
   // (mtpStepsFor); SPLASH_MTP_ADAPTIVE=0 always drafts SPLASH_MTP_DRAFTS
   // (default 3). The later proposals repeat the last.
+  bool mtpLookup = [] {
+    const char *value = std::getenv("SPLASH_MTP_LOOKUP");
+    return value && std::string_view(value) == "1";
+  }();
   bool mtpAdaptive = mtpAdaptiveFromEnvironment();
   uint32_t mtpDraftSteps = mtpDraftStepsFromEnvironment(mtpAdaptive);
   static bool mtpAdaptiveFromEnvironment() {
@@ -461,6 +472,8 @@ struct Runtime::Impl {
     entry.mtpPlanned = false;
     // Forced end tokens judge neither the head's proposals nor their positions.
     if (endDrafts) { entry.mtpDrafted = 0; return; }
+    // Lookup and graft outcomes must not teach the head's acceptance model.
+    if (entry.lookupBegin < kDraftProposalTokens) { entry.mtpDrafted = 0; return; }
     if (!entry.mtpDrafted) return;
     const uint32_t kept = std::min(accepted, entry.mtpDrafted);
     entry.mtpAccepted = kMtpDecay * entry.mtpAccepted + static_cast<float>(kept);
@@ -497,6 +510,7 @@ struct Runtime::Impl {
   }();
   std::array<uint64_t, kMtpPlannerPositions + 1> mtpStepCounts{};
   uint64_t mtpVocabularyCycles = 0;
+  uint64_t mtpLookupLanes = 0, mtpGraftLanes = 0;
   void logMtpPlans(const MtpCostModel::Cycle &cycle) {
     ++mtpStepCounts[std::min(cycle.steps, kMtpPlannerPositions)];
     mtpVocabularyCycles += cycle.draftVocabulary;
@@ -506,7 +520,8 @@ struct Runtime::Impl {
     std::ostringstream text;
     text << "MTP plans: " << cycles << " cycles, steps 0-7:";
     for (const uint64_t count : mtpStepCounts) text << ' ' << count;
-    text << ", draft vocabulary " << mtpVocabularyCycles;
+    text << ", draft vocabulary " << mtpVocabularyCycles
+         << ", lookup lanes " << mtpLookupLanes << ", graft candidate lanes " << mtpGraftLanes;
     for (uint32_t lanes = 1; lanes <= kMtpPlannerLanes; ++lanes) {
       if (!mtpCosts.observations(lanes)) continue;
       const auto theta = mtpCosts.coefficients(lanes, true);
@@ -519,7 +534,25 @@ struct Runtime::Impl {
   // mtpDrafted) and returns the steps the batch drafts.
   uint32_t planMtpBatch(std::span<Request *const> entries) {
     const uint32_t lanes = static_cast<uint32_t>(entries.size());
-    std::array<uint32_t, kLaneCount> depths{};
+    std::array<uint32_t, kLaneCount> depths{}, lookupCounts{};
+    std::array<double, kLaneCount> lookupExpected{};
+    std::array<bool, kLaneCount> lookupChosen{};
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+      Request &entry = *entries[lane];
+      entry.lookupBegin = kDraftProposalTokens;
+      entry.lookupTokens.clear();
+      if (!mtpLookup || !PromptLookup::usableLane(samplingEnabled(entry), samplingPolicy(entry).thinkingCutoff.has_value())) continue;
+      entry.lookup.sync(entry.tokens, samplingEnabled(entry), samplingPolicy(entry).thinkingCutoff.has_value());
+      entry.lookupTokens = entry.lookup.propose(entry.tokens, *entry.pendingToken, mtpDraftSteps);
+      if (!entry.lookupAcceptance.eligible()) continue;
+      lookupCounts[lane] = static_cast<uint32_t>(entry.lookupTokens.size());
+      double reach = 1.0;
+      lookupExpected[lane] = 1.0;
+      for (uint32_t i = 0; i < lookupCounts[lane]; ++i) {
+        reach *= entry.lookupAcceptance.rate();
+        lookupExpected[lane] += reach;
+      }
+    }
     if (targetModel.hasMtpDraftVocabulary())
       for (Request *entry : entries) entry->draftContext.scan(entry->tokens, geometry.target.vocabularySize);
     const bool sampled = std::ranges::any_of(entries, [](const Request *entry) { return samplingEnabled(*entry); });
@@ -537,23 +570,39 @@ struct Runtime::Impl {
       // upstream's common-depth policy, with request-local draft heads.
       const bool measured = mtpParameters.measuredCosts;
       const MtpDepthPlan plan =
-          planMtpDepths(std::span(expected).first(lanes), mtpCosts, measured, draftVocabulary, mtpDraftSteps);
+          planMtpDepths(std::span(expected).first(lanes), mtpCosts, measured, draftVocabulary, mtpDraftSteps,
+                        std::span(lookupCounts).first(lanes), std::span(lookupExpected).first(lanes));
       for (uint32_t lane = 0; lane < lanes; ++lane) {
         Request &entry = *entries[lane];
+        lookupChosen[lane] = plan.lookup[lane];
         uint32_t depth = plan.depths[lane];
-        depth = probeMtpDepth(depth, entry.mtpIdleCycles, mtpParameters.probeCycles);
+        if (!lookupChosen[lane]) depth = probeMtpDepth(depth, entry.mtpIdleCycles, mtpParameters.probeCycles);
         depths[lane] = depth;
       }
       ++mtpPlannedCycles;
-      if (lanes == 1)
+      if (lanes == 1 && !lookupChosen[0])
         depths[0] = exploreMtpDepth(depths[0], mtpDraftSteps, mtpPlannedCycles, mtpParameters.exploreCycles);
     }
     uint32_t steps = 0, laneSteps = 0;
     for (uint32_t lane = 0; lane < lanes; ++lane) {
-      entries[lane]->mtpPlanned = true;
-      entries[lane]->mtpDrafted = depths[lane];
+      Request &entry = *entries[lane];
+      entry.mtpPlanned = true;
+      entry.mtpHeadSteps = depths[lane];
+      entry.mtpDrafted = lookupChosen[lane] ? lookupCounts[lane] : depths[lane];
+      if (lookupChosen[lane]) entry.lookupBegin = 0;
+      // Graft only a matched head prefix; device softmax confidence picks
+      // the first low-confidence position after it. Keep the head fallback.
+      else if (mtpLookup && !sampled && entry.lookupAcceptance.eligible(0.65F) &&
+               depths[lane] > 1 && entry.lookupTokens.size() > 1)
+        entry.lookupBegin = 1;
+      mtpLookupLanes += entry.lookupBegin == 0;
+      mtpGraftLanes += entry.lookupBegin > 0 && entry.lookupBegin < kDraftProposalTokens;
+      if (entry.lookupBegin < kDraftProposalTokens) {
+        auto *input = contents<uint32_t>(decodeArena->get(lane, DecodeTensor::DraftInputTokens), "lookup tokens");
+        std::copy(entry.lookupTokens.begin(), entry.lookupTokens.end(), input + 1);
+      }
       steps = std::max(steps, depths[lane]);
-      laneSteps += depths[lane];
+      laneSteps += entry.mtpDrafted;
     }
     mtpCycle = MtpCostModel::Cycle{lanes, steps, laneSteps, draftVocabulary && steps,
                                     mtpDraftRoutedRows(std::span(depths).first(lanes))};
@@ -1261,8 +1310,18 @@ struct Runtime::Impl {
     }
     // The previous anchor and every selection before the new one are now
     // read (Request::tokens).
-    if (entry.pendingToken) entry.tokens.push_back(*entry.pendingToken);
-    entry.tokens.insert(entry.tokens.end(), tokens.begin(), tokens.end() - 1);
+    if (mtpLookup && targetModel.hasMtp() && entry.pendingToken &&
+        PromptLookup::usableLane(samplingEnabled(entry), samplingPolicy(entry).thinkingCutoff.has_value())) {
+      for (size_t i = 0; i < tokens.size(); ++i) {
+        const uint32_t anchor = i ? tokens[i - 1] : *entry.pendingToken;
+        entry.lookup.sync(entry.tokens, samplingEnabled(entry), samplingPolicy(entry).thinkingCutoff.has_value());
+        entry.lookupAcceptance.record(entry.lookup.propose(entry.tokens, anchor, mtpDraftSteps), tokens[i]);
+        entry.tokens.push_back(anchor);
+      }
+    } else {
+      if (entry.pendingToken) entry.tokens.push_back(*entry.pendingToken);
+      entry.tokens.insert(entry.tokens.end(), tokens.begin(), tokens.end() - 1);
+    }
     entry.pendingToken = tokens.back();
   }
 
@@ -2245,6 +2304,9 @@ struct Runtime::Impl {
     if (mtpDraft) {
       buffers.anchors = d(DecodeTensor::DraftInputTokens);
       buffers.proposals = d(DecodeTensor::ProposedTokens);
+      if (std::ranges::any_of(entries.first(lanes), [](const Request *entry) {
+            return entry->lookupBegin > 0 && entry->lookupBegin < kDraftProposalTokens;
+          })) buffers.mtpConfidence = d(DecodeTensor::MtpConfidence);
       buffers.candidates = d(DecodeTensor::Candidates);
       buffers.proposalsPerLane = kDraftProposalTokens;
       buffers.candidatesPerProposal = 16;
@@ -2254,7 +2316,7 @@ struct Runtime::Impl {
       uint32_t steps = 0;
       const bool draftVocabulary = useDraftVocabulary(entries.first(lanes));
       for (uint32_t lane = 0; lane < lanes; ++lane) {
-        depths[lane] = entries[lane]->mtpDrafted;
+        depths[lane] = entries[lane]->mtpHeadSteps;
         steps = std::max(steps, depths[lane]);
       }
       if (draftVocabulary && targetModel.hasMtpDraftVocabulary()) bindDraftContext(buffers, entries.first(lanes));
@@ -3292,6 +3354,21 @@ Runtime::decodeAsync(const BatchPlan &plan,
       // A batch whose lanes all draft nothing runs the verify alone.
       if (impl_->planMtpBatch(entries))
         impl_->encodeTargetVerifyBatchForward(commandGraph, entries, items, true);
+      if (impl_->mtpLookup) {
+        Qwen4LookupParams mix{width, kDraftProposalTokens, 16, kDecodeRows, {}, {}};
+        bool mixing = false;
+        for (uint32_t lane = 0; lane < width; ++lane) {
+          const auto &entry = *entries[lane];
+          mix.end[lane] = std::min<uint32_t>(entry.mtpDrafted, entry.lookupTokens.size());
+          mix.begin[lane] = std::min(entry.lookupBegin, mix.end[lane]);
+          mixing = mixing || mix.begin[lane] < mix.end[lane];
+        }
+        if (mixing) ops::Qwen4::addMtpLookup(commandGraph,
+            impl_->decodeArena->batchSlice(DecodeTensor::DraftInputTokens, width),
+            impl_->decodeArena->batchSlice(DecodeTensor::ProposedTokens, width),
+            impl_->decodeArena->batchSlice(DecodeTensor::Candidates, width),
+            impl_->decodeArena->batchSlice(DecodeTensor::MtpConfidence, width), mix);
+      }
       for (uint32_t lane = 0; lane < width; ++lane) {
         lanes[lane].drafted = entries[lane]->mtpDrafted;
         lanes[lane].maximumRetained = std::min(lanes[lane].maximumRetained, std::max(entries[lane]->mtpDrafted, lanes[lane].endDrafts) + 1);

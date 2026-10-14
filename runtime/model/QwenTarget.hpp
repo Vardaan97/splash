@@ -325,6 +325,7 @@ struct QwenTargetVerifyBuffers final {
   // its anchor), and the proposals and sparse candidates it writes.
   metal::MetalBuffer anchors;
   metal::MetalBuffer proposals;
+  metal::MetalBuffer mtpConfidence;
   metal::MetalBuffer candidates;
   uint32_t proposalsPerLane = 0;
   uint32_t candidatesPerProposal = 0;

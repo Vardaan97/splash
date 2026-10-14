@@ -82,11 +82,12 @@ struct Fixture {
     return {floats(16, hidden).blocks().segments.front(), floats(1, hidden).blocks().segments.front(),
             forward, forward, down};
   }
-  explicit Fixture(const char *library, bool adaptive = true, bool withContext = false, bool zeroDepth = false, bool lookup = false)
+  explicit Fixture(const char *library, bool adaptive = true, bool withContext = false, bool zeroDepth = false, bool lookup = false, bool mtpLookup = false)
       : backend(library), contextWeights(withContext), operators(backend.capabilities()) {
     setenv("SPLASH_MTP_ADAPTIVE", adaptive ? "1" : "0", 1);
     setenv("SPLASH_MTP_DRAFTS", "7", 1);
     setenv("SPLASH_MTP_DEPTH", "cost", 1);
+    setenv("SPLASH_MTP_LOOKUP", mtpLookup ? "1" : "0", 1);
     Qwen4ExpWeights weights;
     auto &layout = weights.layout;
     layout.maximumContextTokens = 4096;
@@ -201,6 +202,7 @@ struct Fixture {
     RuntimeContext context{backend, model, *pages, *states, operators};
     context.mtpDepth.probeCycles = context.mtpDepth.exploreCycles = 0;
     context.mtpDepth.measuredCosts = false; // deterministic plans, independent of GPU timings
+    if (mtpLookup) context.mtpDepth.priorRatios = {1.0, 0.01, 0.01, 0.001, 0.001};
     if (zeroDepth) context.mtpDepth.priorRatios = {1.0, 100.0, 100.0, 100.0, 100.0};
     runtime = std::make_unique<Runtime>(context);
   }
@@ -242,6 +244,39 @@ struct Fixture {
     return submit(std::span(&id, 1), std::span(&lane, 1))->wait().front();
   }
 };
+
+void lookupMixing(const char *library) {
+  Fixture f(library, true, false, false, false, true);
+  const std::array<uint64_t, 2> ids{41, 42};
+  const std::array<uint32_t, 2> lanes{3, 1};
+  f.prefill(f.request(ids[0], std::vector<uint32_t>(24, 0)), lanes[0]);
+  f.prefill(f.request(ids[1], {11}), lanes[1]);
+  metal::BackendInstrumentation::setDispatchProfiling(f.backend, true);
+  bool mixed = false, lookupOnly = false;
+  for (uint32_t cycle = 0; cycle < 20; ++cycle) {
+    const auto result = f.submit(ids, lanes)->wait();
+    for (uint32_t lane = 0; lane < 2; ++lane) {
+      require(result[lane].failure.empty(), "mixed lookup runtime succeeds");
+      for (auto token : result[lane].outputTokens)
+        require(token == lane, "mixed lookup greedy output equals synthetic target oracle");
+    }
+    const auto profile = metal::BackendInstrumentation::takeDispatchProfile(f.backend);
+    const bool lookup = std::ranges::any_of(profile, [](const auto &d) { return d.pipelineName == "qwen4_mtp_lookup"; });
+    const bool head = std::ranges::any_of(profile, [](const auto &d) { return d.pipelineName.starts_with("qwen4_mtp_argmax"); });
+    mixed |= lookup && head;
+    lookupOnly |= lookup && !head;
+  }
+  require(mixed && lookupOnly, "runtime reaches mixed and all-lookup batches");
+  metal::BackendInstrumentation::setDispatchProfiling(f.backend, false);
+  const auto production = f.submit(ids, lanes)->wait();
+  for (uint32_t lane = 0; lane < 2; ++lane)
+    for (auto token : production[lane].outputTokens)
+      require(token == lane, "unprofiled lookup output equals synthetic target oracle");
+  f.runtime->end(ids[0]); f.runtime->end(ids[1]);
+  f.prefill(f.request(ids[0], {10}), lanes[1]);
+  require(f.decode(ids[0], lanes[1]).failure.empty(), "lookup request ID and lane reuse succeeds");
+  std::cout << "runtime_mtp_lookup_mix=PASS\n";
+}
 
 void unequalCommit(const char *library) {
   Fixture f(library);
@@ -448,7 +483,7 @@ void constrainedTransitions(const char *library) {
 int main(int argc, char **argv) {
   try {
     require(argc == 2, "usage: mtp-runtime METALLIB");
-    unequalCommit(argv[1]); thinkingZeroDepth(argv[1]); thinkingCutoff(argv[1]); contextLifetime(argv[1]); constrainedTransitions(argv[1]);
+    lookupMixing(argv[1]); unequalCommit(argv[1]); thinkingZeroDepth(argv[1]); thinkingCutoff(argv[1]); contextLifetime(argv[1]); constrainedTransitions(argv[1]);
   } catch (const std::exception &error) {
     std::cerr << "mtp-runtime: FAIL: " << error.what() << '\n'; return 1;
   }

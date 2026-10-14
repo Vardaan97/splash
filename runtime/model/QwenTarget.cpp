@@ -1193,6 +1193,15 @@ void QwenTarget::addMtpDraft(metal::CommandGraph &graph, QwenTargetVerifyBuffers
                                vocabulary, buffers.proposalsPerLane, buffers.candidatesPerProposal, j - 1, j == steps,
                                draftHead ? draftHead->tokens : metal::MetalBuffer{});
     }
+    if (buffers.mtpConfidence) {
+      Qwen4MtpParams confidence{lanes * laneRows, 0, 0, laneRows, 0, vocabulary,
+                                  buffers.proposalsPerLane, 0, j - 1, 0, draftHead ? 1u : 0u, context ? 1u : 0u};
+      Qwen4MtpContext info{kQwen4DraftContextTokens, buffers.draftContextLogitsSlot, {0, 0}};
+      ops::Qwen4::addMtpConfidence(graph, buffers.logits, buffers.mtpConfidence,
+                                    draftHead ? draftHead->tokens : metal::MetalBuffer{},
+                                    buffers.draftContextLogits, buffers.draftContextTokens,
+                                    buffers.draftContextInfo, confidence, info);
+    }
     if (j < steps)
       for (uint32_t lane = 0; lane < lanes; ++lane)
         ops::Qwen4::addMtpCarry(graph, rowsOf<float>(backend_, h.mtpStreams, lane * laneRows, j, width),

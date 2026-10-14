@@ -4,6 +4,7 @@
 //   mtp-depth-planner
 #include "TestChecks.hpp"
 #include "model/MtpDepthPlanner.hpp"
+#include "model/PromptLookup.hpp"
 
 #include <cmath>
 #include <iostream>
@@ -132,6 +133,66 @@ void lanes() {
   require(capped.steps <= 2 && capped.depths[0] <= 2, "plan: at most the steps it may draft");
 }
 
+void lookup() {
+  PromptLookup matcher;
+  std::vector<uint32_t> history{1, 2, 3, 4, 5, 6, 1, 2, 3};
+  matcher.sync(history);
+  require(matcher.propose(history, 4, 3) == std::vector<uint32_t>({5, 6, 1}), "lookup longest exact suffix");
+  history.insert(history.end(), {4, 8, 9, 1, 2, 3});
+  matcher.sync(history);
+  require(matcher.propose(history, 4, 2) == std::vector<uint32_t>({8, 9}), "lookup latest occurrence and incremental sync");
+  require(matcher.propose(history, 99).empty(), "lookup missing suffix");
+  history = {7};
+  matcher.sync(history);
+  require(matcher.propose(history, 4).empty(), "lookup reset drops old history");
+  PromptLookup repeated;
+  const std::vector<uint32_t> zeros(24, 0);
+  repeated.sync(zeros);
+  require(repeated.propose(zeros, 0).size() == 7, "recent short suffix does not hide a complete earlier span");
+  PromptLookup bounded;
+  std::vector<uint32_t> large(262144);
+  for (size_t i = 0; i < large.size(); ++i) large[i] = i;
+  require(bounded.sync(large) == PromptLookup::maximumTokensPerSync,
+          "first decode indexes only the bounded tail of a full-window prompt");
+  require(bounded.sync(large) == 0, "unchanged history incurs no indexing work");
+  for (uint32_t batch = 0; batch < 40; ++batch) {
+    for (uint32_t i = 0; i < 300; ++i) large.push_back(large.size());
+    require(bounded.sync(large) == PromptLookup::maximumTokensPerSync,
+            "each sync caps newly indexed rows even after a large append");
+    require(bounded.indexedKeys() <= 2 * PromptLookup::maximumKeysPerIndex,
+            "lookup memory stays bounded across long requests");
+  }
+  large = {7};
+  bounded.sync(large);
+  require(bounded.indexedKeys() == 0, "shrink clears capped indexes");
+  require(PromptLookup::usableLane(false, false) && !PromptLookup::usableLane(true, false) &&
+              !PromptLookup::usableLane(false, true), "sampled and cutoff lanes cannot index lookup");
+  PromptLookup excluded;
+  const std::vector<uint32_t> fullPrompt(262144, 0);
+  require(excluded.sync(fullPrompt, true, false) == 0 && excluded.indexedKeys() == 0,
+          "sampled full-window lane allocates no lookup index");
+  require(excluded.sync(fullPrompt, false, true) == 0 && excluded.indexedKeys() == 0,
+          "thinking-cutoff full-window lane allocates no lookup index");
+  require(excluded.sync(fullPrompt, false, false) == PromptLookup::maximumTokensPerSync &&
+              excluded.indexedKeys() > 0, "greedy eligible lane still indexes the bounded tail");
+  LookupAcceptance tracker;
+  require(!tracker.eligible(), "lookup has no optimistic prior");
+  const std::array<uint32_t, 1> proposed{3};
+  for (int i = 0; i < 8; ++i) tracker.record(proposed, 3);
+  require(tracker.eligible(), "shadow successes earn lookup");
+  for (int i = 0; i < 5; ++i) tracker.record(proposed, 9);
+  require(!tracker.eligible(), "shadow errors disable lookup");
+  for (int i = 0; i < 500; ++i) tracker.record({}, 3);
+  require(!tracker.eligible(0), "missing matches expire evidence");
+  const MtpCostModel costs({1.0, 0.01, 0.01, 0.001, 0.001});
+  const std::array<std::array<double, 8>, 2> expected{MtpAcceptance{}.expectedTokens(), MtpAcceptance{}.expectedTokens()};
+  const std::array<uint32_t, 2> counts{7, 0};
+  const std::array<double, 2> tokens{8, 0};
+  const auto plan = planMtpDepths(expected, costs, false, true, 7, counts, tokens);
+  require(plan.lookup[0] && !plan.lookup[1] && plan.depths[0] == 0 && plan.depths[1] > 0,
+          "planner mixes zero-step lookup and head lanes");
+}
+
 void cadence() {
   uint32_t idle = 0;
   require(probeMtpDepth(0, idle, 2) == 0 && probeMtpDepth(0, idle, 2) == 1 && idle == 0,
@@ -152,6 +213,7 @@ int main() {
     lanes();
     routedWork();
     cadence();
+    lookup();
   } catch (const std::exception &error) {
     std::cerr << "MTP depth planner tests FAILED: " << error.what() << '\n';
     return 1;

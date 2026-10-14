@@ -394,6 +394,22 @@ disk and runs on probation for a minute; if it fails then, the start after it
 begins empty. `/status` reports all this under `disk` (`persistent`,
 `kv_copies`, `taken_back`, `write_behind`).
 
+### Experimental MTP lookup
+
+`SPLASH_MTP_LOOKUP=1` enables request-local prompt lookup in greedy MTP lanes.
+An incremental index matches the last one to four tokens against earlier
+prompt and output tokens. Lookup starts disabled and needs at least four
+recent shadow judgments with 85% first-token accuracy. The depth planner can
+choose lookup with live verify rows and no head steps. Evidence decays on
+all emitted tokens, including tokens without a match.
+
+At 65% shadow accuracy, a head position whose top-1 softmax confidence is
+below 50% can instead receive a lookup tail after a matching head prefix.
+The prototype keeps the head chain for fallback; grafting itself saves no
+draft steps yet. Sampled
+and forced thinking-end cycles keep the existing proposal policy. Target
+verification and acceptance remain unchanged. The flag is off by default.
+
 ## Model storage
 
 Allow space for the target and BF16 draft downloads: up to about 21 GB for the

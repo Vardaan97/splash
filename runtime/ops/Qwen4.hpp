@@ -11,6 +11,9 @@
 #include <cstdint>
 
 struct Qwen4PleHashParams;
+struct Qwen4LookupParams;
+struct Qwen4MtpParams;
+struct Qwen4MtpContext;
 
 namespace splash::ops {
 
@@ -117,6 +120,14 @@ struct Qwen4 final {
   // as its proposal `row` and, `last`, every later one. With `tokens`, the
   // logits are a draft vocabulary's, ascending token ids of which `tokens`
   // holds (uint32 each), and the proposal is the argmax's token.
+  static void addMtpLookup(metal::CommandGraph &graph, metal::MetalBuffer lookup,
+                           metal::MetalBuffer proposals, metal::MetalBuffer candidates,
+                           metal::MetalBuffer confidence, const Qwen4LookupParams &params);
+  static void addMtpConfidence(metal::CommandGraph &graph, metal::MetalBuffer logits,
+                               metal::MetalBuffer confidence, metal::MetalBuffer tokens,
+                               metal::MetalBuffer contextLogits, metal::MetalBuffer contextTokens,
+                               metal::MetalBuffer lanesInfo, const Qwen4MtpParams &params,
+                               const Qwen4MtpContext &context);
   static void addMtpArgmax(metal::CommandGraph &graph, metal::MetalBuffer logits, metal::MetalBuffer proposals,
                            metal::MetalBuffer candidates, uint32_t lanes, uint32_t laneRows, uint32_t vocabulary,
                            uint32_t proposalsPerLane, uint32_t candidatesPerProposal, uint32_t row, bool last,

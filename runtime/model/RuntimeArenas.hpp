@@ -310,6 +310,7 @@ enum class DecodeTensor : uint32_t {
   TopPartialValues,
   ProposalProbs,
   ProposedTokens,
+  MtpConfidence,
   PageTable,
   // Indexed by state lane, like PageTable: a penalized request's penalty
   // words (ops::Sampling::rebuildPenaltyWords).
