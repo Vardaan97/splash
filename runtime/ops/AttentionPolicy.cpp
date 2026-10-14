@@ -235,7 +235,7 @@ void attentionKernelSelfTest(metal::MetalBackend &backend) {
   if (requested().empty() && !explicitTest) return;
   // Apple9 compiles these MPP variants but cannot prove Apple10 NA identity.
   // Remain unavailable on Apple9; never infer Apple10 promotion from it.
-  if (backend.capabilities().appleGpuFamily < 10) {
+  if (backend.capabilities().appleGpuFamily != 10) {
     std::cerr << "kernel-selftest: attention pipe unavailable on Apple" << backend.capabilities().appleGpuFamily << '\n';
     return;
   }
