@@ -231,11 +231,11 @@ public:
 
   [[nodiscard]] bool tick(double nowMilliseconds);
   [[nodiscard]] bool commandInFlight() const noexcept {
-    return pending_.has_value();
+    return pending_.has_value() || slicedPrefill_.has_value();
   }
   // No request is waiting, running or draining.
   [[nodiscard]] bool idle() const noexcept {
-    return requests_.empty() && !pending_;
+    return requests_.empty() && !pending_ && !slicedPrefill_;
   }
   [[nodiscard]] std::optional<double> nextWakeupMilliseconds() const;
   [[nodiscard]] EngineSnapshot snapshot() const;
@@ -703,6 +703,7 @@ private:
   [[nodiscard]] bool holdsBack(std::optional<uint64_t> refused) const;
   std::function<void()> completionNotifier_;
   std::optional<Pending> pending_;
+  std::optional<Pending> slicedPrefill_;
   // When the latest command retired, until a tick finds nothing to do.
   std::optional<double> busySinceMilliseconds_;
   // The lanes admit() has obtained so far, including those it gave back when

@@ -147,6 +147,40 @@ void tickUntil(engine::Engine &engine, double &now, const std::function<bool()> 
   require(done(), message);
 }
 
+void testDecodeBetweenPrefillSegments(bool cancel) {
+  test::TestKvStorage storage(1024, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor model;
+  model.slices = 8;
+  model.decodeFinishes = false;
+  Events events;
+  engine::Engine engine(test::engineConfig(), cache, model, events);
+  guardReleases(storage, engine);
+  auto peer = request(1, std::vector<uint32_t>(33, 1));
+  peer.maxNewTokens = 1000;
+  engine.submit(peer);
+  double now = 0;
+  tickUntil(engine, now, [&] { return events.emitted > 0; }, "peer did not start decoding");
+  engine.submit(request(2, std::vector<uint32_t>(2048, 2)));
+  tickUntil(engine, now, [&] { return engine.commandInFlight() && model.requests.size() == 2; },
+            "prefill did not start beside decode");
+  const auto before = events.emitted;
+  for (unsigned i = 0; i < 6; ++i) static_cast<void>(engine.tick(now++));
+  require(events.emitted > before && events.progress[2].empty(),
+          "peer decode did not run before prefill commit");
+  rejects([&] { static_cast<void>(engine.reclaimMemory({.critical = true})); }, "in flight", "reclaimed a provisional chunk");
+  if (cancel) engine.cancel(2);
+  tickUntil(engine, now, [&] {
+    const auto counts = engine.snapshot();
+    return cancel ? counts.cancelled == 1 : events.completedCount == 1;
+  }, "sliced prefill did not finish");
+  if (cancel) require(events.outputs[2].empty(), "cancelled slice emitted a first token");
+  engine.cancel(1);
+  tickUntil(engine, now, [&] { return idle(engine); }, "sliced engine did not drain");
+  require(cache.snapshot().activeRequests == 0, "sliced chunk leaked reservations");
+}
+
 void testConcurrentColdPrefixesComputeOnce() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
@@ -10419,6 +10453,8 @@ int main() {
     testLaneThatWouldYieldTakesNothingInUse();
     testEveryEndReleasesTheReplayPoint();
     testWaitingEndsReleaseTheReplayPoint();
+    testDecodeBetweenPrefillSegments(false);
+    testDecodeBetweenPrefillSegments(true);
     testConcurrentColdPrefixesComputeOnce();
     testColdRequestReportsTheBlocksItReadFromTheCache();
     testBlocksFoundCachedAfterTheLastCommandAreNotReported();

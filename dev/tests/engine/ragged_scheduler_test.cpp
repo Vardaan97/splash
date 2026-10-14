@@ -410,6 +410,37 @@ void testConstrainedDecodeRemainsSeparate() {
           "constrained decode lost its independent mask pipeline");
 }
 
+void testPausedPrefillAllowsOnlyPeerDecode() {
+  Scheduler scheduler(0.0);
+  scheduler.setPrefillSlices(8);
+  scheduler.submit(request(1, 1));
+  scheduler.submit(request(2, 10000));
+  scheduler.resourcesReady(1, 1);
+  scheduler.resourcesReady(2, 0);
+  completeDecode(scheduler);
+  scheduler.observePrefill(2048, 4096.0);
+  const auto chunk = *scheduler.next({});
+  require(chunk.kind == WorkKind::Prefill && chunk.items[0].tokenCount == 2048,
+          "sliced prefill shrank its row budget");
+  scheduler.commit(chunk, {});
+  rejects([&] { scheduler.resumePrefill(); }, "invalid prefill resume", "resumed an unpaused chunk");
+  for (unsigned segment = 0; segment < 7; ++segment) {
+    scheduler.pausePrefill();
+    rejects([&] { scheduler.pausePrefill(); }, "invalid prefill pause", "paused twice");
+    const auto decode = *scheduler.next({});
+    require(decode.kind == WorkKind::Decode && decode.items[0].requestId == 1,
+            "paused prefill scheduled its provisional lane");
+    completeDecode(scheduler);
+    scheduler.resumePrefill();
+    require(!scheduler.next({}), "scheduled over a resumed segment");
+    require(scheduler.promptProcessed(2) == 0, "committed a partial chunk");
+  }
+  const std::array result{StepResult{2, 2048, false, DecodeStage::Regular}};
+  scheduler.complete(chunk, result, 4096.0, true);
+  require(scheduler.promptProcessed(2) == 2048 && scheduler.snapshot().prefillBatches == 1,
+          "sliced chunk was counted more than once");
+}
+
 void testPrefillAndDecodeAlternateWithoutStarvation() {
   engine::Scheduler scheduler(0.0);
   scheduler.submit(request(1, 1));
@@ -1064,6 +1095,7 @@ int main() {
     testUnconstrainedLanesShareDecode();
     testRejectedCommitCountsNothing();
     testConstrainedDecodeRemainsSeparate();
+    testPausedPrefillAllowsOnlyPeerDecode();
     testPrefillAndDecodeAlternateWithoutStarvation();
     testDecodeRepaysItsShareOfContendedPrefill();
     testMaskWaitAccruesNoDecodeDebt();

@@ -238,6 +238,13 @@ std::optional<RequestPriority> Scheduler::highestRunnablePriority() const noexce
 std::optional<BatchPlan> Scheduler::next(std::span<const uint64_t> excluded) const {
   if (active_)
     return std::nullopt;
+  if (pausedPrefill_) {
+    std::vector<uint64_t> blocked(excluded.begin(), excluded.end());
+    const auto priority = get(pausedPrefill_->items.front().requestId).spec.priority;
+    for (const auto &[id, peer] : requests_)
+      if (peer.phase != Phase::Decode || peer.spec.priority > priority) blocked.push_back(id);
+    return nextDecode(blocked);
+  }
   auto decode = nextDecode(excluded);
   auto prefill = nextPrefill(excluded);
   if (!decode)
@@ -344,7 +351,9 @@ uint32_t Scheduler::prefillBudget(
   // memory lands), and for peers that can finish prefill within this slice.
   // The first sample and minimum matrix shape remain limits.
   if (contended)
-    return rows;
+    return prefillSlices_ && ready.size() == 1 && std::any_of(requests_.begin(), requests_.end(), [&](const auto &entry) {
+      return entry.second.phase == Phase::Decode && entry.second.spec.priority <= leader.request->spec.priority;
+    }) ? maximum : rows;
   // A leader that finishes within the full budget ends the command at its
   // last row: prefill cost is linear above the slice, so shortest-first
   // sequential commands minimise first-token latency. Long prefills share a
@@ -383,6 +392,20 @@ std::optional<BatchPlan> Scheduler::nextDecode(std::span<const uint64_t> exclude
       break;
   }
   return plan;
+}
+
+void Scheduler::pausePrefill() {
+  if (!active_ || active_->kind != WorkKind::Prefill || pausedPrefill_)
+    throw std::logic_error("invalid prefill pause");
+  pausedPrefill_ = std::move(active_);
+  active_.reset();
+  pausedExcluded_ = std::move(excluded_);
+}
+void Scheduler::resumePrefill() {
+  if (active_ || !pausedPrefill_) throw std::logic_error("invalid prefill resume");
+  active_ = std::move(pausedPrefill_);
+  pausedPrefill_.reset();
+  excluded_ = std::move(pausedExcluded_);
 }
 
 void Scheduler::commit(const BatchPlan &plan, std::span<const uint64_t> excluded) {
@@ -488,6 +511,8 @@ void Scheduler::complete(const BatchPlan &plan,
   // command was planned without: it could not run either.
   if (std::isfinite(wallMilliseconds) && wallMilliseconds > 0.0) {
     if (plan.kind == WorkKind::Decode) {
+      if (pausedPrefill_)
+        slicedDecodeCreditMilliseconds_ += std::max(0.0, wallMilliseconds - decodeDebtMilliseconds_);
       decodeDebtMilliseconds_ =
           std::max(0.0, decodeDebtMilliseconds_ - wallMilliseconds);
     } else if (decodeShare_ > 0.0) {
@@ -500,7 +525,8 @@ void Scheduler::complete(const BatchPlan &plan,
                    !listed(excluded_, id);
           });
       if (contended)
-        decodeDebtMilliseconds_ += decodeShare_ * wallMilliseconds;
+        decodeDebtMilliseconds_ += std::max(0.0, decodeShare_ * wallMilliseconds - slicedDecodeCreditMilliseconds_);
+      slicedDecodeCreditMilliseconds_ = 0.0;
     }
   }
   dropStaleDecodeDebt();

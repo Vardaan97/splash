@@ -214,8 +214,34 @@ private:
 // (MaskOverlapTicket); and provideMask throws for a request that waits for
 // no mask and refuses one that permits no token. Its other members are the
 // tests' knobs and records.
+class SegmentedTicket final : public ModelBatchTicket {
+public:
+  SegmentedTicket(uint32_t segments, std::function<std::vector<ModelStepResult>()> finish,
+                  std::vector<ModelStepResult> discarded)
+      : remaining_(segments), finish_(std::move(finish)), discarded_(std::move(discarded)) {}
+  bool ready() const noexcept override { return cancelled_ || remaining_ == 1; }
+  bool segmentReady() const noexcept override { return !cancelled_ && remaining_ > 1; }
+  void pauseSegment() override { paused_ = true; }
+  void resumeSegment() override {
+    require(paused_, "resumed a segment before releasing the backend");
+    --remaining_; paused_ = false;
+  }
+  void abandonMask(uint64_t) noexcept override { cancelled_ = true; }
+  std::vector<ModelStepResult> wait() override {
+    return cancelled_ ? std::move(discarded_) : finish_();
+  }
+  double wallMilliseconds() const noexcept override { return 1.0; }
+private:
+  uint32_t remaining_;
+  bool cancelled_ = false, paused_ = false;
+  std::function<std::vector<ModelStepResult>()> finish_;
+  std::vector<ModelStepResult> discarded_;
+};
+
 class Executor final : public model::Model {
 public:
+  uint32_t slices = 0;
+  uint32_t prefillSliceCount() const noexcept override { return slices; }
   explicit Executor(
       uint32_t maximumLanes = model::ExecutionLimits::maximumBatchWidth)
       : maximumLanes(maximumLanes) {}
@@ -455,7 +481,15 @@ public:
          std::function<void()> completion) override {
     checkPageTables(items);
     std::unique_ptr<ModelBatchTicket> ticket;
-    if (plan.kind == WorkKind::Decode && plan.constrained &&
+    if (plan.kind == WorkKind::Prefill && plan.prefillSlices) {
+      std::vector<ModelBatchItem> copied(items.begin(), items.end());
+      std::vector<ModelStepResult> discarded;
+      for (const auto &item : items)
+        discarded.push_back({.requestId = item.requestId, .consumedPromptTokens = item.tokenCount,
+                             .failure = "prefill chunk cancelled"});
+      ticket = std::make_unique<SegmentedTicket>(plan.prefillSlices,
+          [this, plan, copied = std::move(copied)] { return prefill(plan, copied); }, std::move(discarded));
+    } else if (plan.kind == WorkKind::Decode && plan.constrained &&
         plan.decodeStage == DecodeStage::Regular) {
       // Every constrained cycle after the first token waits for its mask
       // inside the ticket, as the production constrained ticket does.

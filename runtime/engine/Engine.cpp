@@ -61,6 +61,7 @@ Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
                EngineEventSink &events)
     : config_(config), cache_(cache), writeBehind_(cache), model_(model),
       events_(events), scheduler_(config_.decodeShare) {
+  scheduler_.setPrefillSlices(model_.prefillSliceCount());
   if (!config_.maxContext || !config_.vocabularySize) {
     throw std::invalid_argument("context and vocabulary sizes must be positive");
   }
@@ -188,12 +189,11 @@ bool Engine::tick(double now) {
   // in flight.
   uint64_t earliestWorking = std::numeric_limits<uint64_t>::max();
   uint64_t earliestWorkingAdmission = std::numeric_limits<uint64_t>::max();
-  if (pending_) {
-    for (const BatchItem &item : pending_->plan.items) {
-      earliestWorking =
-          std::min(earliestWorking, scheduler_.submissionOrder(item.requestId));
-      earliestWorkingAdmission =
-          std::min(earliestWorkingAdmission, request(item.requestId).admission);
+  for (const auto *command : {&pending_, &slicedPrefill_}) {
+    if (!*command) continue;
+    for (const BatchItem &item : (*command)->plan.items) {
+      earliestWorking = std::min(earliestWorking, scheduler_.submissionOrder(item.requestId));
+      earliestWorkingAdmission = std::min(earliestWorkingAdmission, request(item.requestId).admission);
     }
   }
   const bool draining = drainingForRecovery();
@@ -252,6 +252,29 @@ bool Engine::tick(double now) {
     // A mask response, cancellation, or deadline can make the commit tail
     // runnable without another Metal completion wake.
     forwardMaskRequests();
+    if (pending_->ticket->segmentReady()) {
+      pending_->ticket->pauseSegment();
+      scheduler_.pausePrefill();
+      slicedPrefill_ = std::move(pending_);
+      pending_.reset();
+      // Scheduler allows only same/higher-priority decode while paused.
+      // No admission or reclaim runs while the provisional chunk is pinned.
+      if (auto decode = scheduler_.next({})) {
+        std::vector<ModelBatchItem> items;
+        std::vector<std::vector<Capture>> captures;
+        if (prepare(*decode, items, captures, now) == Prepared::Runnable) {
+          auto ticket = model_.submit(*decode, items, completionNotifier_);
+          scheduler_.commit(*decode, {});
+          pending_ = Pending{std::move(*decode), std::move(captures), std::move(ticket), now};
+          return true;
+        }
+      }
+      pending_ = std::move(slicedPrefill_);
+      slicedPrefill_.reset();
+      scheduler_.resumePrefill();
+      pending_->ticket->resumeSegment();
+      return true;
+    }
     if (!pending_->ticket->ready())
       return progressed;
     Pending command = std::move(*pending_);
@@ -262,6 +285,12 @@ bool Engine::tick(double now) {
           command.ticket->prefillTimingIsRepresentative(), now);
     busySinceMilliseconds_ = now;
     sweepTerminal();
+    if (slicedPrefill_) {
+      pending_ = std::move(slicedPrefill_);
+      slicedPrefill_.reset();
+      scheduler_.resumePrefill();
+      if (pending_->ticket->segmentReady()) pending_->ticket->resumeSegment();
+    }
     return true;
   }
 
@@ -270,6 +299,10 @@ bool Engine::tick(double now) {
   // Lanes that wait for memory on its way back cannot run before it lands;
   // the command runs the other lanes meanwhile. A plan whose lanes all wait
   // adds them, so each attempt plans without at least one more lane.
+  const bool imagePrefill = std::any_of(requests_.begin(), requests_.end(), [&](const auto &entry) {
+    return !entry.second.request.images.empty() && scheduler_.phase(entry.first) == Phase::Prefill;
+  });
+  scheduler_.setPrefillSlices(imagePrefill ? 0 : model_.prefillSliceCount());
   std::vector<uint64_t> excluded;
   for (const auto &[id, active] : requests_) {
     if (active.lane && active.resourceWait.pending && !resourceRetryReady(active, now))
@@ -280,6 +313,14 @@ bool Engine::tick(double now) {
     std::vector<std::vector<Capture>> captures;
     switch (prepare(*plan, items, captures, now)) {
     case Prepared::Runnable: {
+      if (plan->kind == WorkKind::Prefill && plan->width() == 1 && model_.prefillSliceCount() &&
+          request(plan->items.front().requestId).request.images.empty()) {
+        const auto priority = request(plan->items.front().requestId).request.priority;
+        for (const auto &[id, peer] : requests_)
+          if (id != plan->items.front().requestId && peer.lane &&
+              peer.request.priority <= priority && scheduler_.phase(id) == Phase::Decode)
+            plan->prefillSlices = model_.prefillSliceCount();
+      }
       std::unique_ptr<ModelBatchTicket> ticket =
           model_.submit(*plan, items, completionNotifier_);
       if (!ticket) {
@@ -1556,7 +1597,7 @@ bool Engine::yieldsBefore(const Request &a, const Request &b) const {
 Engine::Request *Engine::laneToYield() {
   Request *yielding = nullptr;
   for (auto &[id, candidate] : requests_) {
-    if (!candidate.lane)
+    if (!candidate.lane || inFlight(id))
       continue;
     // Requests enter the scheduler before they can acquire a lane.
     const Phase phase = scheduler_.phase(id);
@@ -1767,7 +1808,7 @@ void Engine::suspendForGrowth(Request &active, uint64_t workEnd,
 }
 
 MemoryReclaimResult Engine::reclaimMemory(const MemoryReclaimDirective &directive) {
-  if (pending_)
+  if (pending_ || slicedPrefill_)
     throw std::logic_error("memory reclaim requested while a command is in flight");
   if (cache_.pollTransfers())
     signalResourceProgress();
@@ -2004,9 +2045,11 @@ void Engine::apply(const BatchPlan &plan, std::span<const std::vector<Capture>> 
 }
 
 bool Engine::inFlight(uint64_t id) const {
-  return pending_ &&
-         std::any_of(pending_->plan.items.begin(), pending_->plan.items.end(),
-                     [id](const BatchItem &item) { return item.requestId == id; });
+  const auto contains = [id](const auto &command) {
+    return command && std::any_of(command->plan.items.begin(), command->plan.items.end(),
+                                  [id](const BatchItem &item) { return item.requestId == id; });
+  };
+  return contains(pending_) || contains(slicedPrefill_);
 }
 
 void Engine::settle(Request &active, LaneEnd end) {
@@ -2015,8 +2058,12 @@ void Engine::settle(Request &active, LaneEnd end) {
   if (active.restore || inFlight(active.request.id)) {
     if (!active.pendingEnd)
       active.pendingEnd = std::move(end);
-    if (!active.restore)
-      pending_->ticket->abandonMask(active.request.id);
+    if (!active.restore) {
+      if (slicedPrefill_ && std::any_of(slicedPrefill_->plan.items.begin(), slicedPrefill_->plan.items.end(),
+          [&](const BatchItem &item) { return item.requestId == active.request.id; }))
+        slicedPrefill_->ticket->abandonMask(active.request.id);
+      else pending_->ticket->abandonMask(active.request.id);
+    }
     else if (active.restore->ticket)
       active.restore->ticket->cancel();
     return;

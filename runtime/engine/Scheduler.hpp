@@ -94,6 +94,9 @@ public:
   [[nodiscard]] std::optional<BatchPlan> next(std::span<const uint64_t> excluded) const;
   // The excluded lanes are those the plan was made without: blocked, not
   // passed over, so they lose nothing to it.
+  void setPrefillSlices(uint32_t count) noexcept { prefillSlices_ = count; }
+  void pausePrefill();
+  void resumePrefill();
   void commit(const BatchPlan &plan, std::span<const uint64_t> excluded);
   void complete(const BatchPlan &plan, std::span<const StepResult> results,
                 double wallMilliseconds, bool representativePrefillTiming);
@@ -149,6 +152,10 @@ private:
 
   std::unordered_map<uint64_t, Request> requests_;
   std::optional<BatchPlan> active_;
+  uint32_t prefillSlices_ = 0;
+  double slicedDecodeCreditMilliseconds_ = 0.0;
+  std::optional<BatchPlan> pausedPrefill_;
+  std::vector<uint64_t> pausedExcluded_;
   // The lanes the active command was planned without.
   std::vector<uint64_t> excluded_;
   uint64_t order_ = 0;
