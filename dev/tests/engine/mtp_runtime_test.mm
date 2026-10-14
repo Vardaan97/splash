@@ -96,7 +96,7 @@ struct Fixture {
     return {floats(16, hidden).blocks().segments.front(), floats(1, hidden).blocks().segments.front(),
             forward, forward, down};
   }
-  explicit Fixture(const char *library, bool adaptive = true, bool withContext = false, bool zeroDepth = false, bool lookup = false, bool mtpLookup = false, const char *depth = "cost", bool streamed = false, ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32, kv::Format kvFormat = kv::Format::Int8)
+  explicit Fixture(const char *library, bool adaptive = true, bool withContext = false, bool zeroDepth = false, bool lookup = false, bool mtpLookup = false, const char *depth = "cost", bool streamed = false, ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32, kv::Format kvFormat = kv::Format::Int8, bool nonzeroIndexer = false)
       : backend(library), contextWeights(withContext), operators(backend.capabilities()) {
     setenv("SPLASH_MTP_ADAPTIVE", adaptive ? "1" : "0", 1);
     setenv("SPLASH_MTP_DRAFTS", "7", 1);
@@ -199,6 +199,14 @@ struct Fixture {
     if (lookup) {
       // Keep one real trunk attention layer when the MTP head is absent.
       weights.layers.push_back(mtp.block);
+      // Nonzero pooled indexer keys make omitted attention work visible;
+      // all-zero keys otherwise expose only signed-zero rotation bits.
+      if (nonzeroIndexer) {
+        std::vector<float> indexKeys(uint64_t{128} * hidden);
+        for (uint32_t i = 0; i < 128; ++i) indexKeys[i * hidden + i] = 1.0F;
+        weights.layers.back().indexer->key = {128, hidden,
+            {{ops::QuantizedSegment::floats(128, hidden, upload(indexKeys))}}};
+      }
       layout.layers = layout.fullAttentionPeriod = 2;
       weights.mtp.reset(); layout.mtpLayers = 0;
     }
@@ -297,8 +305,9 @@ void profileComposition(const char *library) {
 void slicedPrefillIdentity(const char *library) {
   for (auto stateFormat : {ops::GdnStateFormat::Float32, ops::GdnStateFormat::BFloat16})
     for (auto kvFormat : {kv::Format::Int8, kv::Format::BFloat16})
-      for (bool streamed : {false, true}) {
-        Fixture f(library, true, false, true, true, false, "cost", streamed, stateFormat, kvFormat);
+      for (bool streamed : {false, true})
+      for (bool nonzero : {false, true}) {
+        Fixture f(library, true, false, true, true, false, "cost", streamed, stateFormat, kvFormat, nonzero);
         const auto stateBytes = [&] {
           std::vector<std::byte> result;
           const auto append = [&](const metal::MetalBuffer &buffer) {
@@ -313,6 +322,7 @@ void slicedPrefillIdentity(const char *library) {
           append(state.auxiliary);
           return result;
         };
+        for (bool interleave : {false, true})
         for (bool scoring : {true, false}) {
           std::vector<std::byte> expectedState, expectedKv, expectedCapture, expectedLogits;
           for (uint32_t slices : {0u, 2u, 8u}) {
@@ -344,7 +354,7 @@ void slicedPrefillIdentity(const char *library) {
               if (!ticket->segmentReady()) { std::this_thread::yield(); continue; }
               ticket->pauseSegment();
               require(f.states->metadata(0).lengths.targetTokens == 0, "partial slice committed lengths");
-              require(f.decode(701, 1).failure.empty(), "peer decode failed between layers");
+              if (interleave) require(f.decode(701, 1).failure.empty(), "peer decode failed between layers");
               ticket->resumeSegment();
               ++yields;
             }
@@ -370,6 +380,24 @@ void slicedPrefillIdentity(const char *library) {
             if (!slices) {
               expectedState = actualState; expectedKv = actualKv; expectedCapture = capture; expectedLogits = logits;
             } else {
+              if (actualState != expectedState || actualKv != expectedKv || capture != expectedCapture || logits != expectedLogits) {
+                const auto diagnose = [&](const char *name, const auto &a, const auto &b) {
+                  size_t first = 0, changed = 0;
+                  for (size_t i = 0; i < std::min(a.size(), b.size()); ++i)
+                    if (a[i] != b[i]) {
+                      if (!changed) first = i;
+                      if (changed < 8) std::cerr << "slice_byte " << name << ' ' << i << ' '
+                          << std::to_integer<unsigned>(a[i]) << '/' << std::to_integer<unsigned>(b[i]) << '\n';
+                      ++changed;
+                    }
+                  std::cerr << "slice_identity " << name << " bytes=" << a.size() << '/' << b.size()
+                            << " changed=" << changed << " first=" << first << '\n';
+                };
+                std::cerr << "slice_identity state_format=" << unsigned(stateFormat) << " kv_format=" << unsigned(kvFormat)
+                          << " streamed=" << streamed << " slices=" << slices << " interleave=" << interleave << " nonzero=" << nonzero << '\n';
+                diagnose("state", actualState, expectedState); diagnose("KV", actualKv, expectedKv);
+                diagnose("capture", capture, expectedCapture); diagnose("logits", logits, expectedLogits);
+              }
               require(actualState == expectedState && actualKv == expectedKv && capture == expectedCapture && logits == expectedLogits,
                       "layer slicing changed state, PLE history, captures, KV or logits");
             }

@@ -16,6 +16,7 @@
 #include "model/SparseRowStore.hpp"
 
 #include "metal/CommandGraph.hpp"
+#include <deque>
 #include "metal/abi/GDN.h"
 #include "ops/AneFfn.hpp"
 #include "ops/Linear.hpp"
@@ -107,10 +108,35 @@ private:
 
 // Only one segment is submitted at a time. Completed tickets release the
 // backend before the engine schedules a peer's decode command.
+// A layer group's bindings are fixed, but its indirect grids and inputs are
+// produced by prior groups. Keep raw payload ownership until submission and
+// encode only after the preceding command has retired.
+struct OwnedLayerCommand {
+  std::vector<metal::ComputeDispatch> dispatches;
+  std::deque<std::vector<uint8_t>> payloads;
+  std::vector<metal::EventStep> events;
+  explicit OwnedLayerCommand(const metal::Command &source)
+      : dispatches(source.dispatches.begin(), source.dispatches.end()),
+        events(source.events.begin(), source.events.end()) {
+    for (auto &dispatch : dispatches)
+      for (auto &binding : dispatch.bytes) {
+        if (!binding.data || !binding.sizeBytes) throw std::logic_error("invalid layer payload");
+        auto &bytes = payloads.emplace_back(binding.sizeBytes);
+        std::memcpy(bytes.data(), binding.data, binding.sizeBytes);
+        binding.data = bytes.data();
+      }
+  }
+  OwnedLayerCommand(const OwnedLayerCommand &) = delete;
+  OwnedLayerCommand &operator=(const OwnedLayerCommand &) = delete;
+  OwnedLayerCommand(OwnedLayerCommand &&) = default;
+  OwnedLayerCommand &operator=(OwnedLayerCommand &&) = default;
+  metal::Command command() const { return {dispatches, events}; }
+};
+
 class SlicedPrefillTicket final : public ModelBatchTicket {
 public:
   using Finish = DeferredMetalTicket::Completion;
-  SlicedPrefillTicket(MetalBackend &backend, std::vector<EncodedCommand> commands,
+  SlicedPrefillTicket(MetalBackend &backend, std::vector<OwnedLayerCommand> commands,
                      std::function<void()> notify, std::function<void()> prepare,
                      Finish finish, std::vector<ModelStepResult> discarded)
       : backend_(backend), commands_(std::move(commands)), notify_(std::move(notify)),
@@ -154,9 +180,9 @@ private:
     timing_.gpuSeconds += timing.gpuSeconds;
     timing_.wallSeconds += timing.wallSeconds;
   }
-  void submit() { ticket_ = backend_.submitEncoded(std::move(commands_.at(next_++)), notify_); }
+  void submit() { ticket_ = backend_.submitCommandAsync(commands_.at(next_++).command(), notify_); }
   MetalBackend &backend_;
-  std::vector<EncodedCommand> commands_;
+  std::vector<OwnedLayerCommand> commands_;
   std::function<void()> notify_, prepare_;
   Finish finish_;
   std::vector<ModelStepResult> discarded_;
@@ -3313,10 +3339,10 @@ Runtime::prefillAsync(const BatchPlan &plan,
   std::vector<ModelBatchItem> copiedItems(items.begin(), items.end());
   const bool sliced = impl_->geometry.target.qwen4() && plan.prefillSlices > 1 && items.size() == 1 &&
                       !impl_->aneFfn && !encodesImages;
-  std::vector<EncodedCommand> segments;
+  std::vector<OwnedLayerCommand> segments;
   if (sliced)
     for (const auto &segment : graph.layerCommands(plan.prefillSlices))
-      segments.push_back(impl_->backend.encodeCommand(segment));
+      segments.emplace_back(segment);
   CommandTicket command;
   if (!sliced)
     command = impl_->aneFfn ? impl_->aneFfn->commit(graph, std::move(completion))
