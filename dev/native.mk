@@ -1,4 +1,6 @@
 ENGINE_TEST_BUILD := $(BUILD)/engine-tests
+TEST_COMMAND_GRAPH := $(ENGINE_TEST_BUILD)/command-graph
+TEST_DECODE_PROFILE_INPUT := $(ENGINE_TEST_BUILD)/decode-profile-input
 ENGINE_TEST_CXXFLAGS := -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev \
 	$(MACOS_TARGET_FLAG)
 # Production flags less -O3, so Metal optimizes at its default -O2. With
@@ -182,6 +184,8 @@ TEST_CPU_TARGETS := $(TEST_SLOT_FILE) $(TEST_SPARSE_ROW_STORE) $(TEST_CACHE_DIRE
 	$(TEST_STATUS_TEST) \
 	$(TEST_Q8_CPU_TEST)
 
+TEST_CPU_TARGETS += $(TEST_COMMAND_GRAPH) $(TEST_DECODE_PROFILE_INPUT)
+
 TEST_METAL_TARGETS := $(TEST_MTP_RUNTIME) $(TEST_DRAFT_PREPARATION) \
 	$(TEST_GGUF_PROJECTION) \
 	$(TEST_ANE_FFN) \
@@ -287,12 +291,13 @@ $(TEST_STATUS_TEST): runtime/metal/DeviceCapabilities.cpp \
 		runtime/engine/MemoryPlan.cpp runtime/engine/MemoryAudit.cpp \
 		runtime/engine/Status.cpp \
 		dev/tests/engine/runtime_status_test.cpp
+$(TEST_DECODE_PROFILE_INPUT): dev/tests/engine/decode_profile_input_test.cpp dev/benchmarks/DecodeProfileInput.hpp
 $(TEST_Q8_CPU_TEST): dev/tests/engine/q8_paged_kv_test.cc
 $(TEST_DISK_SPACE): runtime/engine/DiskSpace.cpp runtime/engine/CacheDirectory.cpp \
 		runtime/model/SlotFile.cpp dev/tests/engine/disk_space_test.cpp
 $(TEST_LEGACY_WEIGHT_CACHE): dev/tests/engine/legacy_weight_cache_test.cpp
 
-$(TEST_WEIGHT_SOURCE) $(TEST_GGUF_FILE) $(TEST_MEMORY_TEST) $(TEST_KV_PAGE_CACHE_TEST) \
+$(TEST_DECODE_PROFILE_INPUT) $(TEST_WEIGHT_SOURCE) $(TEST_GGUF_FILE) $(TEST_MEMORY_TEST) $(TEST_KV_PAGE_CACHE_TEST) \
 		$(TEST_DRAFT_CONTEXT_PLAN_TEST) $(TEST_QWEN4_DRAFT_CONTEXT) $(TEST_MTP_DEPTH_PLANNER) $(TEST_RAGGED_SCHEDULER_TEST) \
 		$(TEST_ELASTIC_KV_TEST) $(TEST_NATIVE_LOOP_TEST) $(TEST_METRICS_TEST) \
 		$(TEST_MEMORY_AUDIT_TEST) $(TEST_MEMORY_GOVERNOR_TEST) $(TEST_STATUS_TEST) \
@@ -302,6 +307,7 @@ $(TEST_WEIGHT_SOURCE) $(TEST_GGUF_FILE) $(TEST_MEMORY_TEST) $(TEST_KV_PAGE_CACHE
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
 # C++ tests linked with the frameworks.
+$(TEST_COMMAND_GRAPH): dev/tests/engine/command_graph_test.cpp $(ENGINE_LIBRARY)
 $(TEST_SAFETENSORS_CHECKPOINT): dev/tests/engine/safetensors_checkpoint_test.cpp $(ENGINE_LIBRARY)
 $(TEST_MODEL_CONFIGURATION): dev/tests/engine/model_configuration_test.cpp $(ENGINE_LIBRARY)
 $(TEST_VISION_PREPARATION): dev/tests/engine/vision_preparation_test.cpp $(ENGINE_LIBRARY)
@@ -319,7 +325,7 @@ $(TEST_MODEL_EXECUTION_PLANS): dev/tests/engine/model_execution_plan_test.cpp \
 $(TEST_VISION_METAL_TEST): dev/tests/engine/vision_metal_test.cpp \
 		$(ENGINE_LIBRARY) $(LIB)
 
-$(TEST_SAFETENSORS_CHECKPOINT) $(TEST_MODEL_CONFIGURATION) $(TEST_VISION_PREPARATION) \
+$(TEST_COMMAND_GRAPH) $(TEST_SAFETENSORS_CHECKPOINT) $(TEST_MODEL_CONFIGURATION) $(TEST_VISION_PREPARATION) \
 		$(TEST_NATIVE_ARGUMENTS_TEST) $(TEST_ANE_FFN_STARTUP) $(TEST_MODEL_LOADING_TEST) $(TEST_OPERATOR_WORKSPACE) \
 		$(TEST_EXECUTION_PLANS) $(TEST_MODEL_EXECUTION_PLANS) $(TEST_VISION_METAL_TEST): | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) \
@@ -391,7 +397,7 @@ $(TEST_MODEL_RUNTIME_ORACLE): dev/tests/engine/model_runtime_oracle_test.mm \
 		$(BUILD_ID_HEADER)
 # The oracle remembers the split's calibration under the build, as the engine does.
 $(TEST_MODEL_RUNTIME_ORACLE): ENGINE_TEST_CXXFLAGS += -include $(BUILD_ID_HEADER)
-$(TEST_DECODE_PROFILE): dev/benchmarks/decode_profile.mm \
+$(TEST_DECODE_PROFILE): dev/benchmarks/decode_profile.mm dev/benchmarks/DecodeProfileInput.hpp \
 		$(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_LIBRARY) $(LIB)
 $(TEST_ATTENTION_SWEEP): dev/benchmarks/attention_sweep.mm \
 		dev/benchmarks/DispatchReplay.hpp \
@@ -523,6 +529,8 @@ test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP)
 	$(TEST_MEMORY_GOVERNOR_TEST)
 	$(TEST_STATUS_TEST) dev/tests/engine/status_golden.json
 	$(TEST_Q8_CPU_TEST)
+	$(TEST_COMMAND_GRAPH)
+	$(TEST_DECODE_PROFILE_INPUT)
 
 test-engine-metal: $(TEST_METAL_TARGETS)
 	$(METAL_TEST_ENV) $(BUILD_ID_PYTHON) dev/tests/engine/run_draft_preparation.py $(TEST_DRAFT_PREPARATION) $(LIB) \

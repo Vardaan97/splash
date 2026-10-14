@@ -163,6 +163,10 @@ struct ComputeDispatch {
   DispatchSize threadgroups;
   DispatchSize threadsPerThreadgroup;
   IndirectGrid indirectThreadgroups = {};
+  // Caller-proven independence from every dispatch since the last boundary.
+  // False orders this dispatch after all earlier buffer accesses. True only
+  // removes that boundary; it never crosses an event or encoder boundary.
+  bool independentOfPrevious = false;
 };
 
 // Orders a command against another agent, such as the Neural Engine, after

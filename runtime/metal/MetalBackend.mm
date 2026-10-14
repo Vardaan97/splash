@@ -886,6 +886,9 @@ struct MetalBackend::Impl {
             };
             // Indexed by argument table entry. The ticket and the dispatches
             // keep the buffers alive.
+            const bool concurrent = std::ranges::any_of(dispatches, [](const PreparedDispatch &item) {
+                return item.source->independentOfPrevious;
+            });
             __unsafe_unretained id<MTLBuffer> buffers[kBufferArgumentEntries];
             NSUInteger offsets[kBufferArgumentEntries];
             for (size_t index = 0; index < dispatches.size(); ++index) {
@@ -893,11 +896,18 @@ struct MetalBackend::Impl {
                 const PreparedDispatch &item = dispatches[index];
                 const ComputeDispatch &dispatch = *item.source;
                 if (!encoder) {
-                    encoder = [command computeCommandEncoder];
+                    encoder = concurrent
+                        ? [command computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent]
+                        : [command computeCommandEncoder];
                     if (!encoder) {
                         failBeforeCommit("unable to create Metal compute encoder");
                     }
                 }
+                // A full buffer barrier also covers indirect accesses through
+                // pointer tables and scratch aliases. Only caller-proven
+                // independent groups omit it. Event steps end the encoder.
+                if (concurrent && !dispatch.independentOfPrevious)
+                    [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
                 [encoder setComputePipelineState:item.pipeline];
                 for (const BufferBinding &binding : dispatch.buffers) {
                     const MetalBuffer::Impl &buffer = *binding.buffer.impl_;
@@ -1051,6 +1061,9 @@ struct MetalBackend::Impl {
             };
             // Indexed by argument table entry. The ticket and the dispatches
             // keep the buffers alive.
+            const bool concurrent = std::ranges::any_of(dispatches, [](const PreparedDispatch &item) {
+                return item.source->independentOfPrevious;
+            });
             __unsafe_unretained id<MTLBuffer> buffers[kBufferArgumentEntries];
             NSUInteger offsets[kBufferArgumentEntries];
             for (size_t index = 0; index < dispatches.size(); ++index) {
@@ -1058,11 +1071,18 @@ struct MetalBackend::Impl {
                 const PreparedDispatch &item = dispatches[index];
                 const ComputeDispatch &dispatch = *item.source;
                 if (!encoder) {
-                    encoder = [command computeCommandEncoder];
+                    encoder = concurrent
+                        ? [command computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent]
+                        : [command computeCommandEncoder];
                     if (!encoder) {
                         failBeforeCommit("unable to create Metal compute encoder");
                     }
                 }
+                // A full buffer barrier also covers indirect accesses through
+                // pointer tables and scratch aliases. Only caller-proven
+                // independent groups omit it. Event steps end the encoder.
+                if (concurrent && !dispatch.independentOfPrevious)
+                    [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
                 [encoder setComputePipelineState:item.pipeline];
                 for (const BufferBinding &binding : dispatch.buffers) {
                     const MetalBuffer::Impl &buffer = *binding.buffer.impl_;

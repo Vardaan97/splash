@@ -14,6 +14,8 @@
 #include "ops/RowCopy.hpp"
 
 #include <algorithm>
+#include <cstdlib>
+#include <string_view>
 #include <optional>
 #include <stdexcept>
 #include <utility>
@@ -947,10 +949,21 @@ void QwenTarget::addQwen4VerifyAttention(VerifyStep &step, const Qwen4ExpLayerWe
     addDecodeProjection(step.graph, linear, std::move(input), projection, std::move(output), step.lanes, b.linearScratch, std::move(prepared));
   };
   const uint32_t topBlocks = qwen4()->layout.indexerTopBlocks;
+  const size_t projectionBegin = step.graph.dispatches().size();
   project(b.normalized, mixer.inputProjection, b.fullPacked, std::move(input));
+  const size_t indexerBegin = step.graph.dispatches().size();
   const Qwen4IndexerWeights &indexer = *layer.indexer;
   addIndexerProjection(step.graph, linear, b.normalized, indexer.query, h.indexerQuery, step.rows);
   addIndexerProjection(step.graph, linear, b.normalized, indexer.key, h.indexerKey, step.rows);
+  const char *dispatchMode = std::getenv("SPLASH_DECODE_DISPATCH");
+  if (dispatchMode && std::string_view(dispatchMode) == "1") {
+    // All three read normalized and immutable weights. The indexer writes
+    // only indexerQuery/indexerKey, never linear scratch or fullPacked.
+    // Multi-dispatch linear plans keep their internal ordering; only the
+    // two scratch-free indexer projections overlap in that case.
+    step.graph.independent(indexerBegin == projectionBegin + 1 ? projectionBegin : indexerBegin,
+                           step.graph.dispatches().size());
+  }
   bool sparse = false;
   for (uint32_t lane = 0; lane < step.lanes; ++lane)
     sparse = sparse || ops::Qwen4::qsaSparse(step.chunks[lane].committed_tokens, laneRows, topBlocks);
