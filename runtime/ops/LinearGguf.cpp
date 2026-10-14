@@ -236,6 +236,9 @@ void LinearPlan::requireConfiguration() const {
   if ((c.stepInputs != 32 || c.columns != 64) &&
       (c.tile != LinearTile::GgufStaged || !decode || workload_.epilogue != LinearEpilogue::None || c.oneGateUpPass))
     throw std::invalid_argument("small projection tiles take plain staged decode projections");
+  if (c.smallPrefillGroups && (decode || c.tile != LinearTile::GgufPrefill ||
+      workload_.rows <= kMaximumDecodeTileRows || workload_.rows > 256))
+    throw std::invalid_argument("invalid grouped prefill workload");
   if (c.spread && c.tile != LinearTile::GgufStaged)
     throw std::invalid_argument("only the staged block tile spreads its walks");
   if (c.oneGateUpPass && (c.tile != LinearTile::GgufStaged || !decode || workload_.epilogue != LinearEpilogue::GateUp))
@@ -247,7 +250,8 @@ void LinearPlan::requireConfiguration() const {
     return;
   }
   if (c.tile == LinearTile::GgufPrefill) {
-    if (decode || c.splits != 1) throw std::invalid_argument("invalid block prefill configuration");
+    if (decode || (!c.smallPrefillGroups && c.splits != 1) ||
+        (c.smallPrefillGroups && (!c.validSplits() || c.splits == 1 || (k / 32) % c.splits))) throw std::invalid_argument("invalid block prefill configuration");
     return;
   }
   if (!c.validSplits() || (k / 32) % c.splits)
@@ -285,7 +289,7 @@ LinearScratchSize LinearPlan::scratchSize() const noexcept {
   const uint64_t columns = config_.oneGateUpPass ? 2 * uint64_t{n} : n;
   const uint32_t tile = config_.oneGateUpPass ? GGUF_STAGED_COLUMNS : config_.columns;
   return config_.splits > 1
-      ? LinearScratchSize{0, 0, uint64_t{config_.splits} * storageRows() * columns * sizeof(float),
+      ? LinearScratchSize{0, 0, uint64_t{config_.splits} * (config_.smallPrefillGroups ? kMaximumDecodeTileRows : storageRows()) * columns * sizeof(float),
                           uint64_t{n / tile} * sizeof(uint32_t)}
       : LinearScratchSize{};
 }
@@ -302,6 +306,17 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
   // that is 1.8-2.9x faster on a 16-core M5 Pro (its neural accelerator pads
   // 8 rows to 16) and 1.1-2.8x on a 40-core M3 Max; the 27B down and output
   // projections split in two gain 24-37% more on the 16-core M5 Pro.
+  if (w.phase == LinearPhase::Prefill && w.rows > kMaximumDecodeTileRows &&
+      w.rows <= smallPrefillRows_ && family_ == GpuFamilyClass::Apple10 &&
+      n <= k && n / GGUF_TILE_COLUMNS < 4 * gpuCores_ &&
+      std::all_of(projections.begin(), projections.end(), [](const Projection *p) {
+        return !p || (!p->rotation && !p->planeInputs() && p->blocks().segments.size() == 1 &&
+                      p->blocks().segments.front().formatId == GGUF_FMT_Q80);
+      })) {
+    const uint32_t splits = decodeSplits(n, k, gpuCores_, stagedTiers(family_));
+    if (splits > 1)
+      return {.tile = LinearTile::GgufPrefill, .splits = splits, .smallPrefillGroups = true};
+  }
   if (w.phase == LinearPhase::Prefill)
     return w.rows <= kMaximumDecodeTileRows
         ? LinearConfig{.tile = LinearTile::GgufStaged,

@@ -1,4 +1,5 @@
 #include "Linear.hpp"
+#include "ops/PrefillPolicy.hpp"
 
 #include <cstdlib>
 #include <cstring>
@@ -6,7 +7,7 @@
 namespace splash::ops {
 
 Linear::Linear(const DeviceCapabilities &device) noexcept
-    : family_(gpuFamilyClass(device.appleGpuFamily)),
+    : smallPrefillRows_(smallPrefillRows()), family_(gpuFamilyClass(device.appleGpuFamily)),
       gpuCores_(plannedGpuCores(device)) {
   const char *enabled = std::getenv("SPLASH_SMALL_PROJ");
   smallProjectionEnabled_ = enabled && std::strcmp(enabled, "1") == 0;

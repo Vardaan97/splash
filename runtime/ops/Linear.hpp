@@ -96,6 +96,8 @@ struct LinearConfig final {
   bool oneGateUpPass = false;
   uint32_t stepInputs = 32;
   uint32_t columns = 64;
+  // Prefill storage, executed as serial staged 32-row split-K groups.
+  bool smallPrefillGroups = false;
   [[nodiscard]] constexpr bool validSplits() const noexcept {
     return splits && splits <= kMaximumSplits && !(splits & (splits - 1));
   }
@@ -317,6 +319,7 @@ private:
                             const Projection &projection, const LinearPlan &plan) const;
   bool smallProjectionEnabled_ = false;
   uint32_t smallProjectionVariant_ = 0;
+  uint32_t smallPrefillRows_ = 0;
   GpuFamilyClass family_;
   uint32_t gpuCores_ = 0;
 };

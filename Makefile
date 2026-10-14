@@ -239,6 +239,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/Embedding.cpp \
 	runtime/ops/ExecutionPlans.cpp \
 	runtime/ops/GDN.cpp \
+	runtime/ops/PrefillPolicy.cpp \
 	runtime/ops/Linear.cpp \
 	runtime/ops/LinearPolicy.cpp \
 	runtime/ops/LinearGguf.cpp \

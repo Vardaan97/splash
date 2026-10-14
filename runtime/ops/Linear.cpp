@@ -1,5 +1,6 @@
 #include "Linear.hpp"
 #include "ops/Qwen4.hpp"
+#include "ops/PrefillPolicy.hpp"
 
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Gguf.h"
@@ -197,7 +198,7 @@ LinearScratchSize Linear::prefillScratchSize(ProjectionShape shape) const {
   LinearScratchSize bound;
   // Prefill plans take split scratch only in chunks of up to a decode batch,
   // which run the staged tile (LinearGguf.cpp).
-  for (uint32_t rows = 1; rows <= kMaximumDecodeTileRows; ++rows)
+  for (uint32_t rows = 1; rows <= std::max(kMaximumDecodeTileRows, smallPrefillRows_); ++rows)
     for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate})
       bound.include(plan({{shape.outputSize, shape.inputSize}, rows, LinearPhase::Prefill, epilogue}).scratchSize());
   // Every prefill plan stores at most the token budget.
@@ -238,6 +239,33 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
   requireBytes(b.scratch.partials, scratch.partials, "projection partials");
   requireBytes(b.scratch.counters, scratch.counters, "projection counters");
   if (p.rotation) requireBytes(b.scratch.rotated, rotatedBytes(k, rows), "projection rotated input");
+  // Small chain-bound Q8_0 projections reuse the existing split-K tile in
+  // serial 32-row groups. Each group owns the same scratch only until its
+  // dispatch completes; the fixed split reduction order is unchanged.
+  if (selected.configuration().smallPrefillGroups) {
+    const auto groupPlan = Linear::plan(
+        {w.matrix, kMaximumDecodeTileRows, LinearPhase::Prefill, w.epilogue},
+        {.tile = LinearTile::GgufStaged, .splits = selected.configuration().splits},
+        selected.destination());
+    if (groupPlan.configuration().splits > 1) {
+      // The outer prefill storage is rounded to 128 rows, so the final
+      // group's padded stores remain inside every input/output/aux view.
+      const auto view = [&](metal::MetalBuffer buffer, uint32_t begin, uint32_t width) {
+        if (!buffer) return buffer;
+        return buffer.subview(uint64_t{begin} * width * 2,
+                                        uint64_t{kMaximumDecodeTileRows} * width * 2);
+      };
+      for (uint32_t begin = 0; begin < w.rows; begin += kMaximumDecodeTileRows) {
+        LinearBuffers group = b;
+        group.input = view(b.input, begin, k);
+        group.output = view(b.output, begin, n);
+        group.residual = view(b.residual, begin, n);
+        group.gateScratch = view(b.gateScratch, begin, n);
+        add(graph, group, p, groupPlan);
+      }
+      return {};
+    }
+  }
   addGguf(graph, b, p, selected, gate);
   // A rotated projection's plan prepares its table, if any, from the rotated
   // rows, which no other plan reads.

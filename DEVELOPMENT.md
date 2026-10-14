@@ -2993,3 +2993,18 @@ token commit only after the final group. Cancellation drains the submitted
 group and discards the provisional chunk. ANE splits, image encoding, other
 model families and multi-lane prefill use a single command. Invalid flag
 values disable slicing. Arithmetic and kernel order are unchanged (class B).
+
+### Experimental small prefill split-K
+
+| Flag | Default | Scope | Sunset |
+| --- | --- | --- | --- |
+| `SPLASH_PREFILL_SMALL_SPLIT=33..256` | 0 (off) | Apple10 Q8_0, unrotated single tensors, N ≤ K and fewer than four column tiles/core, decode splits > 1 | Remove or replace the rule after the shape sweep and paired short-position KLD gate |
+
+The value is the largest eligible chunk. Invalid values disable the path.
+Eligible projections run serial 32-row groups on the existing staged kernels
+and reuse the existing prefill split scratch. Wide, rotated, leading-input,
+mixed-format and Apple9 projections keep their usual path. The arithmetic is
+N-det: fixed-order split-K reductions can change fp32 association. Keep this
+opt-in pending M0-a (predicted saving at 64 rows ≥ 20 ms), paired neutral-set
+ΔKLD ≤ 0.0002 at short-chunk positions, and a greedy-drift report. No shader
+or new device-specific kernel variant is introduced.

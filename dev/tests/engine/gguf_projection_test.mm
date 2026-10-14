@@ -679,6 +679,41 @@ void prefill(MetalBackend &backend, const Linear &linear) {
           "chunks and chunks of 8-32 rows (S 1 and 4) within fp64, equal to the 128-row tiles");
 }
 
+// Forced Apple10 planning exercises the opt-in on Apple9 too. Each grouped
+// result must equal independently dispatched 32-row production kernels,
+// including a partial final group and repeated use of poisoned split scratch.
+void smallPrefillGroups(MetalBackend &backend) {
+  auto caps = backend.capabilities();
+  caps.appleGpuFamily = 10;
+  caps.gpuCoreCount = 40;
+  const Linear linear(caps);
+  constexpr uint32_t N = 320, K = 10240;
+  const Tensor weight = tensor(backend, Q80, N, K);
+  const Projection p = projection({&weight}, N);
+  bool exercised = false;
+  for (uint32_t rows : {33u, 63u, 64u, 65u, 96u, 127u, 128u, 129u, 255u, 256u}) {
+    for (auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate}) {
+      const auto plan = linear.prefillPlan(p, rows, epilogue);
+      if (!plan.configuration().smallPrefillGroups) continue;
+      exercised = true;
+      const auto x = storageRows(activations(Inputs::Dense, plan.storageRows(), K), K, rows, plan.storageRows());
+      const auto aux = storageRows(residuals(plan.storageRows(), N), N, rows, plan.storageRows());
+      const auto actual = run(backend, linear, plan, p, nullptr, x, aux, kPoisonNaN, N, "small groups");
+      const auto repeat = run(backend, linear, plan, p, nullptr, x, aux, kPoisonFinite, N, "small groups repeat");
+      if (actual.output != repeat.output) fail("small groups depend on partial poison");
+      for (uint32_t begin = 0; begin < rows; begin += 32) {
+        const auto group = linear.prefillPlan(p, 32, epilogue);
+        const std::vector<uint16_t> gx(x.begin() + uint64_t{begin} * K, x.begin() + uint64_t{begin + 32} * K);
+        const std::vector<uint16_t> ga(aux.begin() + uint64_t{begin} * N, aux.begin() + uint64_t{begin + 32} * N);
+        const auto expected = run(backend, linear, group, p, nullptr, gx, ga, kPoisonNaN, N, "reference group");
+        if (!sameRows(actual.output, begin, expected.output, 0, std::min(32u, rows - begin), N))
+          fail("small groups differ from fixed-partition production kernels");
+      }
+    }
+  }
+  section(exercised ? "small prefill groups: deterministic, reference memcmp and guards" : "small prefill groups: disabled");
+}
+
 // ---------------------------------------------------------------- leading inputs
 // A view of the leading inputs of a projection's rows (Projection::leadingInputs), as the ANE FFN split runs down's GPU
 // share: its residual prefill (gguf_prefill_<format>_r_leading_inputs) equals bit for bit the residual prefill of
@@ -1181,6 +1216,7 @@ int main(int argc, char **argv) {
       fusedDecode(backend, linear, LinearTile::GgufStaged, true);
       for (const bool spread : {false, true}) oneGateUpPass(backend, linear, spread);
       prefill(backend, linear);
+      smallPrefillGroups(backend);
       leadingInputs(backend, linear);
       // The 27B out_proj then down, and gdn_in then gate/up: K 6144, 17408 and 5120.
       const SplitOperand out = splitOperand(backend, Q4K, {5120, 6144}, LinearEpilogue::Residual);

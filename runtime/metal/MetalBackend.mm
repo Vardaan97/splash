@@ -1625,6 +1625,17 @@ MetalBuffer MetalBackend::view(const MetalBuffer &base,
     return MetalBuffer(std::move(result));
 }
 
+MetalBuffer MetalBuffer::subview(uint64_t offsetBytes, uint64_t lengthBytes) const {
+    if (!impl_ || !lengthBytes || offsetBytes > impl_->lengthBytes ||
+        lengthBytes > impl_->lengthBytes - offsetBytes)
+        throw MetalBackendError("Metal buffer subview is out of range");
+    auto result = std::make_shared<MetalBuffer::Impl>();
+    result->allocation = impl_->allocation;
+    result->offsetBytes = impl_->offsetBytes + offsetBytes;
+    result->lengthBytes = lengthBytes;
+    return MetalBuffer(std::move(result));
+}
+
 SharedEvent MetalBackend::newSharedEvent() {
     checkOperation();
     auto result = std::make_shared<SharedEvent::Impl>();
