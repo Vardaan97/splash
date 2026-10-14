@@ -314,67 +314,67 @@ void slicedPrefillIdentity(const char *library) {
           return result;
         };
         for (bool scoring : {true, false}) {
-        std::vector<std::byte> expectedState, expectedKv, expectedCapture, expectedLogits;
-        for (uint32_t slices : {0u, 2u, 8u}) {
-          f.pages->clearPages(std::array<uint32_t, 2>{0, 4});
-          auto peer = f.request(701, {11});
-          peer.sampling.temperature = 0.7F;
-          peer.sampling.seed = 77;
-          f.prefill(peer, 1);
-          auto request = f.request(700, std::vector<uint32_t>(48, 10));
-          if (scoring) {
-            request.maxNewTokens = 0;
-            request.scoreTokens = {0, 1, 10, 11};
-          } else {
-            request.maxNewTokens = 1;
-            request.sampling.temperature = 0.7F;
-            request.sampling.seed = 99;
+          std::vector<std::byte> expectedState, expectedKv, expectedCapture, expectedLogits;
+          for (uint32_t slices : {0u, 2u, 8u}) {
+            f.pages->clearPages(std::array<uint32_t, 2>{0, 4});
+            auto peer = f.request(701, {11});
+            peer.sampling.temperature = 0.7F;
+            peer.sampling.seed = 77;
+            f.prefill(peer, 1);
+            auto request = f.request(700, std::vector<uint32_t>(48, 10));
+            if (scoring) {
+              request.maxNewTokens = 0;
+              request.scoreTokens = {0, 1, 10, 11};
+            } else {
+              request.maxNewTokens = 1;
+              request.sampling.temperature = 0.7F;
+              request.sampling.seed = 99;
+            }
+            f.runtime->beginColdRequest(request.modelView(), 0);
+            const std::array<uint32_t, 2> table{0, 4};
+            BatchPlan plan{.kind = WorkKind::Prefill, .items = {{request.id, 48}}, .prefillSlices = slices};
+            ModelBatchItem item{request.id, 0, 48, table};
+            item.inputTokens = request.prompt;
+            item.pageTableRevision = ++f.revisions[request.id];
+            item.stateCaptures.push_back({32, f.runtime->reserveState(request.id, 32)});
+            require(bool(item.stateCaptures[0].reservation), "capture reservation failed");
+            auto ticket = f.runtime->submit(plan, std::span(&item, 1), {});
+            unsigned yields = 0;
+            while (!ticket->ready()) {
+              if (!ticket->segmentReady()) { std::this_thread::yield(); continue; }
+              ticket->pauseSegment();
+              require(f.states->metadata(0).lengths.targetTokens == 0, "partial slice committed lengths");
+              require(f.decode(701, 1).failure.empty(), "peer decode failed between layers");
+              ticket->resumeSegment();
+              ++yields;
+            }
+            const auto result = ticket->wait().front();
+            require(result.failure.empty() && result.capturedStates.size() == 1, "sliced prefill failed");
+            require((slices == 0) == (yields == 0), "sliced runtime never yielded");
+            auto actualState = stateBytes();
+            std::vector<std::byte> actualKv;
+            for (uint32_t page : table)
+              for (const auto span : f.pages->spans(page)) actualKv.insert(actualKv.end(), span.begin(), span.end());
+            std::vector<std::byte> logits(result.scoreLogits.size() * sizeof(float));
+            std::memcpy(logits.data(), result.scoreLogits.data(), logits.size());
+            for (uint32_t token : result.outputTokens) {
+              const auto *p = reinterpret_cast<const std::byte *>(&token);
+              logits.insert(logits.end(), p, p + sizeof(token));
+            }
+            if (result.firstToken) {
+              const auto *p = reinterpret_cast<const std::byte *>(&*result.firstToken);
+              logits.insert(logits.end(), p, p + sizeof(uint32_t));
+            }
+            require(!f.runtime->beginRestore(request.id, 32, result.capturedStates[0], true, {}), "capture restore failed");
+            auto capture = stateBytes();
+            if (!slices) {
+              expectedState = actualState; expectedKv = actualKv; expectedCapture = capture; expectedLogits = logits;
+            } else {
+              require(actualState == expectedState && actualKv == expectedKv && capture == expectedCapture && logits == expectedLogits,
+                      "layer slicing changed state, PLE history, captures, KV or logits");
+            }
+            f.runtime->end(700); f.runtime->end(701);
           }
-          f.runtime->beginColdRequest(request.modelView(), 0);
-          const std::array<uint32_t, 2> table{0, 4};
-          BatchPlan plan{.kind = WorkKind::Prefill, .items = {{request.id, 48}}, .prefillSlices = slices};
-          ModelBatchItem item{request.id, 0, 48, table};
-          item.inputTokens = request.prompt;
-          item.pageTableRevision = ++f.revisions[request.id];
-          item.stateCaptures.push_back({32, f.runtime->reserveState(request.id, 32)});
-          require(bool(item.stateCaptures[0].reservation), "capture reservation failed");
-          auto ticket = f.runtime->submit(plan, std::span(&item, 1), {});
-          unsigned yields = 0;
-          while (!ticket->ready()) {
-            if (!ticket->segmentReady()) { std::this_thread::yield(); continue; }
-            ticket->pauseSegment();
-            require(f.states->metadata(0).lengths.targetTokens == 0, "partial slice committed lengths");
-            require(f.decode(701, 1).failure.empty(), "peer decode failed between layers");
-            ticket->resumeSegment();
-            ++yields;
-          }
-          const auto result = ticket->wait().front();
-          require(result.failure.empty() && result.capturedStates.size() == 1, "sliced prefill failed");
-          require((slices == 0) == (yields == 0), "sliced runtime never yielded");
-          auto actualState = stateBytes();
-          std::vector<std::byte> actualKv;
-          for (uint32_t page : table)
-            for (const auto span : f.pages->spans(page)) actualKv.insert(actualKv.end(), span.begin(), span.end());
-          std::vector<std::byte> logits(result.scoreLogits.size() * sizeof(float));
-          std::memcpy(logits.data(), result.scoreLogits.data(), logits.size());
-          for (uint32_t token : result.outputTokens) {
-            const auto *p = reinterpret_cast<const std::byte *>(&token);
-            logits.insert(logits.end(), p, p + sizeof(token));
-          }
-          if (result.firstToken) {
-            const auto *p = reinterpret_cast<const std::byte *>(&*result.firstToken);
-            logits.insert(logits.end(), p, p + sizeof(uint32_t));
-          }
-          require(!f.runtime->beginRestore(request.id, 32, result.capturedStates[0], true, {}), "capture restore failed");
-          auto capture = stateBytes();
-          if (!slices) {
-            expectedState = actualState; expectedKv = actualKv; expectedCapture = capture; expectedLogits = logits;
-          } else {
-            require(actualState == expectedState && actualKv == expectedKv && capture == expectedCapture && logits == expectedLogits,
-                    "layer slicing changed state, PLE history, captures, KV or logits");
-          }
-          f.runtime->end(700); f.runtime->end(701);
-        }
         }
         auto cancelled = f.request(702, std::vector<uint32_t>(48, 10));
         f.runtime->beginColdRequest(cancelled.modelView(), 0);

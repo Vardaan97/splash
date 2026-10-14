@@ -805,19 +805,7 @@ struct Runtime::Impl {
       throw std::invalid_argument("a streamed PLE table runs with the MTP head or looked-up proposals");
     prefillArena = std::make_unique<PrefillArena>(backend, geometry, operators);
     decodeArena = std::make_unique<DecodeArena>(backend, geometry, operators);
-    if (prefillSlices()) {
-      for (uint32_t p = 0; p < prefillTensorCount; ++p) {
-        const auto a = prefillArena->get(static_cast<PrefillTensor>(p));
-        if (!a) continue;
-        for (uint32_t d = 0; d < decodeTensorCount; ++d)
-          for (uint32_t lane = 0; lane < kLaneCount; ++lane) {
-            const auto b = decodeArena->get(lane, static_cast<DecodeTensor>(d));
-            if (b && a.gpuAddress() < b.gpuAddress() + b.sizeBytes() &&
-                b.gpuAddress() < a.gpuAddress() + a.sizeBytes())
-              throw std::logic_error("prefill and decode scratch arenas alias");
-          }
-      }
-    }
+    if (prefillSlices()) decodeArena->requireSeparate(*prefillArena);
     penaltyTable =
         decodeArena->batchSlice(DecodeTensor::PenaltyState, kLaneCount);
     if (geometry.target.qwen4())

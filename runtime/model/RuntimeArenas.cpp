@@ -7,6 +7,20 @@
 
 namespace splash::model {
 
+void PrefillArena::requireSeparate(const metal::MetalBuffer &other) const {
+  if (other && base_.gpuAddress() < other.gpuAddress() + other.sizeBytes() &&
+      other.gpuAddress() < base_.gpuAddress() + base_.sizeBytes())
+    throw std::logic_error("prefill and decode scratch arenas alias");
+}
+
+void DecodeArena::requireSeparate(const PrefillArena &prefill) const {
+  prefill.requireSeparate(base_);
+  prefill.requireSeparate(gateScratch_);
+  for (const auto &buffer : {linearScratch_.input, linearScratch_.sums,
+       linearScratch_.partials, linearScratch_.counters, linearScratch_.rotated})
+    prefill.requireSeparate(buffer);
+}
+
 namespace {
 
 // Qwen3.8-Flash-Next's scratch of `rows` rows (QwenHyperBuffers).

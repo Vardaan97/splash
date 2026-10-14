@@ -207,6 +207,8 @@ public:
       std::memset(zeros.contents(), 0, zeros.sizeBytes());
   }
 
+  // Checks the complete allocation, including padding between tensors.
+  void requireSeparate(const metal::MetalBuffer &other) const;
   [[nodiscard]] metal::MetalBuffer get(PrefillTensor tensor) const {
     return tensors_[static_cast<uint32_t>(tensor)];
   }
@@ -451,6 +453,8 @@ public:
     bytes_ = plannedDecodeBytes(geometry_, operators);
   }
 
+  // Includes layer-major tensors and separately allocated linear scratch.
+  void requireSeparate(const PrefillArena &prefill) const;
   [[nodiscard]] metal::MetalBuffer get(uint32_t lane, DecodeTensor tensor) const {
     if (lane >= kLaneCount)
       throw std::out_of_range("invalid decode lane");
