@@ -100,7 +100,8 @@ struct Fixture {
       : backend(library), contextWeights(withContext), operators(backend.capabilities()) {
     setenv("SPLASH_MTP_ADAPTIVE", adaptive ? "1" : "0", 1);
     setenv("SPLASH_MTP_DRAFTS", "7", 1);
-    setenv("SPLASH_MTP_DEPTH", depth, 1);
+    if (depth) setenv("SPLASH_MTP_DEPTH", depth, 1);
+    else unsetenv("SPLASH_MTP_DEPTH");
     setenv("SPLASH_MTP_LOOKUP", mtpLookup ? "1" : "0", 1);
     Qwen4ExpWeights weights;
     auto &layout = weights.layout;
@@ -302,7 +303,7 @@ void ruleLaneIdentity(const char *library) {
   for (bool sampled : {false, true}) {
     std::vector<uint32_t> reference;
     std::vector<uint32_t> referenceDepths;
-    for (const char *depth : {"rule", "lane"}) {
+    for (const char *depth : {static_cast<const char *>(nullptr), "rule", "lane"}) {
       Fixture f(library, true, false, false, false, false, depth);
       auto request = f.request(71, {11});
       if (sampled) { request.sampling.temperature = 0.6F; request.sampling.seed = 1; }
@@ -314,8 +315,8 @@ void ruleLaneIdentity(const char *library) {
         output.insert(output.end(), result.outputTokens.begin(), result.outputTokens.end());
         depths.push_back(result.draftedTokens);
       }
-      if (std::string_view(depth) == "rule") { reference = output; referenceDepths = depths; }
-      else require(output == reference && depths == referenceDepths, "B1 rule/lane byte and depth identity");
+      if (!depth) { reference = output; referenceDepths = depths; }
+      else require(output == reference && depths == referenceDepths, "B1 unset/rule/lane byte and depth identity");
     }
   }
   Fixture f(library, true, false, false, false, false, "lane");
