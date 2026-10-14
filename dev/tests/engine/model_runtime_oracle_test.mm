@@ -2111,11 +2111,84 @@ void warmupEos(model::RuntimeContext context, model::LoadedModel &model) {
             << " decode_stop=" << decodeStop << '\n';
 }
 
+// A scaled agent replay. The old tail is beyond the edited tool result;
+// continuing from the earlier grid state must match a cold edited prompt.
+// Boundaries are command ends, preserving the cold prefill partition exactly.
+void requireGridCheckpointEditReplay(model::Runtime &executor,
+                                     const model::QwenStateStorage &states,
+                                     std::span<const uint32_t> chat) {
+  constexpr uint32_t boundary = 2048, end = 3072, edit = 2301;
+  std::vector<uint32_t> prompt(end);
+  for (uint32_t row = 0; row < end; ++row)
+    prompt[row] = chat[row % chat.size()];
+  const auto scoring = [](uint64_t id, const std::vector<uint32_t> &tokens) {
+    EngineRequest request = makeRequest(id, tokens, 0);
+    request.scoreTokens = {1000, 1037, 1074, 1111};
+    return request;
+  };
+  const auto pages = pageRange(0, 96);
+  const std::array<uint32_t, 1> grid{boundary}, tail{end};
+  const std::array<uint32_t, 2> insideGrid{1024, boundary};
+  const bool fp32 = states.layout().target.format == ops::GdnStateFormat::Float32;
+  beginCold(executor, scoring(901, prompt), 0);
+  executor.setDraftContextPlan(901, planDraftContext(0, end, grid));
+  auto captured = prefillChunk(executor, 901, 0, std::span(prompt).first(boundary), pages, {}, grid);
+  require(captured.capturedStates.size() == 1, "grid capture was not returned");
+  const auto checkpoint = captured.capturedStates.back();
+  const auto gridCell = bytesOf(states.current(0).stateBase);
+  const auto oldTail = prefillChunk(executor, 901, boundary, std::span(prompt).subspan(boundary), pages, {}, tail);
+  require(oldTail.capturedStates.size() == 1, "tail capture was not returned beside the grid");
+  executor.end(901);
+  prompt[edit] = chat[(edit + 7) % chat.size()];
+  require(prompt[edit] != chat[edit % chat.size()], "edit fixture did not change a token");
+  beginCold(executor, scoring(902, prompt), 0);
+  executor.setDraftContextPlan(902, planDraftContext(0, end, grid));
+  prefillChunk(executor, 902, 0, std::span(prompt).first(boundary), pages);
+  const auto cold = prefillChunk(executor, 902, boundary, std::span(prompt).subspan(boundary), pages);
+  const auto coldCell = bytesOf(states.current(0).stateBase);
+  const auto coldLengths = states.metadata(0).lengths;
+  beginCold(executor, scoring(903, prompt), 1);
+  restoreActivePrefix(executor, 903, end, boundary, checkpoint);
+  require(bytesOf(states.current(1).stateBase) == gridCell,
+          "grid restore changed GDN convolution, recurrence, PLE history or MTP streams");
+  const uint64_t before = executor.telemetry().targetPrefillRows;
+  const auto replay = prefillChunk(executor, 903, boundary, std::span(prompt).subspan(boundary), pages);
+  require(replay.failure.empty() && cold.failure.empty() && replay.scoreLogits == cold.scoreLogits &&
+              states.metadata(1).lengths == coldLengths && bytesOf(states.current(1).stateBase) == coldCell &&
+              executor.telemetry().targetPrefillRows - before == end - boundary,
+          "grid edit replay did not match the cold edited prompt bitwise");
+  executor.end(903);
+  if (fp32) {
+    // Capture the fallback separately: an inside-command GDN capture splits
+    // its scan. Including it in 901 would change the purported same-partition
+    // reference above, even though both commands have the same outer rows.
+    beginCold(executor, scoring(905, prompt), 1);
+    executor.setDraftContextPlan(905, planDraftContext(0, end, insideGrid));
+    const auto fallback = prefillChunk(executor, 905, 0, std::span(prompt).first(boundary),
+                                      pages, {}, insideGrid);
+    require(fallback.capturedStates.size() == 2, "fallback capture was not returned");
+    executor.end(905);
+    // fp32 register carry survives an arbitrary mid-command split bitwise.
+    beginCold(executor, scoring(904, prompt), 1);
+    restoreActivePrefix(executor, 904, end, 1024, fallback.capturedStates.front());
+    const auto partitioned = prefillChunk(executor, 904, 1024, std::span(prompt).subspan(1024), pages);
+    require(partitioned.failure.empty() && partitioned.scoreLogits == cold.scoreLogits &&
+                states.metadata(1).lengths == coldLengths && bytesOf(states.current(1).stateBase) == coldCell,
+            "fp32 earlier grid restore changed the complete cell or logits bitwise");
+    std::cout << "gdn_grid_partition cell_and_logits=bitwise\n";
+    executor.end(904);
+  }
+  executor.end(902);
+  std::cout << "gdn_grid_edit_replay=PASS shared=" << edit << " restored=" << boundary
+            << " replayed=" << end - boundary << " cell_and_logits=bitwise\n";
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
   try {
     bool imagesOnly = false, warmupEosOnly = false;
+    bool gdnCheckpointsOnly = false;
     kv::Format format = kv::Format::Int8;
     ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
     std::optional<double> givenAneFfnShare;
@@ -2131,7 +2204,8 @@ int main(int argc, char **argv) {
            "[--ane-ffn-share SHARE] [--ane-ffn-fault EVALUATION] [--ple-ssd-cache BYTES]");
     for (int i = 3; i < argc; ++i) {
       const std::string_view option(argv[i]);
-      if (option == "--images-only") imagesOnly = true;
+      if (option == "--gdn-checkpoints-only") gdnCheckpointsOnly = true;
+      else if (option == "--images-only") imagesOnly = true;
       else if (option == "--warmup-eos-only") warmupEosOnly = true;
       else if (option == "--kv-format" && i + 1 < argc) {
         const std::string_view value(argv[++i]);
@@ -2328,6 +2402,13 @@ int main(int argc, char **argv) {
       return 0;
     }
     model::Runtime &executor = *runtime;
+    if (gdnCheckpointsOnly) {
+      const std::array<uint32_t, 16> chat{248045, 8678, 198, 24342, 286, 4879, 369, 716,
+                                         310, 830, 11553, 13, 5044, 1683, 15060, 1472};
+      requireGridCheckpointEditReplay(executor, states, chat);
+      std::cout << "model_runtime_oracle_test: PASS scope=gdn-checkpoints\n";
+      return 0;
+    }
     // Warmup runs on the KV runway and never allocates: without it, after
     // actual state activation, warmupPrefill fails and cleans up.
     pages.releaseExtent(0);
@@ -2492,6 +2573,9 @@ int main(int argc, char **argv) {
     requireNonFiniteRowFailsOnlyItsLane(executor, pages, states, backend, model.hasDraft(),
                                         samplingSeedTokens, prompt128);
     requireThinkingBudgetClosesThinking(executor);
+// This Flash-Next fixture uses GDN composite state and its token IDs.
+    if (std::holds_alternative<model::Qwen4ExpWeights>(model.target))
+      requireGridCheckpointEditReplay(executor, states, samplingSeedTokens);
     requireStatesCapturedInsideCommands(executor, backend, pages, states, aneFfn.get(), model.hasDraft(), samplingSeedTokens);
     requireCapturesOutliveTheirItems(executor, states, samplingSeedTokens);
 

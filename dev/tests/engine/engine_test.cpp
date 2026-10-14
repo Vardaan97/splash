@@ -7501,6 +7501,96 @@ void testDefaultCheckpointRestoresLatestCommittedPrefix() {
 // none is planned within one prefill chunk of where a request resumes or of
 // its replay boundary: not for a follow-up resuming at 2976 whose replay
 // boundary is 4192, nor for one resuming at 4064.
+// Growing turns move the rolling frontier far beyond an old tool result.
+// Only the retained grid can restore the edited conversation's shared prefix.
+void testRetainedGridSurvivesGrowingTurnsAndDeepEdits() {
+  require(retainedCheckpoints(8180, 8200, 8192) == std::vector<uint32_t>{8192} &&
+              retainedCheckpoints(8192, 16384, 8192) == std::vector<uint32_t>{16384} &&
+              retainedCheckpoints(0, 16384, 0).empty() &&
+              retainedCheckpoints(0xfffff000U, 0xffffffffU, 8192).empty(),
+          "retained grid skipped a short crossing, duplicated a resume or overflowed");
+  for (const uint32_t grid : {0U, 8192U, 16384U}) {
+    test::TestKvStorage storage(4096, 4096, 4);
+    KvPool pool(storage, 0);
+    engine::Cache resources(pool, nullptr, nullptr);
+    Executor executor(1);
+    Events events;
+    EngineConfig config = test::engineConfig();
+    config.retainedCheckpointTokens = grid;
+    engine::Engine engine(config, resources, executor, events);
+    guardReleases(storage, engine);
+    double now = 1;
+    const auto finish = [&] {
+      tickUntil(engine, now, [&] { return idle(engine); }, "grid replay did not finish");
+    };
+    std::vector<uint32_t> prompt(30001, 41);
+    engine.submit(request(800, prompt));
+    finish();
+    for (uint64_t id = 801; id <= 804; ++id) {
+      prompt.resize(prompt.size() + 4096, 41);
+      engine.submit(request(id, prompt));
+      finish();
+    }
+    // The earliest edit is off-grid; later cached states must not be used.
+    constexpr uint32_t edit = 19013;
+    std::fill(prompt.begin() + edit, prompt.end(), 42);
+    const uint32_t expected = grid ? edit / grid * grid : 0;
+    require(resources.lookup(prompt, {}).resumeBoundary() == expected,
+            "deep edit did not find the deepest retained state below its shared prefix");
+    const uint64_t before = executor.prefillRows;
+    engine.submit(request(805, prompt));
+    finish();
+    require(events.starts.back() == expected &&
+                executor.prefillRows - before == prompt.size() - expected &&
+                events.failedCount == 0,
+            "deep edit replayed the wrong suffix or failed");
+    if (grid) {
+      // Reclaim is allowed to evict a retained point; lookup falls back to
+      // an earlier one, never to a state beyond the edit.
+      auto held = resources.lookup(std::span(prompt).first(expected + 1), {});
+      const uint64_t block = held.state->kvBlock();
+      const CompositeState *state = held.state->state().get();
+      held = {};
+      resources.discardState(block, state);
+      require(resources.lookup(std::span(prompt).first(expected + 1), {}).resumeBoundary() == expected - grid,
+              "an evicted grid state did not fall back to the preceding retained point");
+    }
+  }
+}
+
+void testRetainedGridAtFullWindowWithARefusedCapture() {
+  for (const uint32_t grid : {8192U, 16384U}) {
+    test::TestKvStorage storage(16384, 4096, 4);
+    KvPool pool(storage, 0);
+    engine::Cache resources(pool, nullptr, nullptr);
+    Executor executor(1);
+    // Refuse a grid point even after reclaim. A missing optional point
+    // must leave a usable earlier restore rather than fail the request.
+    executor.denyReservationAt = 2 * grid;
+    Events events;
+    EngineConfig config = test::engineConfig({.maxContext = 262144});
+    config.retainedCheckpointTokens = grid;
+    engine::Engine engine(config, resources, executor, events);
+    guardReleases(storage, engine);
+    std::vector<uint32_t> prompt(262000, 41);
+    double now = 1;
+    engine.submit(request(810, prompt));
+    tickUntil(engine, now, [&] { return idle(engine); }, "full-window prefill did not finish");
+    require(events.failedCount == 0 && executor.prefillRows == prompt.size(),
+            "a refused full-window grid capture failed or lost prefill rows");
+    std::fill(prompt.begin() + 2 * grid + 17, prompt.end(), 42);
+    const auto lookup = resources.lookup(prompt, {});
+    require(lookup.resumeBoundary() <= grid && lookup.resumeBoundary() < 2 * grid,
+            "a refused grid capture left a restore beyond the valid prefix");
+    const uint64_t before = executor.prefillRows;
+    engine.submit(request(811, prompt));
+    tickUntil(engine, now, [&] { return idle(engine); }, "full-window replay did not finish");
+    require(events.failedCount == 0 &&
+                executor.prefillRows - before == prompt.size() - events.starts.back(),
+            "the full-window edit did not replay exactly its admitted suffix");
+  }
+}
+
 void testCheckpointsSkipNearResumeAndReplayBoundaries() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
@@ -10070,6 +10160,8 @@ int main() {
     testReplayPointWithoutRoomTakesTheCheckpointItsCommandCaptures();
     testShortSuffixContinuesCheckpointDraftState();
     testDefaultCheckpointRestoresLatestCommittedPrefix();
+    testRetainedGridSurvivesGrowingTurnsAndDeepEdits();
+    testRetainedGridAtFullWindowWithARefusedCapture();
     testCheckpointsSkipNearResumeAndReplayBoundaries();
     testDecodeShareValidation();
     testIncompleteConfigIsRefused();
