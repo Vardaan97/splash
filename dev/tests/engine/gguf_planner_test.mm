@@ -461,6 +461,15 @@ void checkDraftHead(const std::filesystem::path &directory) {
             std::adjacent_find(vocabulary.begin(), vocabulary.end()) == vocabulary.end() &&
             vocabulary.back() < model::kQwen4DraftVocabularySource,
         "Qwen3.8's draft vocabulary: its tokens, ascending, within the vocabulary");
+  for (uint32_t size : {32768U, 49152U, 65536U}) {
+    const auto set = model::qwen4DraftVocabulary(size);
+    check(set.size() == size && std::is_sorted(set.begin(), set.end()), "configurable draft vocabulary size");
+    check(std::includes(set.begin(), set.end(), vocabulary.begin(), vocabulary.end()), "larger sets retain 32K tokens");
+    for (uint32_t token : set) check(model::qwen4DraftContains(token, size), "bitmap membership agrees with set");
+    setenv("SPLASH_MTP_DRAFT_VOCAB", std::to_string(size).c_str(), 1);
+    check(model::qwen4DraftTokensFor(248320) == size, "requested vocabulary size");
+  }
+  unsetenv("SPLASH_MTP_DRAFT_VOCAB");
   bool members = std::all_of(vocabulary.begin(), vocabulary.end(), model::inQwen4DraftVocabulary);
   // Token 0 (what a row without a finite logit drafts), the stop tokens and
   // the chat template's, tool-call and thinking tokens.

@@ -18,15 +18,17 @@ struct Qwen4DraftContext final {
   std::vector<uint32_t> tokens;
   std::vector<uint64_t> bits;
   size_t scanned = 0;
+  uint32_t draftTokens = kQwen4DraftVocabularyTokens;
   float misses = 0.0F;
   float observations = 0.0F;
 
   [[nodiscard]] bool contains(uint32_t token) const noexcept {
-    return inQwen4DraftVocabulary(token) ||
+    return qwen4DraftContains(token, draftTokens) ||
            (token / 64 < bits.size() && ((bits[token / 64] >> (token % 64)) & 1));
   }
   void scan(std::span<const uint32_t> history, uint32_t vocabulary,
-            uint32_t capacity = kQwen4DraftContextTokens) {
+            uint32_t capacity = kQwen4DraftContextTokens, uint32_t selected = kQwen4DraftVocabularyTokens) {
+    draftTokens = selected;
     if (bits.empty()) bits.assign((vocabulary + 63) / 64, 0);
     for (; scanned < history.size(); ++scanned) {
       if (tokens.size() >= capacity) {
