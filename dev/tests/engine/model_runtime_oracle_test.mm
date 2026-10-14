@@ -966,7 +966,7 @@ uint64_t requireCapturedWindow(const std::vector<uint8_t> &captured, const std::
 // (--ane-ffn-fault) can stop inside the command that captures the states.
 void requireStatesCapturedInsideCommands(model::Runtime &executor, const metal::MetalBackend &backend,
                                      const kv::PageStorage &pages, const model::QwenStateStorage &states,
-                                     const ops::AneFfn *aneFfn, std::span<const uint32_t> chat) {
+                                     const ops::AneFfn *aneFfn, bool hasDraft, std::span<const uint32_t> chat) {
   constexpr uint32_t split = 480, firstCaptured = 1024, secondCaptured = 2080, end = 2112, longer = 2144;
   require(pages.pageCount() > 120, "the KV pool cannot hold the captured-state fixture");
   std::vector<uint32_t> prompt(longer);
@@ -1045,8 +1045,16 @@ void requireStatesCapturedInsideCommands(model::Runtime &executor, const metal::
               requireCapturedWindow(capturedBytes[1].window, before, after, width, end, secondCaptured, "captured at 2080") == 32 &&
               requireCapturedWindow(capturedBytes[2].window, before, after, width, end, end, "captured at 2112") == 0,
           "captured windows took the wrong positions from the lane's window before the command");
-  require(std::memcmp(before.data(), after.data(), uint64_t{64} * width / 2) != 0,
-          "the command left the slots it overwrote as they were");
+  if (hasDraft)
+    require(std::memcmp(before.data(), after.data(), uint64_t{64} * width / 2) != 0,
+            "the command left the slots it overwrote as they were");
+  else {
+    // Without a draft (nullDraftLayout), no context writer runs. Captures
+    // keep the lane's untouched window, including slots outside their rows.
+    require(before == after, "a target without a draft wrote its context window");
+    for (const StateBytes &captured : capturedBytes)
+      require(captured.window == before, "a target without a draft captured a different context window");
+  }
   require(capturedBytes[2].cell == bytesOf(states.current(1).stateBase) && capturedBytes[2].window == after,
           "the state captured at the command's end is not the lane's");
 
@@ -2482,7 +2490,7 @@ int main(int argc, char **argv) {
     requireNonFiniteRowFailsOnlyItsLane(executor, pages, states, backend, model.hasDraft(),
                                         samplingSeedTokens, prompt128);
     requireThinkingBudgetClosesThinking(executor);
-    requireStatesCapturedInsideCommands(executor, backend, pages, states, aneFfn.get(), samplingSeedTokens);
+    requireStatesCapturedInsideCommands(executor, backend, pages, states, aneFfn.get(), model.hasDraft(), samplingSeedTokens);
     requireCapturesOutliveTheirItems(executor, states, samplingSeedTokens);
 
 
