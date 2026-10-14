@@ -238,6 +238,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/ExecutionPlans.cpp \
 	runtime/ops/GDN.cpp \
 	runtime/ops/Linear.cpp \
+	runtime/ops/LinearPolicy.cpp \
 	runtime/ops/LinearGguf.cpp \
 	runtime/ops/MoE.cpp \
 	runtime/ops/Normalization.cpp \

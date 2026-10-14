@@ -129,6 +129,64 @@ inline void gguf_staged_steps(device bfloat *input, device uchar *w0, device uch
   }
 }
 
+// Deep decode walks retain the baseline's 32-input group order, including
+// rotation and partition boundaries. Two KS-wide stages alternate, loading
+// the next payload before the current matmul consumes its dequantized stage.
+template <class F, ushort Rows, ushort KS, class Acc>
+inline void gguf_staged_deep_steps(device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta,
+                                   uint inputs, uint origin, threadgroup half *stage, threadgroup half2 *tl,
+                                   uint lane, uint sb, uint se, uint sf, thread Acc &acc) {
+  constexpr uint GPS = KS / 32;
+  const uint groups = inputs / 32, units = groups / F::MetaGroups;
+  const uint tile = origin / QUANT_TILE_ROWS, row = origin % QUANT_TILE_ROWS + lane;
+  device uchar *p0 = w0 + (ulong(tile) * groups * QUANT_TILE_ROWS + row) * F::P0;
+  device uchar *p1 = w1 + (ulong(tile) * groups * QUANT_TILE_ROWS + row) * F::P1;
+  device uchar *pm = meta + (ulong(tile) * units * QUANT_TILE_ROWS + row) * F::MetaBytes;
+  auto a = tensor(input, dextents<int, 2>{int(inputs), Rows}, array<int, 2>{1, int(inputs)});
+  constexpr auto descriptor = matmul2d_descriptor(Rows, 32, KS, false, true, false,
+                                                  matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<descriptor, execution_simdgroups<1>> operation;
+  tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt0(stage, dextents<int, 2>{KS, 32}, array<int, 2>{1, KS});
+  tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt1(stage + KS * 32, dextents<int, 2>{KS, 32}, array<int, 2>{1, KS});
+  auto weights0 = bt0.slice<KS, 32>(0, 0), weights1 = bt1.slice<KS, 32>(0, 0);
+  typename F::Payload packed[GPS];
+  typename F::Meta headers[GPS];
+  const auto load = [&](uint first) __attribute__((always_inline)) {
+#pragma unroll
+    for (uint gi = 0; gi < GPS; ++gi) {
+      const uint g = first + gi;
+      packed[gi] = F::load(p0 + ulong(g) * QUANT_TILE_ROWS * F::P0,
+                            p1 + ulong(g) * QUANT_TILE_ROWS * F::P1);
+      headers[gi] = F::loadMeta(pm + ulong(g / F::MetaGroups) * QUANT_TILE_ROWS * F::MetaBytes);
+    }
+  };
+  for (uint run = 0; run < 2; ++run) {
+    uint begin = run ? sb : sf;
+    const uint end = run ? sf : se;
+    if (begin + GPS <= end) load(begin);
+    uint buffer = 0;
+    for (; begin + GPS <= end; begin += GPS, buffer ^= 1) {
+#pragma unroll
+      for (uint gi = 0; gi < GPS; ++gi) {
+        const uint g = begin + gi;
+        dequant32<F>(packed[gi], headers[gi], g % F::MetaGroups, tl,
+                    stage + buffer * KS * 32 + lane * KS + gi * 32);
+      }
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+      if (begin + 2 * GPS <= end) load(begin + GPS);
+      auto values = a.template slice<KS, Rows>(begin * 32, 0);
+      if (buffer) operation.run(values, weights1, acc);
+      else operation.run(values, weights0, acc);
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    if (begin < end) {
+      gguf_staged_steps<F, Rows, 32, 32, 32>(input, w0, w1, meta, inputs, origin, stage, tl,
+                                            lane, begin, end, begin, true, acc);
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+  }
+}
+
 // The decode tile loop of one simdgroup without the store: its Cols columns over steps [step_begin, step_end) of K
 // from step_first.
 template <class F, ushort Rows, ushort Cols, ushort KS, class Acc>

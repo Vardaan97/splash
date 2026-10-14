@@ -215,6 +215,49 @@ kernel void gguf_decode_hcmix(device bfloat *input [[buffer(0)]], device uchar *
       device atomic_uint *, device const bfloat *, device bfloat *, constant GgufDecodeParams &, uint2, uint, uint);
 GGUF_HCMIX(8) GGUF_HCMIX(16) GGUF_HCMIX(32)
 #undef GGUF_HCMIX
+// Q8_0 experimental small projections: preserve the original 64-column
+// rotation even when each half-tile has its own threadgroup and counter.
+template <ushort Rows, ushort KS, ushort Columns, class Out>
+[[max_total_threads_per_threadgroup(Columns)]]
+kernel void gguf_decode_small(device bfloat *input [[buffer(0)]], device uchar *w0 [[buffer(1)]],
+                              device uchar *w1 [[buffer(2)]], device uchar *meta [[buffer(3)]],
+                              device Out *output [[buffer(4)]], device coherent(device) float *partials [[buffer(5)]],
+                              device atomic_uint *counters [[buffer(6)]], device bfloat *aux [[buffer(7)]],
+                              constant GgufDecodeParams &p [[buffer(8)]], uint2 group [[threadgroup_position_in_grid]],
+                              uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+  (void)aux;
+  constexpr uint StageInputs = 2 * KS;
+  threadgroup half stage[Columns * StageInputs];
+  threadgroup half2 tl[1];
+  const uint origin = group.x * Columns + sg * 32, column0 = p.out_offset + origin;
+  const uint per = p.input_size / 32 / p.splits, sb = group.y * per, se = sb + per;
+  const uint sf = staged_first_step(origin / 64, sb, se, p.spread);
+  threadgroup half *my = stage + sg * 32 * StageInputs;
+  auto acc = staged_accumulator<Rows, 32, 32>(input, p.input_size, my);
+  gguf_zero(acc);
+  if constexpr (KS == 32)
+    staged_accumulate<FmtQ80, Rows, 32, 32>(input, w0, w1, meta, p.input_size, origin, my, tl, lane, sb, se, sf, acc);
+  else
+    gguf_staged_deep_steps<FmtQ80, Rows, KS>(input, w0, w1, meta, p.input_size, origin, my, tl, lane, sb, se, sf, acc);
+  // Both simdgroups have consumed their stages before the split arrival
+  // reuses the first word. K128's two stages occupy the full 32 KiB budget.
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  gguf_store_sums<Rows>(acc, p.splits, group.y, partials, counters + p.out_offset / Columns + group.x,
+                        p.out_stride, column0, sg * 32 + lane, reinterpret_cast<threadgroup uint *>(stage), [&](uint row, uint col, float v) {
+    output[ulong(row) * p.out_stride + column0 + col] = Out(v);
+  });
+}
+#define SMALL(R, K, C, suffix, Out) \
+  template [[host_name("gguf_decode_q80_m" #R "_a_" #suffix)]] kernel GgufDecodeKernel<Out> gguf_decode_small<R, K, C, Out>;
+#define SMALL_ROWS(K, C, suffix) \
+  SMALL(8, K, C, suffix, bfloat) SMALL(16, K, C, suffix, bfloat) SMALL(32, K, C, suffix, bfloat) \
+  SMALL(8, K, C, suffix##_f32, float) SMALL(16, K, C, suffix##_f32, float) SMALL(32, K, C, suffix##_f32, float)
+SMALL_ROWS(64, 64, k64)
+SMALL_ROWS(128, 64, k128)
+SMALL_ROWS(32, 32, sg1)
+SMALL_ROWS(64, 32, k64sg1)
+#undef SMALL_ROWS
+#undef SMALL
 
 // Gate/up in one dispatch, where gate and up share their format (ops::Linear, LinearConfig::oneGateUpPass): grid
 // (32-column tiles, K partitions), threadgroups of one simdgroup that stages the gate's and the up's same 32 columns

@@ -37,6 +37,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <random>
@@ -1050,9 +1051,116 @@ void independentProjections(const char *library) {
   section("independent input/indexer projections: B1-B4 and staged K splits bitwise");
 }
 
+// Policy is captured at construction. Apple9 must keep the same plan even
+// with either experimental flag set; explicit plans exercise its kernels below.
+void smallProjectionPolicy(MetalBackend &backend) {
+  const auto saved = [](const char *name) {
+    const char *value = std::getenv(name);
+    return std::pair{value != nullptr, value ? std::string(value) : std::string()};
+  };
+  const auto enabled = saved("SPLASH_SMALL_PROJ"), forced = saved("SPLASH_SMALL_PROJ_TILE");
+  unsetenv("SPLASH_SMALL_PROJ"); unsetenv("SPLASH_SMALL_PROJ_TILE");
+  auto device = backend.capabilities();
+  device.appleGpuFamily = 9;
+  const Linear baseline(device);
+  const Tensor weights = tensor(backend, Q80, 320, 10240);
+  const Projection p = projection({&weights}, 320);
+  for (const char *variant : {"base", "k64", "k128", "sg1", "k64sg1"}) {
+    setenv("SPLASH_SMALL_PROJ", "1", 1); setenv("SPLASH_SMALL_PROJ_TILE", variant, 1);
+    const Linear candidate(device);
+    for (uint32_t rows : {8u, 16u, 24u, 32u}) {
+      const LinearWorkload w{{320, 10240}, rows, LinearPhase::Decode, LinearEpilogue::None};
+      test::require(candidate.plan(w, p).configuration() == baseline.plan(w, p).configuration(),
+                    "Apple9 small projection policy changed");
+    }
+  }
+  device.appleGpuFamily = 10;
+  setenv("SPLASH_SMALL_PROJ_TILE", "k64", 1);
+  const Linear captured(device);
+  setenv("SPLASH_SMALL_PROJ_TILE", "sg1", 1);
+  const LinearWorkload w{{320, 10240}, 8, LinearPhase::Decode, LinearEpilogue::None};
+  const auto config = captured.plan(w, p).configuration();
+  test::require(config.stepInputs == 64 && config.columns == 64,
+                "small projection policy was not captured at construction");
+  const Linear oneSimdgroup(device);
+  for (uint32_t rows : {8u, 16u, 24u, 32u}) {
+    const LinearWorkload work{{320, 10240}, rows, LinearPhase::Decode, LinearEpilogue::None};
+    const auto plan = oneSimdgroup.plan(work, p);
+    const auto bound = oneSimdgroup.decodeScratchSize(p.shape());
+    test::require(plan.configuration().columns == 32 && bound.counters >= plan.scratchSize().counters &&
+                      bound.partials >= plan.scratchSize().partials,
+                  "forced projection exceeds shape-only workspace bounds");
+  }
+  const auto restore = [](const char *name, const auto &value) {
+    if (value.first) setenv(name, value.second.c_str(), 1); else unsetenv(name);
+  };
+  restore("SPLASH_SMALL_PROJ", enabled); restore("SPLASH_SMALL_PROJ_TILE", forced);
+  section("small projection Apple9 policy: no change, B1-B4, every flag/variant");
+}
+
+// Compare the stored bits, including fp32 output (bf16 alone can hide a
+// changed accumulation). Poison split partials and check counter reset on
+// each run. K=2304 exercises odd partitions and rotated tails; K=320 has
+// only splits 1/2 because its ten groups cannot be split into four or eight.
+void smallProjectionTiles(MetalBackend &backend, const Linear &linear) {
+  const auto family = backend.capabilities().appleGpuFamily;
+  std::array<unsigned, 4> tested{}, mismatches{};
+  for (const uint32_t K : {320u, 2304u, 10240u}) {
+    const uint32_t N = K == 320 ? 10240 : 320;
+    const Tensor weights = tensor(backend, Q80, N, K);
+    const Projection p = projection({&weights}, N);
+    const auto values = activations(Inputs::Dense, 32, K);
+    for (const uint32_t rows : {8u, 16u, 24u, 32u})
+      for (const uint32_t splits : kSplits) {
+        if ((K / 32) % splits) continue;
+        for (const bool spread : {false, true}) {
+          const LinearWorkload w{{N, K}, rows, LinearPhase::Decode, LinearEpilogue::None};
+          const LinearConfig base{.tile = LinearTile::GgufStaged, .splits = splits, .spread = spread};
+          for (const FloatOutput type : {FloatOutput::BFloat16, FloatOutput::Float32}) {
+            const auto execute = [&](LinearConfig c) {
+              const auto plan = Linear::plan(w, c, type);
+              const Scratch scratch(backend, plan.scratchSize());
+              scratch.poison(kPoisonNaN);
+              const Guarded input = bfloats(backend, storageRows(values, K, rows, plan.storageRows()));
+              Guarded output(backend, uint64_t(plan.storageRows()) * N * (type == FloatOutput::Float32 ? 4 : 2), 0xFF);
+              CommandGraph graph;
+              static_cast<void>(linear.add(graph, {.input = input.view, .output = output.view,
+                                                   .scratch = scratch.bindings()}, p, plan));
+              static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+              if (!scratch.intact() || !input.intact() || !output.intact()) fail("small projection guards/counters");
+              const auto *bytes = static_cast<const uint8_t *>(output.view.contents());
+              return std::vector<uint8_t>(bytes, bytes + uint64_t(rows) * N * (type == FloatOutput::Float32 ? 4 : 2));
+            };
+            const auto expected = execute(base);
+            unsigned variant = 0;
+            for (const auto [step, columns] : {std::pair{64u, 64u}, {128u, 64u}, {32u, 32u}, {64u, 32u}}) {
+              auto c = base; c.stepInputs = step; c.columns = columns;
+              const auto actual = execute(c);
+              ++tested[variant];
+              if (actual.size() != expected.size() || std::memcmp(actual.data(), expected.data(), expected.size())) {
+                ++mismatches[variant];
+                if (family != 9) fail("small projection bitwise K=" + std::to_string(K) + " rows=" + std::to_string(rows) +
+                     " splits=" + std::to_string(splits) + " spread=" + std::to_string(spread) +
+                     " step=" + std::to_string(step) + " columns=" + std::to_string(columns) +
+                     " fp32=" + std::to_string(type == FloatOutput::Float32));
+              }
+              ++variant;
+            }
+          }
+        }
+      }
+  }
+  constexpr const char *names[] = {"k64", "k128", "sg1", "k64sg1"};
+  for (unsigned i = 0; i < tested.size(); ++i)
+    std::cout << "small-projection family=Apple" << family << " variant=" << names[i]
+              << " cases=" << tested[i] << " mismatches=" << mismatches[i]
+              << " result=" << (mismatches[i] ? (family == 9 ? "UNAVAILABLE" : "FAIL") : "PASS") << '\n';
+  section("small projections: Q8_0, all variants, rows 8/16/24/32, splits 1/2/4/8, both walks and output types");
+}
+
 int main(int argc, char **argv) {
   @autoreleasepool {
-    if (argc != 2) {
+    if (argc != 2 && !(argc == 3 && std::string(argv[2]) == "--small-only")) {
       std::cerr << "usage: gguf-projection <production-and-test.metallib>\n";
       return 2;
     }
@@ -1061,6 +1169,9 @@ int main(int argc, char **argv) {
       MetalBackend backend(argv[1]);
       splash::test::hyperFusionIdentity(backend);
       const Linear linear(backend.capabilities());
+      smallProjectionPolicy(backend);
+      smallProjectionTiles(backend, linear);
+      if (argc == 3) return failures ? 1 : 0;
       for (const LinearTile tile : {LinearTile::GgufRegister, LinearTile::GgufStaged}) {
         decodeTile(backend, linear, tile, false);
         fusedDecode(backend, linear, tile, false);

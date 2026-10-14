@@ -8,6 +8,9 @@
 #include "ops/BufferExtent.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cstdlib>
+#include <cstring>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -227,6 +230,12 @@ void LinearPlan::requireConfiguration() const {
   if (workload_.epilogue == LinearEpilogue::HyperLow &&
       (!decode || c.tile != LinearTile::GgufStaged || destination_ != FloatOutput::BFloat16))
     throw std::invalid_argument("hyper low takes a staged bf16 decode plan");
+  if ((c.stepInputs != 32 && c.stepInputs != 64 && c.stepInputs != 128) ||
+      (c.columns != 32 && c.columns != 64) || (c.stepInputs == 128 && c.columns == 32))
+    throw std::invalid_argument("unsupported small projection tile");
+  if ((c.stepInputs != 32 || c.columns != 64) &&
+      (c.tile != LinearTile::GgufStaged || !decode || workload_.epilogue != LinearEpilogue::None || c.oneGateUpPass))
+    throw std::invalid_argument("small projection tiles take plain staged decode projections");
   if (c.spread && c.tile != LinearTile::GgufStaged)
     throw std::invalid_argument("only the staged block tile spreads its walks");
   if (c.oneGateUpPass && (c.tile != LinearTile::GgufStaged || !decode || workload_.epilogue != LinearEpilogue::GateUp))
@@ -274,7 +283,7 @@ LinearScratchSize LinearPlan::scratchSize() const noexcept {
   if (workload_.epilogue == LinearEpilogue::HyperMix)
     return {0, 0, 0, uint64_t{n / (4 * GGUF_TILE_COLUMNS)} * sizeof(uint32_t)};
   const uint64_t columns = config_.oneGateUpPass ? 2 * uint64_t{n} : n;
-  const uint32_t tile = config_.oneGateUpPass ? GGUF_STAGED_COLUMNS : GGUF_TILE_COLUMNS;
+  const uint32_t tile = config_.oneGateUpPass ? GGUF_STAGED_COLUMNS : config_.columns;
   return config_.splits > 1
       ? LinearScratchSize{0, 0, uint64_t{config_.splits} * storageRows() * columns * sizeof(float),
                           uint64_t{n / tile} * sizeof(uint32_t)}
@@ -298,6 +307,25 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
         ? LinearConfig{.tile = LinearTile::GgufStaged,
                        .splits = decodeSplits(n, k, gpuCores_, stagedTiers(family_))}
         : LinearConfig{.tile = LinearTile::GgufPrefill};
+  // Automatic selection stays disabled until the device sweep validates a rule.
+  // Apple9 always keeps its baseline; explicit configurations still test every tile.
+  const bool eligible = (smallProjectionVariant_ || smallProjectionEnabled_) &&
+      family_ == GpuFamilyClass::Apple10 &&
+      w.epilogue == LinearEpilogue::None && !projections.empty() && projections.front() &&
+      (projections.size() == 1 || (projections.size() == 2 && !projections[1])) &&
+      projections.front()->blocks().segments.size() == 1 &&
+      projections.front()->blocks().segments.front().formatId == GGUF_FMT_Q80;
+  if (eligible) {
+    if (smallProjectionVariant_ > 5) throw std::invalid_argument("unknown small projection tile");
+    if (smallProjectionVariant_) {
+      LinearConfig c = stagedDecode(n, k, gpuCores_, family_);
+      c.spread = spreadsStagedDecode(family_, gpuCores_);
+      if (smallProjectionVariant_ == 2 || smallProjectionVariant_ == 5) c.stepInputs = 64;
+      else if (smallProjectionVariant_ == 3) c.stepInputs = 128;
+      if (smallProjectionVariant_ == 4 || smallProjectionVariant_ == 5) c.columns = 32;
+      return c;
+    }
+  }
   // Apple9 runs matrix operations on the FP32 pipe, so the exact register
   // kernel beats staging but for the projections apple9Stages names.
   if (family_ == GpuFamilyClass::Apple9 && registerFormats && !apple9Stages(w, projections))
@@ -332,6 +360,14 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
 LinearScratchSize Linear::ggufDecodeScratchSize(LinearWorkload w) const {
   const auto [n, k] = w.matrix;
   LinearScratchSize size = LinearPlan(w, ggufBaseline(w)).scratchSize();
+  // Shape-only workspace planning has no projection to select a forced tile.
+  // One-simdgroup variants need twice as many split-arrival counters.
+  if (family_ == GpuFamilyClass::Apple10 && w.epilogue == LinearEpilogue::None &&
+      (smallProjectionEnabled_ || smallProjectionVariant_ == 4 || smallProjectionVariant_ == 5)) {
+    auto small = stagedDecode(n, k, gpuCores_, family_);
+    small.columns = 32;
+    size.include(LinearPlan(w, small).scratchSize());
+  }
   if (family_ == GpuFamilyClass::Apple9) size.include(LinearPlan(w, stagedDecode(n, k, gpuCores_, family_)).scratchSize());
   if (w.epilogue == LinearEpilogue::GateUp && spreadsStagedDecode(family_, gpuCores_))
     size.include(LinearPlan(w, oneGateUpPassDecode(n, k, gpuCores_, family_)).scratchSize());
@@ -438,10 +474,18 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
   }
   const auto tensor = [&](const QuantizedSegment &s, char epilogue, const metal::MetalBuffer &output,
                           const metal::MetalBuffer &aux) {
-    graph.add(kernelInstance(decodeKernel(s.name(), rows, epilogue), plan.destination()),
+    std::string name = decodeKernel(s.name(), rows, epilogue);
+    if (config.stepInputs != 32 || config.columns != 64) {
+      if (s.formatId != GGUF_FMT_Q80 || epilogue != 'a')
+        throw std::invalid_argument("small projection tiles require Q8_0 and no epilogue");
+      const uint32_t step = config.stepInputs == 128 && k == 320 ? 64 : config.stepInputs;
+      name += step == 128 ? "_k128" : step == 64 ?
+              (config.columns == 32 ? "_k64sg1" : "_k64") : "_sg1";
+    }
+    graph.add(kernelInstance(name, plan.destination()),
               {b.input, s.plane0, s.plane1Slot(), s.meta, output, partials, counters, aux},
               GgufDecodeParams{k, splits, n, s.columnOffset, config.spread},
-              {s.outputSize / GGUF_TILE_COLUMNS, splits, 1}, {GGUF_STAGED_THREADS, 1, 1});
+              {s.outputSize / config.columns, splits, 1}, {config.columns, 1, 1});
   };
   if (w.phase == LinearPhase::Prefill) {
     for (const QuantizedSegment &s : segments)
@@ -464,6 +508,8 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
     addDecodeTensor(b, w.epilogue, segments.front(), gate, tensor);
     return;
   }
+  if (config.stepInputs != 32 || config.columns != 64)
+    throw std::invalid_argument("small projection tiles require one segment");
   // Dispatch order is tile order: segments with the most bytes per tile
   // first, so their threadgroups do not form the tail.
   std::vector<const QuantizedSegment *> order;
