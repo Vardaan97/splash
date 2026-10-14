@@ -1,7 +1,11 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
+#include <string_view>
+#include <stdexcept>
 #include <span>
 
 namespace splash::model {
@@ -12,6 +16,41 @@ namespace splash::model {
 // model of the cycle the machine measures, down to drafting nothing.
 inline constexpr uint32_t kMtpPlannerPositions = 7;
 inline constexpr uint32_t kMtpPlannerLanes = 4;
+
+// Rule is the serving default; cost and per-lane rule are explicit experiments.
+enum class MtpDepthPolicy { Rule, Cost, Lane };
+inline MtpDepthPolicy mtpDepthPolicyFromEnvironment() {
+  const char *value = std::getenv("SPLASH_MTP_DEPTH");
+  if (!value || !*value || std::string_view(value) == "rule") return MtpDepthPolicy::Rule;
+  if (std::string_view(value) == "cost") return MtpDepthPolicy::Cost;
+  if (std::string_view(value) == "lane") return MtpDepthPolicy::Lane;
+  throw std::invalid_argument("SPLASH_MTP_DEPTH must be rule, cost or lane");
+}
+inline std::array<float, 4> mtpWorthwhileFromEnvironment() {
+  std::array<float, 4> result{0.30F, 0.35F, 0.40F, 0.45F};
+  const char *value = std::getenv("SPLASH_MTP_WORTHWHILE");
+  if (!value || !*value) return result;
+  for (size_t i = 0; i < result.size(); ++i) {
+    char *end = nullptr;
+    const float threshold = std::strtof(value, &end);
+    if (end == value || !(threshold > 0 && threshold < 1))
+      throw std::invalid_argument("invalid SPLASH_MTP_WORTHWHILE threshold");
+    result[i] = threshold;
+    if (!*end) {
+      if (i == 0) { result.fill(threshold); return result; }
+      if (i == 3) return result;
+      break;
+    }
+    if (*end != ',') break;
+    value = end + 1;
+  }
+  throw std::invalid_argument("SPLASH_MTP_WORTHWHILE takes one or four thresholds");
+}
+inline uint32_t mtpRuleDepth(float rate, uint32_t maximum, float threshold = 0.30F) {
+  uint32_t steps = 1;
+  for (float reach = rate * rate; steps < maximum && reach >= threshold; reach *= rate) ++steps;
+  return std::max(steps, std::min(2U, maximum));
+}
 
 // Component parameters: production uses these defaults, tests can shorten
 // probe/exploration intervals and choose an explicit prior. Zero disables

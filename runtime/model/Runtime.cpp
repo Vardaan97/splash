@@ -436,15 +436,10 @@ struct Runtime::Impl {
   // only its live rows to experts (verifyLiveRows), its row's experts in the
   // verify too, so a lane drafts while r^k stays at least 0.3, and at least
   // two: all seven at r = 0.9, five at 0.8 and two at 0.6.
-  static constexpr float kMtpWorthwhile = 0.3F;
   // How much of a lane's acceptance counts survives each cycle.
   static constexpr float kMtpDecay = 0.8F;
-  uint32_t mtpStepsFor(const Request &entry) const {
-    if (!mtpAdaptive) return mtpDraftSteps;
-    const float rate = entry.mtpAccepted / entry.mtpJudged;
-    uint32_t steps = 1;
-    for (float reach = rate * rate; steps < mtpDraftSteps && reach >= kMtpWorthwhile; reach *= rate) ++steps;
-    return std::max(steps, std::min(2U, mtpDraftSteps));
+  uint32_t mtpStepsFor(const Request &entry, float threshold = 0.30F) const {
+    return mtpAdaptive ? mtpRuleDepth(entry.mtpAccepted / entry.mtpJudged, mtpDraftSteps, threshold) : mtpDraftSteps;
   }
   // The rows of each lane a verify after the MTP head's draft routes to
   // Qwen3.8-Flash-Next's experts: the anchor and the lane's drafted
@@ -482,15 +477,8 @@ struct Runtime::Impl {
     entry.mtpAcceptance.record(entry.mtpDrafted, kept);
     entry.mtpDrafted = 0;
   }
-  // How the MTP head's depth is chosen (SPLASH_MTP_DEPTH): by the cost model
-  // (planMtpDepths, the default), or, "rule", every lane as deep as the
-  // deepest lane's mtpStepsFor. SPLASH_MTP_ADAPTIVE=0 fixes it at
-  // SPLASH_MTP_DRAFTS either way.
-  bool mtpCostDepth = mtpCostDepthFromEnvironment();
-  static bool mtpCostDepthFromEnvironment() {
-    const char *value = std::getenv("SPLASH_MTP_DEPTH");
-    return !value || std::string_view(value) != "rule";
-  }
+  MtpDepthPolicy mtpDepthPolicy = mtpDepthPolicyFromEnvironment();
+  std::array<float, 4> mtpWorthwhile = mtpWorthwhileFromEnvironment();
   // Cycles a lane drafts nothing before it drafts one proposal to measure
   // its acceptance again; and at its configured exploration interval, a planned cycle of a
   // lone greedy lane drafts one more or one fewer than its plan, so the
@@ -560,7 +548,10 @@ struct Runtime::Impl {
     const bool draftVocabulary = useDraftVocabulary(entries);
     if (!mtpAdaptive) {
       depths.fill(mtpDraftSteps);
-    } else if (sampled || !mtpCostDepth) {
+    } else if (mtpDepthPolicy == MtpDepthPolicy::Lane) {
+      for (uint32_t lane = 0; lane < lanes; ++lane)
+        depths[lane] = mtpStepsFor(*entries[lane], mtpWorthwhile[lanes - 1]);
+    } else if (sampled || mtpDepthPolicy != MtpDepthPolicy::Cost) {
       uint32_t steps = 1;
       for (const Request *entry : entries) steps = std::max(steps, mtpStepsFor(*entry));
       depths.fill(steps);
@@ -584,6 +575,15 @@ struct Runtime::Impl {
       if (lanes == 1 && !lookupChosen[0])
         depths[0] = exploreMtpDepth(depths[0], mtpDraftSteps, mtpPlannedCycles, mtpParameters.exploreCycles);
     }
+    // In rule/lane mode lookup replaces a head chain only when its measured
+    // first-token accuracy is eligible and its continuation covers that chain.
+    // Cost mode keeps its throughput planner's selection.
+    if (mtpDepthPolicy != MtpDepthPolicy::Cost && !sampled)
+      for (uint32_t lane = 0; lane < lanes; ++lane)
+        if (lookupCounts[lane] >= depths[lane] && lookupCounts[lane] > 0) {
+          lookupChosen[lane] = true;
+          depths[lane] = 0;
+        }
     uint32_t steps = 0, laneSteps = 0;
     for (uint32_t lane = 0; lane < lanes; ++lane) {
       Request &entry = *entries[lane];
