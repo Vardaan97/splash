@@ -113,9 +113,29 @@ using GgufDecodeKernel = void(device bfloat *, device uchar *, device uchar *, d
   GGUF_DECODE_ROWS(F, f, a, EpNone, bfloat) GGUF_DECODE_ROWS(F, f, a_f32, EpNone, float)                          \
   GGUF_DECODE_ROWS(F, f, r, EpResidual, bfloat) GGUF_DECODE_ROWS(F, f, g, EpUpWithGate, bfloat)
 QUANT_FORMATS(GGUF_DECODE_FORMAT)
+
 #undef GGUF_DECODE_FORMAT
 #undef GGUF_DECODE_ROWS
 #undef GGUF_DECODE
+
+template <ushort Rows>
+[[max_total_threads_per_threadgroup(GGUF_STAGED_THREADS)]]
+kernel void gguf_decode_low(device bfloat *input [[buffer(0)]], device uchar *w0 [[buffer(1)]],
+    device uchar *w1 [[buffer(2)]], device uchar *meta [[buffer(3)]], device bfloat *output [[buffer(4)]],
+    device coherent(device) float *partials [[buffer(5)]], device atomic_uint *counters [[buffer(6)]],
+    device bfloat *aux [[buffer(7)]], constant GgufDecodeParams &p [[buffer(8)]],
+    uint2 group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup half2 tl[1];
+  threadgroup half stage[kStagedStages];
+  threadgroup uint arrival;
+  gguf_decode_tile<FmtQ80, Rows, EpHyperLow>(input, w0, w1, meta, output, partials, counters, aux,
+                                           p, group, lane, sg, stage, tl, &arrival);
+}
+#define GGUF_LOW(R) \
+  template [[host_name("gguf_decode_q80_m" #R "_l")]] kernel GgufDecodeKernel<bfloat> gguf_decode_low<R>;
+GGUF_LOW(8) GGUF_LOW(16) GGUF_LOW(32)
+#undef GGUF_LOW
 
 // Gate/up in one dispatch, where gate and up share their format (ops::Linear, LinearConfig::oneGateUpPass): grid
 // (32-column tiles, K partitions), threadgroups of one simdgroup that stages the gate's and the up's same 32 columns

@@ -51,7 +51,7 @@ struct LinearMatrix final {
 void requireSegmentPlanes(const QuantizedSegment &segment, std::string_view what, uint32_t planeInputs = 0);
 
 enum class LinearPhase : uint8_t { Prefill, Decode };
-enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };
+enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate, HyperLow };
 // The tiles run 64 columns per threadgroup; a one-pass gate/up
 // (LinearConfig::oneGateUpPass) runs 32 columns of both tensors per
 // threadgroup of one simdgroup. The staged tiles, GgufStaged and GgufPrefill,
@@ -240,6 +240,9 @@ public:
   [[nodiscard]] LinearPlan decodePlan(const Projection &projection, uint32_t lanes,
                                       LinearEpilogue epilogue = LinearEpilogue::None,
                                       const Projection *gate = nullptr) const;
+  // Whether a projection can apply this hyper epilogue in its decode store.
+  [[nodiscard]] bool supportsHyperEpilogue(const Projection &projection, uint32_t lanes,
+                                            LinearEpilogue epilogue) const;
   // The scratch of every decode plan of a projection of `shape`: each lane
   // count, the None, Residual and GateUp epilogues and every tile the device
   // may run them on, and the rotated rows of a full decode batch.

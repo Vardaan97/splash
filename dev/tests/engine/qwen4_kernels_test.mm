@@ -1,3 +1,4 @@
+#include "HyperFusionIdentity.hpp"
 // Qwen3.8-Flash-Next's own kernels (kernels/shared/qwen4.metal and
 // qwen4_qsa.metal) through ops::Qwen4, against fp64 CPU references of
 // llama.cpp's qwen4exp graph:
@@ -923,6 +924,7 @@ int main(int argc, const char *argv[]) {
         if (std::getenv("MTL_SHADER_VALIDATION")) throw std::runtime_error("bitwise runs without shader validation");
         hyperNormShapeTest(backend, true);
       } else {
+        splash::test::hyperFusionIdentity(backend);
         hyperTest(backend);
         hyperTableTest(backend);
         hyperNormShapeTest(backend, !std::getenv("MTL_SHADER_VALIDATION"));

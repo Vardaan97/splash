@@ -1,3 +1,4 @@
+#include "HyperFusionIdentity.hpp"
 // GGUF projections through ops::Linear (runtime/ops/LinearGguf.cpp) in every format a tile takes (the register tile
 // all but F16, quant_register_format), against fp64 references over GGML's dequantized weights
 // (GgufFormatReference.hpp). Each check forces its tile with Linear::plan(workload, config), so every GPU runs both
@@ -99,6 +100,7 @@ const char *epilogueName(LinearEpilogue e) {
     case LinearEpilogue::Residual: return "residual";
     case LinearEpilogue::GateUp: return "gate/up";
     case LinearEpilogue::UpWithGate: return "up-with-gate";
+    case LinearEpilogue::HyperLow: return "hyper-low";
   }
   return "?";
 }
@@ -366,6 +368,9 @@ void checkValues(const Outcome &out, const std::vector<Dot> &dots, const std::ve
       const uint64_t i = uint64_t{r} * columns + c;
       const Interval p = projected(dots[i], staged);
       switch (w.epilogue) {
+        case LinearEpilogue::HyperLow:
+          fail(label + ": hyper epilogues require the bitwise identity fixture");
+          return;
         case LinearEpilogue::None: check("the output", i, out.output[i], p); break;
         case LinearEpilogue::Residual:
           check("the output", i, out.output[i], withResidual(p, bf16ToFloat(aux[i])));
@@ -1050,6 +1055,7 @@ int main(int argc, char **argv) {
     try {
       independentProjections(argv[1]);
       MetalBackend backend(argv[1]);
+      splash::test::hyperFusionIdentity(backend);
       const Linear linear(backend.capabilities());
       for (const LinearTile tile : {LinearTile::GgufRegister, LinearTile::GgufStaged}) {
         decodeTile(backend, linear, tile, false);

@@ -949,8 +949,18 @@ ops::PreparedInput QwenTarget::addQwen4VerifyMix(VerifyStep &step, const Qwen4Hy
   ops::PreparedInput prepared = ops::Qwen4::addNorm(step.graph, std::move(streams), hyper.norm, hyper.inject,
                                                     h.normalized, h.weights, hs, step.rows, scratch,
                                                     layout(hyper.down));
-  project(h.normalized, hyper.down, h.low, std::move(prepared));
-  prepared = ops::Qwen4::addLow(step.graph, h.low, hs, step.rows, scratch, layout(hyper.up));
+  const bool fuseLow = (ops::hyperFusionBits() & 1) && hs.streams == 4 &&
+      linear.supportsHyperEpilogue(hyper.down, step.lanes, ops::LinearEpilogue::HyperLow) &&
+      layout(hyper.up) == ops::LinearInput::Plain;
+  if (fuseLow) {
+    linear.add(step.graph, {.input = h.normalized, .output = h.low, .scratch = scratch,
+                            .prepared = std::move(prepared)}, hyper.down,
+               linear.decodePlan(hyper.down, step.lanes, ops::LinearEpilogue::HyperLow));
+    prepared = {};
+  } else {
+    project(h.normalized, hyper.down, h.low, std::move(prepared));
+    prepared = ops::Qwen4::addLow(step.graph, h.low, hs, step.rows, scratch, layout(hyper.up));
+  }
   project(h.low, hyper.up, h.gate, std::move(prepared));
   return ops::Qwen4::addMix(step.graph, h.normalized, h.gate, std::move(output), hs, step.rows, scratch,
                             next ? layout(*next) : ops::LinearInput::Plain);

@@ -162,11 +162,11 @@ uint32_t segmentColumns(const Projection &p) {
 // input (the output for a plain projection, which reads none): 'r' adds the
 // residual, 'g' multiplies silu(gate) from the gate scratch.
 char epilogueSuffix(LinearEpilogue epilogue) noexcept {
-  return epilogue == LinearEpilogue::None ? 'a' : epilogue == LinearEpilogue::Residual ? 'r' : 'g';
+  return epilogue == LinearEpilogue::HyperLow ? 'l' : epilogue == LinearEpilogue::None ? 'a' : epilogue == LinearEpilogue::Residual ? 'r' : 'g';
 }
 const metal::MetalBuffer &epilogueInput(const LinearBuffers &b, LinearEpilogue epilogue) noexcept {
   return epilogue == LinearEpilogue::Residual ? b.residual
-       : epilogue == LinearEpilogue::None     ? b.output
+       : (epilogue == LinearEpilogue::None || epilogue == LinearEpilogue::HyperLow) ? b.output
                                               : b.gateScratch;
 }
 
@@ -217,6 +217,9 @@ void LinearPlan::requireConfiguration() const {
   const uint32_t k = workload_.matrix.inputSize;
   const LinearConfig &c = config_;
   const bool decode = workload_.phase == LinearPhase::Decode;
+  if (workload_.epilogue == LinearEpilogue::HyperLow &&
+      (!decode || c.tile != LinearTile::GgufStaged || destination_ != FloatOutput::BFloat16))
+    throw std::invalid_argument("hyper low takes a staged bf16 decode plan");
   if (c.spread && c.tile != LinearTile::GgufStaged)
     throw std::invalid_argument("only the staged block tile spreads its walks");
   if (c.oneGateUpPass && (c.tile != LinearTile::GgufStaged || !decode || workload_.epilogue != LinearEpilogue::GateUp))
@@ -334,6 +337,9 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
   requireSegments(p, w.matrix);
   if (gate) requireSegments(*gate, w.matrix);
   const std::vector<QuantizedSegment> &segments = p.blocks().segments;
+  if (w.epilogue == LinearEpilogue::HyperLow &&
+      (segments.size() != 1 || segments.front().formatId != GGUF_FMT_Q80))
+    throw std::invalid_argument("hyper low takes one Q8_0 tensor");
   // The fused kernels have no fp32 instance.
   if (plan.destination() == FloatOutput::Float32 && segments.size() > 1)
     throw std::invalid_argument("an fp32 destination takes a single-tensor block projection");

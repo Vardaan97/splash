@@ -17,6 +17,9 @@ struct Qwen4MtpContext;
 
 namespace splash::ops {
 
+// Opt-in decode epilogues: low=1, mix=2, combine=4. Unset or invalid is off.
+[[nodiscard]] uint32_t hyperFusionBits() noexcept;
+
 struct HyperShape final {
   uint32_t hidden = 0;
   uint32_t streams = 0;

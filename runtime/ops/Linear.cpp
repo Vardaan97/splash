@@ -167,6 +167,12 @@ LinearPlan Linear::decodePlan(const Projection &p, uint32_t lanes, LinearEpilogu
                               const Projection *gate) const {
   return plan(decode({p.outputSize, p.inputSize}, lanes, epilogue), p, gate);
 }
+bool Linear::supportsHyperEpilogue(const Projection &p, uint32_t lanes, LinearEpilogue epilogue) const {
+  if (epilogue != LinearEpilogue::HyperLow || p.blocks().segments.size() != 1 ||
+      p.blocks().segments.front().formatId != GGUF_FMT_Q80)
+    return false;
+  return decodePlan(p, lanes).configuration().tile == LinearTile::GgufStaged;
+}
 LinearPlan Linear::prefillPlan(const Projection &p, uint32_t rows, LinearEpilogue epilogue) const {
   return plan({{p.outputSize, p.inputSize}, rows, LinearPhase::Prefill, epilogue}, p);
 }

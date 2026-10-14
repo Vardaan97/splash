@@ -4,12 +4,20 @@
 #include "metal/abi/Qwen4.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace splash::ops {
+
+uint32_t hyperFusionBits() noexcept {
+  const char *value = std::getenv("SPLASH_HYPER_FUSION");
+  return value && value[0] >= '0' && value[0] <= '7' && value[1] == '\0'
+      ? uint32_t(value[0] - '0') : 0;
+}
+
 namespace {
 
 constexpr uint32_t kThreads = QWEN4_ROW_THREADS;
