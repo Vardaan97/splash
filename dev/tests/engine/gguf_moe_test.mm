@@ -1053,14 +1053,70 @@ int routingLoads(MetalBackend &backend) {
 
 } // namespace
 
+// Compare live routes by their routeRows map: tile padding and descriptor
+// order intentionally differ between M32 and M64.
+int prefillM64(MetalBackend &backend) {
+  constexpr uint32_t maximum = 2048;
+  Buffers b;
+  b.moe.residual = zeros(backend, uint64_t{maximum} * kHidden * 2, "residual");
+  b.moe.output = zeros(backend, uint64_t{maximum} * kHidden * 2, "output");
+  const MoeShape shape{kHidden, kExperts, kTopK, kIntermediate};
+  std::vector<uint32_t> counts;
+  for (uint32_t live = 1; live <= 64; ++live) counts.push_back(live);
+  for (uint32_t rows : {65u, 127u, 263u, 512u, 1024u, 2048u}) counts.push_back(rows);
+  for (const Fmt f : {IQ4XS, IQ4NL, Q4K, Q5K, Q80}) {
+    for (bool fused : {false, true}) {
+      const Model m = makeModel(backend, f, fused);
+      for (bool concentrated : {false, true}) {
+        auto x = activations(uint64_t{maximum} * kHidden);
+        if (concentrated)
+          for (uint32_t row = 1; row < maximum; ++row)
+            std::copy_n(x.begin(), kHidden, x.begin() + uint64_t{row} * kHidden);
+        b.moe.input = bfloatBuffer(backend, x, "input");
+        for (uint32_t rows : counts) {
+          std::vector<uint8_t> expected;
+          for (auto tile : {MoeExpertTile::M32, MoeExpertTile::M64}) {
+            const auto plan = MoE::prefillPlan(shape, rows, MoeConfig{tile});
+            allocate(backend, b, plan);
+            CommandGraph graph;
+            MoE::add(graph, b.moe, m.weights, plan);
+            static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+            std::vector<uint8_t> bytes;
+            const auto append = [&](const void *data, size_t n) {
+              auto p = static_cast<const uint8_t *>(data);
+              bytes.insert(bytes.end(), p, p + n);
+            };
+            append(b.moe.output.contents(), uint64_t{rows} * kHidden * 2);
+            append(b.moe.scratch.selectedExperts.contents(), uint64_t{rows} * kRoutes * 4);
+            append(b.moe.scratch.routingWeights.contents(), uint64_t{rows} * kRoutes * 4);
+            const auto *map = static_cast<const uint32_t *>(b.moe.scratch.routeRows.contents());
+            for (uint32_t route = 0; route < rows * kRoutes; ++route) {
+              append(static_cast<const uint16_t *>(b.moe.scratch.expertIntermediate.contents()) +
+                         uint64_t{map[route]} * kIntermediate, kIntermediate * 2);
+              append(static_cast<const uint16_t *>(b.moe.scratch.expertOutput.contents()) +
+                         uint64_t{map[route]} * kHidden, kHidden * 2);
+            }
+            if (tile == MoeExpertTile::M32) expected = std::move(bytes);
+            else require(expected == bytes, "m64 live-route memcmp format=" + std::to_string(f) +
+                          " rows=" + std::to_string(rows) + " concentrated=" + std::to_string(concentrated));
+          }
+        }
+      }
+    }
+  }
+  std::cout << "prefill-m64: PASS (live routes, intermediates, outputs, tails 1-64, rows through 2048)\n";
+  return 0;
+}
+
 int main(int argc, const char *argv[]) {
   @autoreleasepool {
-    if (argc != 2) {
+    if (argc != 2 && !(argc == 3 && std::string_view(argv[2]) == "--prefill-m64")) {
       std::cerr << "usage: gguf_moe_test <metallib>\n";
       return 2;
     }
     try {
       MetalBackend backend(argv[1]);
+      if (argc == 3) return prefillM64(backend);
       splash::test::moeHyperIdentity(backend);
       bufferExtents(backend);
       const int failures = floatProjection(backend) + floatSegments(backend, 64) + floatSegments(backend, 96) +

@@ -116,3 +116,88 @@ using MoeExpertGgufGateUpKernel = void(device bfloat *, device const MoeTileDesc
                                        uint2, uint, uint);
 template [[host_name("moe_expert_gguf_m8_gate_up")]] kernel MoeExpertGgufGateUpKernel moe_expert_gguf_gate_up<8>;
 template [[host_name("moe_expert_gguf_m32_gate_up")]] kernel MoeExpertGgufGateUpKernel moe_expert_gguf_gate_up<32>;
+
+// Both row simdgroups dequantize the same 64-column stage. A simdgroup
+// without live rows still participates in every staging barrier.
+template <ushort R, class Acc>
+inline void moe_m64_accumulate(MoeGgufSegment s, device bfloat *x, uint k, uint origin,
+                               threadgroup half *stage, threadgroup half2 *tl,
+                               uint lane, uint sg, bool live, thread Acc &acc) {
+  quant_format_switch(s.format, [&](auto format) {
+    using F = decltype(format);
+    quant_pair_table<F>(tl, sg * 32 + lane, GGUF_MOE_PREFILL_THREADS);
+    gguf_staged_steps<F, R, GGUF_TILE_COLUMNS, GGUF_PREFILL_STEP, GGUF_MOE_PREFILL_THREADS>(
+        x, s.w0, s.w1, s.meta, k, origin, stage, tl, sg * 32 + lane, 0,
+        k / GGUF_PREFILL_STEP, 0, live, acc);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  });
+}
+
+template <GgufEpilogue Ep>
+[[max_total_threads_per_threadgroup(GGUF_MOE_PREFILL_THREADS)]]
+kernel void moe_expert_gguf_m64(device bfloat *input [[buffer(0)]],
+    device const MoeTileDescriptor *tiles [[buffer(1)]], device const uint *count [[buffer(2)]],
+    device uchar *w0 [[buffer(3)]], device uchar *w1 [[buffer(4)]], device uchar *meta [[buffer(5)]],
+    device uchar *sw0 [[buffer(6)]], device uchar *sw1 [[buffer(7)]], device uchar *smeta [[buffer(8)]],
+    device bfloat *output [[buffer(9)]], device bfloat *aux [[buffer(10)]],
+    constant MoeGgufExpertParams &p [[buffer(11)]], uint2 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+  if (group.y >= *count) return;
+  threadgroup half stage[2 * GGUF_TILE_COLUMNS * GGUF_PREFILL_STEP];
+  threadgroup half2 tl[kQuantPairTableEntries];
+  const auto tile = tiles[group.y];
+  const auto s = moe_gguf_segment(tile.expert, p, w0, w1, meta, sw0, sw1, smeta);
+  const uint row = sg * GGUF_PREFILL_SIMDGROUP_ROWS, origin = group.x * GGUF_TILE_COLUMNS;
+  device bfloat *x = input + (ulong(group.y) * GGUF_MOE_PREFILL_ROWS + row) * p.input_size;
+  const auto run = [&](auto rows) {
+    constexpr ushort R = decltype(rows)::value;
+    auto acc = staged_accumulator<R, GGUF_TILE_COLUMNS, GGUF_PREFILL_STEP>(x, p.input_size, stage);
+    gguf_zero(acc);
+    moe_m64_accumulate<R>(s, x, p.input_size, origin, stage, tl, lane, sg, row < tile.rows, acc);
+    if (row < tile.rows) gguf_elements(acc, [&](uint r, uint c, float v) {
+      const ulong o = (ulong(group.y) * GGUF_MOE_PREFILL_ROWS + row + r) * p.output_size + origin + c;
+      output[o] = gguf_epilogue<Ep>(v, aux, o);
+    });
+  };
+  moe_live_rows<GGUF_PREFILL_SIMDGROUP_ROWS>(tile.rows, run);
+}
+template [[host_name("moe_expert_gguf_m64_a")]] kernel MoeExpertGgufKernel moe_expert_gguf_m64<EpNone>;
+template [[host_name("moe_expert_gguf_m64_g")]] kernel MoeExpertGgufKernel moe_expert_gguf_m64<EpUpWithGate>;
+
+[[max_total_threads_per_threadgroup(GGUF_MOE_PREFILL_THREADS)]]
+kernel void moe_expert_gguf_m64_gate_up(device bfloat *input [[buffer(0)]],
+    device const MoeTileDescriptor *tiles [[buffer(1)]], device const uint *count [[buffer(2)]],
+    device uchar *gw0 [[buffer(3)]], device uchar *gw1 [[buffer(4)]], device uchar *gm [[buffer(5)]],
+    device uchar *gsw0 [[buffer(6)]], device uchar *gsw1 [[buffer(7)]], device uchar *gsm [[buffer(8)]],
+    device uchar *uw0 [[buffer(9)]], device uchar *uw1 [[buffer(10)]], device uchar *um [[buffer(11)]],
+    device uchar *usw0 [[buffer(12)]], device uchar *usw1 [[buffer(13)]], device uchar *usm [[buffer(14)]],
+    device bfloat *output [[buffer(15)]], constant MoeGgufExpertParams &p [[buffer(16)]],
+    uint2 group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+  if (group.y >= *count) return;
+  threadgroup half stage[2 * GGUF_TILE_COLUMNS * GGUF_PREFILL_STEP];
+  threadgroup half2 tl[kQuantPairTableEntries];
+  const auto tile = tiles[group.y];
+  const auto g = moe_gguf_segment(tile.expert, p, gw0, gw1, gm, gsw0, gsw1, gsm);
+  const auto u = moe_gguf_segment(tile.expert, p, uw0, uw1, um, usw0, usw1, usm);
+  const uint row = sg * GGUF_PREFILL_SIMDGROUP_ROWS, origin = group.x * GGUF_TILE_COLUMNS;
+  device bfloat *x = input + (ulong(group.y) * GGUF_MOE_PREFILL_ROWS + row) * p.input_size;
+  const auto run = [&](auto rows) {
+    constexpr ushort R = decltype(rows)::value;
+    auto gate = staged_accumulator<R, GGUF_TILE_COLUMNS, GGUF_PREFILL_STEP>(x, p.input_size, stage);
+    auto up = staged_accumulator<R, GGUF_TILE_COLUMNS, GGUF_PREFILL_STEP>(x, p.input_size, stage);
+    gguf_zero(gate); gguf_zero(up);
+    moe_m64_accumulate<R>(g, x, p.input_size, origin, stage, tl, lane, sg, row < tile.rows, gate);
+    moe_m64_accumulate<R>(u, x, p.input_size, origin, stage, tl, lane, sg, row < tile.rows, up);
+    if (row < tile.rows) {
+#pragma unroll
+      for (ushort i = 0; i < up.get_capacity(); ++i) {
+        if (!up.is_valid_element(i)) continue;
+        const auto index = up.get_multidimensional_index(i);
+        const ulong o = (ulong(group.y) * GGUF_MOE_PREFILL_ROWS + row + index[1]) * p.output_size + origin + index[0];
+        output[o] = bfloat(float(bfloat(up[i])) * splash_silu(float(bfloat(gate[i]))));
+      }
+    }
+  };
+  moe_live_rows<GGUF_PREFILL_SIMDGROUP_ROWS>(tile.rows, run);
+}

@@ -6,6 +6,7 @@
 #include "ops/PagedAttention.hpp"
 
 #include <span>
+#include "metal/MoePrefillPolicy.hpp"
 
 namespace splash::ops {
 
@@ -47,6 +48,8 @@ private:
 
   Linear linear_;
   GpuFamilyClass family_;
+  metal::MoePrefillChoice moePrefillChoice_;
+  bool moeM64Verified_;
 };
 
 } // namespace splash::ops

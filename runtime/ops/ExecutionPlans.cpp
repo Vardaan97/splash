@@ -24,7 +24,8 @@ void include(Workspace &bound, const Workspace &required,
 } // namespace
 
 ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device)
-    : linear_(device), family_(gpuFamilyClass(device.appleGpuFamily)) {}
+    : linear_(device), family_(gpuFamilyClass(device.appleGpuFamily)),
+      moePrefillChoice_(metal::moePrefillChoice()), moeM64Verified_(device.moePrefillM64Verified) {}
 
 PrefillAttentionPlan ExecutionPlans::prefillAttention(
     uint32_t rows, uint32_t queryHeads, kv::Layout layout) const {
@@ -48,6 +49,20 @@ MoeConfig ExecutionPlans::moeConfig(MoeShape shape, uint32_t rows, MoePhase phas
   config.ggufTile = moeGgufTile(family_, shape);
   config.expertTile =
       phase == MoePhase::Prefill ? moeGgufPrefillTile(shape, rows, config.ggufTile) : MoeExpertTile::M8;
+  // Restrict the experiment to the two measured model geometries. Apple9
+  // keeps its existing policy even when the opt-in is set.
+  const bool model = (shape.hiddenSize == 2560 && shape.experts == 512 &&
+                      shape.expertsPerToken == 10 && shape.expertIntermediateSize == 640) ||
+                     (shape.hiddenSize == 2048 && shape.experts == 256 &&
+                      shape.expertsPerToken == 8 && shape.expertIntermediateSize == 512);
+  if (phase == MoePhase::Prefill && rows > 32 && model && family_ == GpuFamilyClass::Apple10 &&
+      config.ggufTile == MoeGgufTile::Staged) {
+    if (moePrefillChoice_ == metal::MoePrefillChoice::M32) config.expertTile = MoeExpertTile::M32;
+    if (moeM64Verified_ && (moePrefillChoice_ == metal::MoePrefillChoice::M64 ||
+        (moePrefillChoice_ == metal::MoePrefillChoice::Auto &&
+         uint64_t{rows} * shape.expertsPerToken >= uint64_t{24} * shape.experts)))
+      config.expertTile = MoeExpertTile::M64;
+  }
   config.ggufRouterTile = linear_.ggufFloatTile(rows, shape.experts);
   return config;
 }

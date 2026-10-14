@@ -32,6 +32,7 @@ struct DeviceCapabilities {
     // the total thread count for every dispatch.
     uint64_t maxThreadgroupWidth = 0;
     bool hasUnifiedMemory = false;
+    bool moePrefillM64Verified = false;
 
     [[nodiscard]] bool meetsMinimumMacos() const noexcept {
         return macosMajor > kMinimumMacosMajor ||

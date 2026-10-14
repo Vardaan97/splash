@@ -137,3 +137,7 @@ struct GgufFloatParams {
   uint32_t out_offset;  // first destination column
 };
 static_assert(sizeof(GgufFloatParams) == 20, "GGUF float parameters are 20 bytes on both sides");
+
+// Experimental expert prefill tile: two row simdgroups share both stages.
+#define GGUF_MOE_PREFILL_ROWS 64u
+#define GGUF_MOE_PREFILL_THREADS 64u

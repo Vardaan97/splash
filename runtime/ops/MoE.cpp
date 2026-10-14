@@ -208,7 +208,7 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
   // of a decode cycle, a 12-core M6 0.1-1.0% and a 40-core M3 Max up to 4.8%.
   const bool oneGateUp = oneGateUpPass(weights, plan);
   const MoeGroupParams group{rows, shape.expertsPerToken, tileRows, shape.experts,
-                             shape.expertIntermediateSize / (oneGateUp ? GGUF_STAGED_COLUMNS : GGUF_TILE_COLUMNS),
+                             shape.expertIntermediateSize / (oneGateUp && tileRows != GGUF_MOE_PREFILL_ROWS ? GGUF_STAGED_COLUMNS : GGUF_TILE_COLUMNS),
                              shape.hiddenSize / GGUF_TILE_COLUMNS, plan.rowsInPlace(),
                              (firstRow || dropsLast) ? SPLASH_TARGET_VERIFY_ROWS : 0, firstRow, lastRowBytes};
   graph.add(wide ? "moe_group_routes_e512" : "moe_group_routes",

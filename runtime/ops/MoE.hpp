@@ -146,7 +146,7 @@ inline constexpr auto kMoeWorkspaceFields = [] {
 // The tile applies to grouping, gather and the expert passes together;
 // changing it never changes the physical rows in a command. Plans run their
 // passes on M8 tiles, or on M32 tiles to prefill (moeGgufPrefillTile).
-enum class MoeExpertTile : uint8_t { M8 = 8, M32 = 32 };
+enum class MoeExpertTile : uint8_t { M8 = 8, M32 = 32, M64 = 64 };
 
 // The expert tile of GGUF plans, which run grouped passes (gate, up with
 // silu(gate), down; the staged tile runs gate and up in one pass where they
