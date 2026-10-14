@@ -2,8 +2,8 @@
 // tile, on the device policy's walk) at one to four lanes and every K split, the measurements behind the split tiers
 // of runtime/ops/LinearGguf.cpp:
 //   gguf-projection-benchmark <metallib> <fmt[+fmt+fmt]> <N[+N+N]> <K> [none|residual|gateup] [rounds]
-//                             [prefill=R[,R...]]
-// The projection has one segment per format and width (up to three, fused, no epilogue), each a multiple of 256
+//                             [prefill=R[,R...]|variants=base,k64,k128,sg1,k64sg1]
+// The projection has one segment per format and width (up to three, fused, no epilogue), each a multiple of 64
 // columns. With prefill=, it times the 128-row prefill tile instead, one case per chunk of R rows (more than 32: the
 // decode tiles run the smaller chunks) of a single segment; gateup is then the up projection's gated epilogue. The
 // weights stay DRAM-cold: a command streams every copy of a ring of at least 384 MiB once, each projection with the
@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <iostream>
@@ -35,7 +36,7 @@ using splash::metal::MetalBuffer;
 namespace {
 
 constexpr uint64_t kRingBytes = 384ull << 20;
-constexpr uint32_t kMinimumCopies = 3, kMaximumCopies = 64, kMaximumLanes = 4, kLaneRows = 8;
+constexpr uint32_t kMinimumCopies = 3, kMaximumCopies = 256, kMaximumLanes = 4, kLaneRows = 8;
 constexpr double kWarmupSeconds = 0.1;
 
 std::vector<std::string> split(const std::string &text, char separator) {
@@ -64,10 +65,11 @@ struct Case {
 int main(int argc, char **argv) {
   @autoreleasepool {
     const std::string prefillOption = "prefill=";
-    const bool prefill = argc == 8;
-    if (argc < 5 || argc > 8 || (prefill && std::string(argv[7]).rfind(prefillOption, 0))) {
+    const bool prefill = argc == 8 && std::string(argv[7]).starts_with(prefillOption);
+    const bool variants = argc == 8 && std::string(argv[7]).starts_with("variants=");
+    if (argc < 5 || argc > 8 || (argc == 8 && !prefill && !variants)) {
       std::cerr << "usage: gguf-projection-benchmark <metallib> <fmt[+fmt+fmt]> <N[+N+N]> <K> "
-                   "[none|residual|gateup] [rounds] [prefill=R[,R...]]\n";
+                   "[none|residual|gateup] [rounds] [prefill=R[,R...]|variants=base,k64,k128,sg1,k64sg1]\n";
       return 2;
     }
     const std::vector<std::string> formats = split(argv[2], '+'), widths = split(argv[3], '+');
@@ -101,7 +103,7 @@ int main(int argc, char **argv) {
       for (size_t i = 0; i < formats.size(); ++i) {
         const Fmt f = fmtNamed(formats[i]);
         const uint32_t n = uint32_t(std::stoul(widths[i]));
-        if (f == FMT_COUNT || !n || n % 256 || !K || K % 256) throw std::invalid_argument("bad segment " + formats[i]);
+        if (f == FMT_COUNT || !n || n % 64 || !K || K % (32 * kQuantFormats[f].meta_groups) || K % 64) throw std::invalid_argument("bad segment " + formats[i]);
         images.push_back({f, n, N, repack(f, makeNative(f, n, K, rng), n, K, nullptr)});
         N += n;
         for (const std::vector<uint8_t> *plane : {&images.back().planes.w0, &images.back().planes.w1,
@@ -131,22 +133,36 @@ int main(int argc, char **argv) {
         cases.push_back({"R" + std::to_string(rows), "prefill128", Linear::plan(w, config, FloatOutput::BFloat16),
                          config == linear.plan(w, ring.front()).configuration(), {}});
       }
+      if (variants && (epilogue != LinearEpilogue::None ||
+          !std::all_of(images.begin(), images.end(), [](const Image &i) { return i.format == Q80; })))
+        throw std::invalid_argument("tile variants take plain Q8_0 projections; fused Q8_0 shapes are baseline controls");
+      const auto variantNames = variants && images.size() == 1 ? split(std::string(argv[7]).substr(9), ',') : std::vector<std::string>{"base"};
+      for (const auto &variant : variantNames) {
+      if (variant != "base" && variant != "k64" && variant != "k128" && variant != "sg1" && variant != "k64sg1")
+        throw std::invalid_argument("unknown tile variant " + variant);
       for (uint32_t lanes = 1; lanes <= kMaximumLanes && !prefill; ++lanes) {
         const LinearWorkload w{{N, K}, lanes * kLaneRows, LinearPhase::Decode, epilogue};
         const LinearConfig policy = linear.plan(w, ring.front()).configuration();
         for (const LinearTile tile : {LinearTile::GgufRegister, LinearTile::GgufStaged})
           for (uint32_t splits = 1; splits <= LinearConfig::kMaximumSplits; splits *= 2) {
             const bool registerTile = tile == LinearTile::GgufRegister;
+            if (variants && (registerTile || (lanes != 1 && lanes != 4))) continue;
             // The register tile takes the formats of quant_register_format only.
             if (registerTile && !std::all_of(images.begin(), images.end(),
                                              [](const Image &i) { return quant_register_format(i.format); }))
               continue;
             if (registerTile ? K / 256 < splits : (K / 32) % splits) continue;
-            const LinearConfig config{.tile = tile, .splits = splits, .spread = !registerTile && policy.spread};
+            LinearConfig config = variants ? policy : LinearConfig{};
+            config.tile = tile; config.splits = splits; config.spread = !registerTile && policy.spread;
+            if (variants) {
+              config.stepInputs = variant == "k128" ? 128 : (variant == "k64" || variant == "k64sg1") ? 64 : 32;
+              config.columns = variant == "sg1" || variant == "k64sg1" ? 32 : 64;
+            }
             cases.push_back({"L" + std::to_string(lanes),
-                             std::string(registerTile ? "register" : "staged") + " S" + std::to_string(splits),
+                             (variants ? variant : std::string(registerTile ? "register" : "staged")) + " S" + std::to_string(splits),
                              Linear::plan(w, config, FloatOutput::BFloat16), config == policy, {}});
           }
+      }
       }
       // Buffers of the widest plan; the scratch of the plan that needs the most.
       LinearScratchSize size;
@@ -196,7 +212,9 @@ int main(int argc, char **argv) {
         Case &c = cases[i];
         if (!i || c.line != cases[i - 1].line) std::printf("%s  %s", i ? "\n" : "", c.line.c_str());
         std::sort(c.ms.begin(), c.ms.end());
-        std::printf(" | %s%s %.4f", c.label.c_str(), c.chosen ? "*" : "", c.ms[c.ms.size() / 2]);
+        const double ms = c.ms[c.ms.size() / 2];
+        std::printf(" | %s%s %.6f %.2f GB/s", c.label.c_str(), c.chosen ? "*" : "", ms,
+                    bytes * (epilogue == LinearEpilogue::GateUp ? 2 : 1) / (ms * 1e6));
       }
       std::printf("\n");
     } catch (const std::exception &e) {
