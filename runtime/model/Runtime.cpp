@@ -552,7 +552,7 @@ struct Runtime::Impl {
       if (!mtpLookup || !PromptLookup::usableLane(samplingEnabled(entry), samplingPolicy(entry).thinkingCutoff.has_value())) continue;
       entry.lookup.sync(entry.tokens, samplingEnabled(entry), samplingPolicy(entry).thinkingCutoff.has_value(), mtpLookupScan);
       uint32_t matched = 0;
-      entry.lookupTokens = entry.lookup.propose(entry.tokens, *entry.pendingToken, mtpDraftSteps, &matched);
+      entry.lookupTokens = entry.lookup.propose(entry.tokens, *entry.pendingToken, mtpDraftSteps, mtpLookupBuckets ? &matched : nullptr);
       entry.lookupBucket = lookupMatchBucket(matched);
       if (!lookupAccuracy(entry).eligible()) continue;
       lookupCounts[lane] = static_cast<uint32_t>(entry.lookupTokens.size());
@@ -1371,10 +1371,11 @@ struct Runtime::Impl {
         const uint32_t anchor = i ? tokens[i - 1] : *entry.pendingToken;
         entry.lookup.sync(entry.tokens, samplingEnabled(entry), samplingPolicy(entry).thinkingCutoff.has_value(), mtpLookupScan);
         uint32_t matched = 0;
-        const auto proposal = entry.lookup.propose(entry.tokens, anchor, mtpDraftSteps, &matched);
+        const auto proposal = entry.lookup.propose(entry.tokens, anchor, mtpDraftSteps, mtpLookupBuckets ? &matched : nullptr);
         entry.lookupAcceptance.record(proposal, tokens[i]);
-        for (uint32_t bucket = 0; bucket < entry.lookupBuckets.size(); ++bucket)
-          entry.lookupBuckets[bucket].record(bucket == lookupMatchBucket(matched) ? std::span<const uint32_t>(proposal)
+        if (mtpLookupBuckets)
+          for (uint32_t bucket = 0; bucket < entry.lookupBuckets.size(); ++bucket)
+            entry.lookupBuckets[bucket].record(bucket == lookupMatchBucket(matched) ? std::span<const uint32_t>(proposal)
                                                                                  : std::span<const uint32_t>{}, tokens[i]);
         entry.tokens.push_back(anchor);
       }
