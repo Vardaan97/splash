@@ -38,7 +38,7 @@ with open('/tmp/m5-gpu.lock', 'a') as lock:
         if validation: arm_env['MTL_SHADER_VALIDATION']='1'
         for name,command in (
             ('u2',[str(root/'build/splash'),'--kernel-selftest',str(root/'build/splash.metallib')]),
-            ('u3',[str(root/'build/engine-tests/prefill-attention-variants'),str(root/'build/splash.metallib'),'--full']),
+            ('u3',[str(root/('build/engine-tests/prefill-qsa-compact' if package == 'PF7' else 'build/engine-tests/prefill-attention-variants')),str(root/'build/splash.metallib'),'--full']),
             ('u5',[str(root/'build/engine-tests/mtp-runtime'),str(root/'build/splash.metallib')])):
             with (out/f'{name}-sv{int(validation)}.log').open('w') as log:
                 subprocess.run(command,stdout=log,stderr=subprocess.STDOUT,check=True,env=arm_env)
