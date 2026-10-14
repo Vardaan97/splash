@@ -1,3 +1,4 @@
+#include "metal/DispatchPolicy.hpp"
 // GGUF projections: plan policy and dispatch (kernels/shared/gguf_linear.metal,
 // kernels/decode/linear_gguf_sgmatrix.metal).
 #include "Linear.hpp"
@@ -338,13 +339,22 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
     throw std::invalid_argument("an fp32 destination takes a single-tensor block projection");
   if (std::any_of(segments.begin(), segments.end(), [](const QuantizedSegment &s) { return s.isFloat(); })) {
     // The quantized segments, which precede the float ones, run the plan's tiles.
+    const size_t floatBegin = graph.dispatches().size();
     addGgufFloatSegments(graph, b, p, plan);
+    const size_t quantBegin = graph.dispatches().size();
     BlockWeights weights{segments};
     std::erase_if(weights.segments, [](const QuantizedSegment &s) { return s.isFloat(); });
     if (!weights.segments.empty()) {
       Projection quantized(p.outputSize, p.inputSize, std::move(weights));
       quantized.rotation = p.rotation;
       addGguf(graph, b, quantized, plan, gate);
+      // requireSegments proves disjoint packed columns. Float kernels use
+      // no split scratch; allow only a single quantized dispatch, unrotated
+      // plain input (no in-place normalization/preparation dependency).
+      if (metal::decodeDispatchSite(8) && w.rows <= 32 && !p.rotation && !gate &&
+          w.epilogue == LinearEpilogue::None && quantBegin > floatBegin &&
+          graph.dispatches().size() == quantBegin + 1)
+        graph.independent(floatBegin, graph.dispatches().size());
     }
     return;
   }

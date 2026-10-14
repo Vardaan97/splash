@@ -82,6 +82,9 @@ void independentDispatches(const char *library) {
     auto left = backend.view(storage, 0, count * sizeof(uint32_t));
     auto right = backend.view(storage, count * sizeof(uint32_t), count * sizeof(uint32_t));
     for (bool encoded : {false, true}) {
+        for (int seed = -1; seed < 8; ++seed) {
+          if (seed < 0) unsetenv("SPLASH_DISPATCH_VERIFY");
+          else setenv("SPLASH_DISPATCH_VERIFY", ("shuffle:" + std::to_string(seed)).c_str(), 1);
         for (bool independent : {false, true}) {
           for (bool events : {false, true}) {
             std::fill_n(static_cast<uint32_t *>(source.contents()), count, 7);
@@ -112,6 +115,8 @@ void independentDispatches(const char *library) {
           }
         }
     }
+    }
+    unsetenv("SPLASH_DISPATCH_VERIFY");
 }
 
 struct TemporaryMetallib final {

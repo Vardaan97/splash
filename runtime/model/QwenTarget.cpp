@@ -7,6 +7,7 @@
 #include "model/SparseRowStore.hpp"
 #include "ops/Qwen4.hpp"
 #include "metal/abi/Qwen4.h"
+#include "metal/DispatchPolicy.hpp"
 #include "model/WeightStore.hpp"
 #include "ops/AneFfn.hpp"
 #include "ops/Embedding.hpp"
@@ -974,8 +975,7 @@ void QwenTarget::addQwen4VerifyAttention(VerifyStep &step, const Qwen4ExpLayerWe
   const Qwen4IndexerWeights &indexer = *layer.indexer;
   addIndexerProjection(step.graph, linear, b.normalized, indexer.query, h.indexerQuery, step.rows);
   addIndexerProjection(step.graph, linear, b.normalized, indexer.key, h.indexerKey, step.rows);
-  const char *dispatchMode = std::getenv("SPLASH_DECODE_DISPATCH");
-  if (dispatchMode && std::string_view(dispatchMode) == "1") {
+  if (metal::decodeDispatchSite(1)) {
     // All three read normalized and immutable weights. The indexer writes
     // only indexerQuery/indexerKey, never linear scratch or fullPacked.
     // Multi-dispatch linear plans keep their internal ordering; only the
@@ -1045,8 +1045,13 @@ void QwenTarget::addQwen4Verify(VerifyStep &step, const Qwen4ExpWeights &weights
       const Qwen4PleWeights &ple = *layer.ple;
       const ops::PleShape ps = pleShape(geometry_);
       addPleGather(step.graph, h, rows * geometry_.pleHeads());
+      const size_t keyBegin = step.graph.dispatches().size();
       project(h.pleRows, ple.key, h.gate);
+      const size_t valueBegin = step.graph.dispatches().size();
       project(h.pleRows, ple.value, h.pleValue);
+      if (metal::decodeDispatchSite(16) && valueBegin == keyBegin + 1 &&
+          step.graph.dispatches().size() == valueBegin + 1)
+        step.graph.independent(keyBegin, step.graph.dispatches().size());
       ops::Qwen4::addPleGate(step.graph, h.gate, h.pleValue, h.streams, ple.keyNorm, ple.queryNorm,
                              ple.convolutionNorm, h.pleGated, h.pleConvolution, ps, rows);
       // Each lane's eight rows after its history; the commit writes the
@@ -1111,11 +1116,16 @@ void QwenTarget::addQwen4MtpVerify(VerifyStep &step, const Qwen4ExpWeights &weig
   const ops::Linear &linear = operators_.linear();
   const ops::HyperShape hs = hyperShape(geometry_);
   const uint32_t rows = step.rows, hidden = geometry_.hiddenSize, width = geometry_.streamWidth();
+  const size_t inputsBegin = step.graph.dispatches().size();
   for (uint32_t lane = 0; lane < step.lanes; ++lane)
     ops::Qwen4::addMtpInput(step.graph, rowsOf<uint16_t>(backend_, embedding, lane * laneRows, laneRows, hidden),
                             mtpCarried(b.pleHistories[lane]),
                             rowsOf<float>(backend_, history, lane * laneRows, laneRows, width), mtp.embedNorm,
                             mtp.hiddenNorm, h.mtpInput, hs, laneRows, limit, lane * laneRows, rows);
+  // Input writes stream-major slices [lane*8, lane*8+8) in each
+  // stream; history/carried buffers are read-only, no linear scratch.
+  if (metal::decodeDispatchSite(32) && step.lanes > 1)
+    step.graph.independent(inputsBegin, step.graph.dispatches().size());
   // The eh projection of the streams' rows, then the fp32 streams. The
   // streams' rows are consecutive, so under SPLASH_HOST_WINS streams go
   // together into one decode projection of up to the batch limit's lanes of
@@ -1236,11 +1246,16 @@ void QwenTarget::addMtpDraft(metal::CommandGraph &graph, QwenTargetVerifyBuffers
                                     buffers.draftContextLogits, buffers.draftContextTokens,
                                     buffers.draftContextInfo, confidence, info);
     }
-    if (j < steps)
+    if (j < steps) {
+      const size_t carryBegin = graph.dispatches().size();
       for (uint32_t lane = 0; lane < lanes; ++lane)
         ops::Qwen4::addMtpCarry(graph, rowsOf<float>(backend_, h.mtpStreams, lane * laneRows, j, width),
                                 rowsOf<float>(backend_, h.mtpHistory, lane * laneRows + j - 1, 1, width), {},
                                 hyperShape(geometry_), j);
+      // Distinct history slices, no scratch or page-table writes.
+      if (metal::decodeDispatchSite(32) && lanes > 1)
+        graph.independent(carryBegin, graph.dispatches().size());
+    }
   }
 }
 
