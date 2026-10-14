@@ -1,4 +1,5 @@
 #include "ops/AttentionPolicy.hpp"
+#include "ops/PrefillCompactPolicy.hpp"
 // Times Splash's production attention kernels on one layer of Page32 KV
 // across cache lengths, for the prefill chunk (2048 rows), and the DFlash
 // verify batch (8 rows per lane, one and four lanes). Each case builds the same
@@ -219,8 +220,10 @@ std::vector<Case> measure(std::span<metal::MetalBackend *> backends,
       mask.words = words;
     }
     attentionPipeBaseline(i != 0);
+    prefillCompactBaseline(i != 0);
     graphs.push_back(caseGraph(*fixtures.back(), prefill, std::move(mask)));
     attentionPipeBaseline(false);
+    prefillCompactBaseline(false);
     results[i].kvBytes = historyBytes(plan);
   }
   // Warm every variant, then alternate order to limit clock/thermal drift.
@@ -385,8 +388,10 @@ int main(int argc, const char *argv[]) {
     std::vector<metal::MetalBackend *> backends{&backend};
     if (!comparisonLibrary.empty()) {
       attentionPipeBaseline(true);
+      prefillCompactBaseline(true);
       comparison = std::make_unique<metal::MetalBackend>(comparisonLibrary);
       attentionPipeBaseline(false);
+      prefillCompactBaseline(false);
       backends.push_back(comparison.get());
     }
     std::cerr << "device " << backend.capabilities().deviceName << ", one attention layer, "

@@ -1,4 +1,5 @@
 #include "ops/AttentionPolicy.hpp"
+#include "ops/PrefillCompactPolicy.hpp"
 #include "model/Runtime.hpp"
 #include "model/PrefillPolicy.hpp"
 #include "AwakeClock.hpp"
@@ -3431,6 +3432,7 @@ Runtime::prefillAsync(const BatchPlan &plan,
           const float *row = contents<float>(
               impl->decodeArena->get(lane, DecodeTensor::Logits),
               "score logits");
+          ops::capturePrefillDistribution(row, impl->geometry.target.vocabularySize);
           result.scoreLogits.reserve(entry.scoreTokens.size());
           for (uint32_t token : entry.scoreTokens) {
             const float logit = row[token];

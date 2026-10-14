@@ -1,5 +1,6 @@
 #include "ops/PagedAttention.hpp"
 #include "ops/AttentionPolicy.hpp"
+#include "ops/PrefillCompactPolicy.hpp"
 
 #include "metal/abi/RoPE.h"
 #include "ops/BufferExtent.hpp"
@@ -162,9 +163,14 @@ PrefillAttentionPlan PagedAttention::prefillPlan(
   const uint32_t tiles = (rows + tileRows - 1) / tileRows;
   const uint32_t splits = prefillSplits(kv::prefillAttentionTiles(rows));
   const uint32_t fusedRows = tileRows * (queryHeads / layout.kvHeads);
-  return {rows, splits,
-          attentionWorkspace(uint64_t{tiles} * splits * layout.kvHeads * fusedRows,
-                             layout.headDimension),
+  auto workspace = attentionWorkspace(uint64_t{tiles} * splits * layout.kvHeads * fusedRows,
+                                       layout.headDimension);
+  if (prefillCompactRequested() && queryHeads == 24 && layout.kvHeads == 2) {
+    const auto compact = prefillCompactWorkspace(rows);
+    workspace.partialsBytes = std::max(workspace.partialsBytes, compact.partialsBytes);
+    workspace.statisticsBytes = std::max(workspace.statisticsBytes, compact.statisticsBytes);
+  }
+  return {rows, splits, workspace,
           attentionPipePipeline(layout.format == kv::Format::BFloat16
               ? pipeline(kernel, "prefill_attention_bf16_split",
                          "prefill_attention_bf16_split_kv2_g8")
@@ -225,8 +231,14 @@ AttentionWorkspace PagedAttention::prefillWorkspace(
   uint64_t slots = 0;
   for (uint32_t tiles = 1; tiles <= kv::prefillAttentionTiles(maximumRows); ++tiles)
     slots = std::max(slots, uint64_t{tiles} * prefillSplits(tiles));
-  return attentionWorkspace(slots * kv::kPrefillAttentionTileRows * queryHeads,
-                             layout.headDimension);
+  auto bound = attentionWorkspace(slots * kv::kPrefillAttentionTileRows * queryHeads,
+                                  layout.headDimension);
+  if (prefillCompactRequested() && queryHeads == 24 && layout.kvHeads == 2) {
+    const auto compact = prefillCompactWorkspace(maximumRows);
+    bound.partialsBytes = std::max(bound.partialsBytes, compact.partialsBytes);
+    bound.statisticsBytes = std::max(bound.statisticsBytes, compact.statisticsBytes);
+  }
+  return bound;
 }
 
 AttentionWorkspace PagedAttention::verifyWorkspace(
@@ -405,6 +417,10 @@ void PagedAttention::addPrefill(
       chunk.committed_tokens, chunk.chunk_tokens, chunk.chunk_stride,
       chunk.page_table_entries, layer, plan.splits};
   const std::string splitName(plan.splitPipeline);
+  if (prefillCompactReady() && mask.words && plan.queryHeads == 24 && plan.layout.kvHeads == 2) {
+    addPrefillCompact(graph, layer, queries, output, partials, statistics, pageTable, chunk, mask, plan.layout.format);
+    return;
+  }
   if (masked(plan.splitPipeline))
     graph.add(splitName,
               {std::move(queries), partials, statistics, std::move(pageTable)}, params,

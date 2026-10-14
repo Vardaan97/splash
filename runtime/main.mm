@@ -418,6 +418,7 @@ int main(int argc, char **argv) {
     try {
       if ((argc == 2 || argc == 3) && std::string_view(argv[1]) == "--kernel-selftest") {
         setenv("SPLASH_KERNEL_SELFTEST", "1", 1);
+        setenv("SPLASH_PREFILL_QSA_COMPACT", "validate", 1);
         const std::string library = argc == 3 ? argv[2] :
             (std::filesystem::path(argv[0]).parent_path() / "splash.metallib").string();
         splash::metal::MetalBackend backend(library);

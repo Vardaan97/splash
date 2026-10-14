@@ -240,6 +240,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/metal/MoePrefillPolicy.cpp \
 	runtime/metal/MoePrefillSelfTest.cpp \
 	runtime/ops/AttentionPolicy.cpp \
+	runtime/ops/PrefillCompactPolicy.cpp \
 	runtime/ops/AneFfn.cpp \
 	runtime/ops/AneFfnCalibration.cpp \
 	runtime/ops/AneFfnMeasurement.cpp \

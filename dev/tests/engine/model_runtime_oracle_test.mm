@@ -1,5 +1,7 @@
 #include "HyperRuntimeFixture.hpp"
 #include "LinearNumerics.hpp"
+#include "../../benchmarks/DecodeProfileInput.hpp"
+#include <fstream>
 #include "TestChecks.hpp"
 #include "ane/ProgramInstrumentation.hpp"
 #include "engine/RuntimeResources.hpp"
@@ -2408,13 +2410,21 @@ int main(int argc, char **argv) {
     // --ple-ssd-cache BYTES: a Qwen3.8-Flash-Next target's PLE table streams
     // from its file through a cache of BYTES, as splash serve's option does;
     // its TOKENS line equals the resident table's.
+    std::vector<uint32_t> longPrompt;
+    uint32_t longWindow = 16384, longStride = 64;
     model::ModelLoadOptions loadOptions;
     if (argc < 3)
       fail("usage: model-runtime-oracle METALLIB MODEL_ROOT [--kv-format int8|bf16] [--state-format fp32|bf16] "
            "[--ane-ffn-share SHARE] [--ane-ffn-fault EVALUATION] [--ple-ssd-cache BYTES]");
     for (int i = 3; i < argc; ++i) {
       const std::string_view option(argv[i]);
-      if (option == "--gdn-checkpoints-only") gdnCheckpointsOnly = true;
+      if (option == "--long-prompt-file" && i + 1 < argc) {
+        std::ifstream input(argv[++i]);
+        longPrompt = splash::bench::profilePrompt(input);
+      } else if (option == "--long-score-stride" && i + 1 < argc) {
+        longStride = static_cast<uint32_t>(std::stoul(argv[++i]));
+        require(longStride > 0 && longStride <= 2048, "invalid long-score stride");
+      } else if (option == "--gdn-checkpoints-only") gdnCheckpointsOnly = true;
       else if (option == "--images-only") imagesOnly = true;
       else if (option == "--warmup-eos-only") warmupEosOnly = true;
       else if (option == "--kv-format" && i + 1 < argc) {
@@ -2492,9 +2502,12 @@ int main(int argc, char **argv) {
     // A pool of 128 pages, or the smallest extent if larger, in whole extents
     // of the size the memory plan would pick for it.
     const kv::Layout kvLayout = model.targetKvLayout(format);
-    const uint32_t budgetPages = std::max(128U, kvLayout.minimumExtentPages());
+    const uint32_t neededPages = longPrompt.empty() ? 128u :
+        static_cast<uint32_t>((longPrompt.size() + kv::kPageTokens - 1) / kv::kPageTokens);
+    const uint32_t budgetPages = std::max(neededPages, kvLayout.minimumExtentPages());
     const uint32_t extentPages = kvLayout.extentPagesFor(budgetPages);
-    const uint32_t pageCount = budgetPages - budgetPages % extentPages;
+    const uint32_t pageCount = longPrompt.empty() ? budgetPages - budgetPages % extentPages :
+        (budgetPages + extentPages - 1) / extentPages * extentPages;
     // A dense target's prefill FFN splits with the Neural Engine as a start
     // splits it (engine::startAneFfn), calibrated by the build's first run and
     // remembered for the runs after it unless a share is given,
@@ -2615,6 +2628,39 @@ int main(int argc, char **argv) {
       return 0;
     }
     model::Runtime &executor = *runtime;
+    if (!longPrompt.empty()) {
+      require(longPrompt.size() > longWindow && longPrompt.size() <= automaticContext,
+              "long prompt is outside the admitted model context");
+      const auto table = pageRange(0, neededPages);
+      std::shared_ptr<const CompositeState> checkpoint;
+      uint32_t boundary = 0, captured = 0;
+      const uint32_t start = static_cast<uint32_t>(longPrompt.size()) - longWindow;
+      for (uint32_t end = start + longStride; end <= longPrompt.size(); end += longStride) {
+        const uint64_t id = 1000000 + captured;
+        EngineRequest request = makeRequest(id, {longPrompt.begin(), longPrompt.begin() + end}, 0);
+        request.scoreTokens = {0, 1}; // raw full head is captured by the diagnostic hook
+        beginCold(executor, request, 0);
+        if (checkpoint) restoreActivePrefix(executor, id, end, boundary, checkpoint);
+        ModelStepResult result;
+        for (uint32_t position = boundary; position < end;) {
+          const uint32_t count = std::min(2048u, end - position);
+          const std::array<uint32_t, 1> at{end};
+          result = prefillChunk(executor, id, position, std::span(longPrompt).subspan(position, count), table,
+                                {}, position + count == end ? std::span<const uint32_t>(at) : std::span<const uint32_t>{});
+          require(result.failure.empty(), "long capture request failed: " + result.failure);
+          position += count;
+        }
+        require(result.finished && result.capturedStates.size() == 1 && result.scoreLogits.size() == 2,
+                "long capture lacks complete score/checkpoint");
+        checkpoint = result.capturedStates[0];
+        boundary = end;
+        executor.end(id);
+        ++captured;
+      }
+      std::cout << "PASS long-context-capture rows=" << captured << " context=" << longPrompt.size()
+                << " window=" << longWindow << " stride=" << longStride << '\n';
+      return 0;
+    }
     if (gdnCheckpointsOnly) {
       const std::array<uint32_t, 16> chat{248045, 8678, 198, 24342, 286, 4879, 369, 716,
                                          310, 830, 11553, 13, 5044, 1683, 15060, 1472};
