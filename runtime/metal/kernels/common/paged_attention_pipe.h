@@ -102,7 +102,8 @@ inline void splash_paged_attention_pipe_tile(
       if (next < page_end) {
         const auto nt = addressing.page(page_table[next]);
         auto nkt = tensor(nt.keys, dextents<int, 2>{D, N}, array<int, 2>{1, D});
-        qk.run(q0, nkt.template slice<D, N>(0, 0), page_scores);
+        auto next_keys = nkt.template slice<D, N>(0, 0);
+        qk.run(q0, next_keys, page_scores);
         auto nst = tensor(scores + (1u - parity) * M * N,
                           dextents<int, 2>{N, M}, array<int, 2>{1, N});
         page_scores.store(nst.template slice<N, M>(0, 0));
