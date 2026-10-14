@@ -259,8 +259,10 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
         LinearBuffers group = b;
         group.input = view(b.input, begin, k);
         group.output = view(b.output, begin, n);
-        group.residual = view(b.residual, begin, n);
-        group.gateScratch = view(b.gateScratch, begin, n);
+        if (w.epilogue == LinearEpilogue::Residual)
+          group.residual = view(b.residual, begin, n);
+        if (w.epilogue == LinearEpilogue::UpWithGate)
+          group.gateScratch = view(b.gateScratch, begin, n);
         add(graph, group, p, groupPlan);
       }
       return {};
