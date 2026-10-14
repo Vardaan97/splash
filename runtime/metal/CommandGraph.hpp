@@ -7,6 +7,7 @@
 #include <cstring>
 #include <deque>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -85,6 +86,25 @@ public:
   }
   void wait(SharedEvent event, uint64_t value) {
     step(std::move(event), value, EventStep::Kind::Wait);
+  }
+
+  // The caller proves that [begin, end) has no RAW, WAR or WAW dependency,
+  // including aliased views, scratch and buffers reached through pointers.
+  // All earlier work completes before the group; all its work completes
+  // before the next ordinary dispatch. No access-mode inference is made.
+  void independent(size_t begin, size_t end) {
+    if (begin >= end || end > dispatches_.size())
+      throw std::invalid_argument("invalid independent dispatch range");
+    for (const EventStep &event : events_)
+      if (event.before > begin && event.before < end)
+        throw std::invalid_argument("independent dispatch range crosses an event");
+    for (size_t i = begin; i < end; ++i)
+      if (dispatches_[i].indirectThreadgroups.buffer || dispatches_[i].independentOfPrevious)
+        throw std::invalid_argument("independent dispatch range overlaps a group or indirect grid");
+    if (end < dispatches_.size() && dispatches_[end].independentOfPrevious)
+      throw std::invalid_argument("independent dispatch range cuts a group");
+    for (size_t i = begin + 1; i < end; ++i)
+      dispatches_[i].independentOfPrevious = true;
   }
 
   [[nodiscard]] bool empty() const noexcept { return dispatches_.empty(); }

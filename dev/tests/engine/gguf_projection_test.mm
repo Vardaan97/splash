@@ -20,6 +20,7 @@
 #include "GgufFormatReference.hpp"
 #include "LinearNumerics.hpp"
 #include "TestBuffers.hpp"
+#include "TestChecks.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/Gguf.h"
@@ -987,6 +988,59 @@ void gatherExtents(MetalBackend &backend) {
           "element short");
 }
 
+// The input projection beside the real indexer kernels, with nonzero BF16
+// inputs. Check every decode width and staged split count, bit for bit.
+void independentProjections(const char *library) {
+  MetalBackend backend(library);
+  const Linear linear(backend.capabilities());
+  constexpr uint32_t k = 256;
+  constexpr std::array<uint32_t, 3> widths{1024, 512, 128};
+  const Tensor q80 = tensor(backend, Q80, widths[0], k);
+  const Projection quantized = projection({&q80}, widths[0]);
+  for (uint32_t rows : {8u, 16u, 24u, 32u}) {
+    auto input = backend.allocateBuffer(32 * k * 2, metal::BufferStorage::Shared, "indexer-input");
+    auto *values = static_cast<uint16_t *>(input.contents());
+    for (uint32_t i = 0; i < 32 * k; ++i)
+      values[i] = i < rows * k ? uint16_t(0x3e00 + i % 512) : kNaN;
+    std::array<MetalBuffer, 3> weights, outputs;
+    for (size_t j = 0; j < widths.size(); ++j) {
+      weights[j] = backend.allocateBuffer(widths[j] * k * 4, metal::BufferStorage::Shared, "indexer-weights");
+      auto *w = static_cast<float *>(weights[j].contents());
+      for (uint32_t i = 0; i < widths[j] * k; ++i) w[i] = float(int(i % 97) - 48) / 113;
+      outputs[j] = backend.allocateBuffer(32 * widths[j] * 4, metal::BufferStorage::Shared, "indexer-output");
+    }
+    // Zero selects a float main projection; positive values its Q8_0 K splits.
+    for (uint32_t splits : {0u, 1u, 2u, 4u, 8u}) {
+      const LinearWorkload workload = decode({widths[0], k}, rows / 8, LinearEpilogue::None);
+      const LinearPlan plan = Linear::plan(workload, config(LinearTile::GgufStaged, workload, std::max(1u, splits)),
+                                           FloatOutput::BFloat16);
+      const Scratch scratch(backend, plan.scratchSize());
+      std::array<std::vector<std::byte>, 3> expected;
+      for (bool independent : {false, true}) {
+        CommandGraph graph;
+        scratch.poison(independent ? kPoisonNaN : kPoisonFinite);
+        if (splits)
+          linear.add(graph, {.input = input, .output = outputs[0], .scratch = scratch.bindings()}, quantized, plan);
+        for (size_t j = splits ? 1 : 0; j < widths.size(); ++j)
+          addGgufFloat(graph, input, QuantizedSegment::floats(widths[j], k, weights[j]), outputs[j], rows,
+                       widths[j], 0, FloatOutput::Float32, linear.ggufFloatTile(rows, widths[j]));
+        test::require(graph.dispatches().size() == 3, "projection group must contain three independent dispatches");
+        if (independent) graph.independent(0, 3);
+        (void)backend.submitCommandAsync(graph.command()).wait();
+        test::require(scratch.intact(), "independent projection damaged split scratch");
+        for (size_t j = 0; j < widths.size(); ++j) {
+          const auto *begin = static_cast<const std::byte *>(outputs[j].contents());
+          const size_t size = rows * widths[j] * (splits && j == 0 ? 2 : 4);
+          if (!independent) expected[j].assign(begin, begin + size);
+          else test::require(std::memcmp(begin, expected[j].data(), size) == 0,
+                             "independent projection changed output bits");
+        }
+      }
+    }
+  }
+  section("independent input/indexer projections: B1-B4 and staged K splits bitwise");
+}
+
 int main(int argc, char **argv) {
   @autoreleasepool {
     if (argc != 2) {
@@ -994,6 +1048,7 @@ int main(int argc, char **argv) {
       return 2;
     }
     try {
+      independentProjections(argv[1]);
       MetalBackend backend(argv[1]);
       const Linear linear(backend.capabilities());
       for (const LinearTile tile : {LinearTile::GgufRegister, LinearTile::GgufStaged}) {

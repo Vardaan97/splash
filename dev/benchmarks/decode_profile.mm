@@ -8,13 +8,14 @@
 // every dispatch of a prefill command and B1 through B4 DFlash cycles
 // is replayed as its own command and attributed to its pipeline.
 // The fused (unprofiled) GPU time of the same work is reported alongside, so
-// the gap between the sum of parts and the fused command shows how much a
-// cycle pays in dispatch boundaries rather than kernel work.
+// replay gives isolated attribution. Its sum minus fused time is not an
+// idle-gap measurement; use a full-command Metal trace for that.
 // With --images it profiles the vision encoder instead, loading only the
 // model's vision role: K encodes of a synthetic image per patch grid (height
 // x width in patches), fused and then attributed.
 
 #include "engine/Types.hpp"
+#include "DecodeProfileInput.hpp"
 #include "model/Runtime.hpp"
 #include "ops/PageStorage.hpp"
 #include "ops/Vision.hpp"
@@ -36,6 +37,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <map>
 #include <span>
@@ -222,11 +224,11 @@ struct Lane final {
 };
 
 void prefill(model::Runtime &executor, Lane &lane,
-             std::span<const uint32_t> prompt) {
+             std::span<const uint32_t> prompt, uint32_t maximumTokens) {
   EngineRequest request;
   request.id = lane.id;
   request.prompt.assign(prompt.begin(), prompt.end());
-  request.maxNewTokens = 256;
+  request.maxNewTokens = maximumTokens;
   executor.beginColdRequest(request.modelView(), lane.stateLane);
   uint32_t offset = 0;
   while (offset < prompt.size()) {
@@ -295,7 +297,8 @@ int main(int argc, char **argv) {
       if (argc < 3) {
         std::cerr << "usage: decode-profile METALLIB MODEL_ROOT "
                      "[--prompt-tokens N] [--cycles K] [--kv-format int8|bf16] "
-                     "[--state-format fp32|bf16]\n"
+                     "[--state-format fp32|bf16] [--prompt-file TOKEN_IDS] "
+                     "[--ple-ssd-cache BYTES] [--profile-dispatches 0|1]\n"
                      "       decode-profile METALLIB MODEL_ROOT "
                      "--images HxW[,HxW...] [--cycles K]\n";
         return 2;
@@ -305,13 +308,27 @@ int main(int argc, char **argv) {
       kv::Format format = kv::Format::Int8;
       ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
       std::vector<ops::ImageGrid> grids;
-      bool textOptions = false;
+      bool textOptions = false, promptCountGiven = false, profileDispatches = true;
+      std::string promptFile;
+      model::ModelLoadOptions loadOptions;
       for (int index = 3; index < argc; index += 2) {
         const std::string_view option(argv[index]);
         if (index + 1 >= argc)
           throw std::invalid_argument(std::string(option) + " requires a value");
         if (option == "--prompt-tokens") {
           promptTokens = parseCount(argv[index + 1], "--prompt-tokens");
+          promptCountGiven = true;
+          textOptions = true;
+        } else if (option == "--prompt-file") {
+          promptFile = argv[index + 1];
+          textOptions = true;
+        } else if (option == "--ple-ssd-cache") {
+          loadOptions.pleCacheBytes = bench::profileCacheBytes(argv[index + 1]);
+          textOptions = true;
+        } else if (option == "--profile-dispatches") {
+          const std::string_view value(argv[index + 1]);
+          if (value != "0" && value != "1") throw std::invalid_argument("--profile-dispatches takes 0 or 1");
+          profileDispatches = value == "1";
           textOptions = true;
         } else if (option == "--cycles")
           cycles = parseCount(argv[index + 1], "--cycles");
@@ -335,6 +352,13 @@ int main(int argc, char **argv) {
       if (!grids.empty() && textOptions)
         throw std::invalid_argument("--images takes no other option than --cycles");
 
+      std::vector<uint32_t> prompt;
+      if (!promptFile.empty()) {
+        if (promptCountGiven) throw std::invalid_argument("--prompt-file and --prompt-tokens are exclusive");
+        std::ifstream input(promptFile);
+        prompt = bench::profilePrompt(input);
+        promptTokens = static_cast<uint32_t>(prompt.size());
+      }
       metal::MetalBackend backend(argv[1]);
       const std::filesystem::path root(argv[2]);
       if (!grids.empty()) {
@@ -343,15 +367,23 @@ int main(int argc, char **argv) {
         profileImages(backend, root, grids, cycles);
         return 0;
       }
-      model::LoadedModel model =
-          model::loadModel(backend, root, model::inspectModelRoot(root));
+      const auto descriptor = model::inspectModelRoot(root);
+      const uint64_t decodeTokens = bench::profileDecodeTokens(cycles, model::ExecutionLimits::targetVerifyRows,
+                                                               profileDispatches);
+      if (uint64_t{promptTokens} + decodeTokens > descriptor.capabilities.maximumContextTokens)
+        throw std::invalid_argument("prompt leaves too little context for profiling cycles");
+      if (prompt.empty()) prompt = chatPrompt(promptTokens);
+      const uint32_t vocabulary = std::visit([](const auto &layout) { return layout.vocabularySize; }, descriptor.target);
+      if (std::any_of(prompt.begin(), prompt.end(), [&](uint32_t token) { return token >= vocabulary; }))
+        throw std::invalid_argument("prompt token outside model vocabulary");
+      model::LoadedModel model = model::loadModel(backend, root, descriptor, loadOptions);
+      std::printf("ple_ssd_cache=%s, dispatch_replay=%s\n", model.streamedTable() ? "streamed" : "resident",
+                  profileDispatches ? "on" : "off");
       ops::ExecutionPlans operators(backend.capabilities());
 
       // Enough Page32 pages for four lanes of prompt plus generated rows.
       const uint32_t pagesPerLane =
-          (promptTokens + 256 + model::ExecutionLimits::targetVerifyRows) /
-              kv::kPageTokens +
-          2;
+          static_cast<uint32_t>((promptTokens + decodeTokens) / kv::kPageTokens) + 2;
       // Whole extents of the largest size the pool rule picks, as a large
       // pool's would be.
       const kv::Layout kvLayout = model.targetKvLayout(format);
@@ -382,28 +414,31 @@ int main(int argc, char **argv) {
         lanes[index] = {index + 1, index, 0,
                         pageRange(index * pagesPerLane, pagesPerLane)};
       }
-      const std::vector<uint32_t> prompt = chatPrompt(promptTokens);
-
       // Warm prefill and B1 decode with real work before measuring.
-      prefill(executor, lanes[0], prompt);
+      prefill(executor, lanes[0], prompt, static_cast<uint32_t>(decodeTokens));
       static_cast<void>(decodeCycle(backend, executor, std::span<Lane>(&lanes[0], 1)));
       executor.end(lanes[0].id);
 
       // Prefill: fused timing first, then the attributed replay. Both cover
       // every chunk of the prompt.
       const double prefillBefore = executor.telemetry().totalPrefillGpuSeconds;
-      prefill(executor, lanes[0], prompt);
+      prefill(executor, lanes[0], prompt, static_cast<uint32_t>(decodeTokens));
       const double prefillFused =
           executor.telemetry().totalPrefillGpuSeconds - prefillBefore;
       executor.end(lanes[0].id);
-      BackendInstrumentation::setDispatchProfiling(backend, true);
-      prefill(executor, lanes[0], prompt);
-      BackendInstrumentation::setDispatchProfiling(backend, false);
-      Table prefillTable;
-      accumulate(prefillTable,
-                 BackendInstrumentation::takeDispatchProfile(backend));
-      print("prefill " + std::to_string(promptTokens) + " rows", prefillTable,
-            1.0, prefillFused);
+      if (profileDispatches) {
+        BackendInstrumentation::setDispatchProfiling(backend, true);
+        prefill(executor, lanes[0], prompt, static_cast<uint32_t>(decodeTokens));
+        BackendInstrumentation::setDispatchProfiling(backend, false);
+        Table prefillTable;
+        accumulate(prefillTable,
+                   BackendInstrumentation::takeDispatchProfile(backend));
+        print("prefill " + std::to_string(promptTokens) + " rows", prefillTable,
+              1.0, prefillFused);
+      } else {
+        prefill(executor, lanes[0], prompt, static_cast<uint32_t>(decodeTokens));
+        std::printf("prefill %.2f ms (dispatch replay disabled)\n", prefillFused * 1e3);
+      }
 
       auto profileWidth = [&](const char *title, std::span<Lane> active) {
         std::vector<CycleTiming> fused;
@@ -418,6 +453,7 @@ int main(int argc, char **argv) {
                     "command(s) per cycle\n",
                     title, median.gpuSeconds * 1e3, median.wallSeconds * 1e3,
                     static_cast<unsigned long long>(median.commands));
+        if (!profileDispatches) return;
         BackendInstrumentation::setDispatchProfiling(backend, true);
         for (uint32_t cycle = 0; cycle < cycles; ++cycle)
           static_cast<void>(decodeCycle(backend, executor, active));
@@ -430,7 +466,7 @@ int main(int argc, char **argv) {
       profileWidth("B1 decode cycle", std::span<Lane>(&lanes[0], 1));
       // Add one lane at a time so M16 and M24 paths are measured too.
       for (uint32_t index = 1; index < lanes.size(); ++index) {
-        prefill(executor, lanes[index], prompt);
+        prefill(executor, lanes[index], prompt, static_cast<uint32_t>(decodeTokens));
         const std::string title = "B" + std::to_string(index + 1) + " decode cycle";
         profileWidth(title.c_str(), std::span<Lane>(lanes.data(), index + 1));
       }

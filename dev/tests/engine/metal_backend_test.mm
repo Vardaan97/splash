@@ -72,6 +72,48 @@ ComputeDispatch addition(const MetalBuffer &buffer, const uint32_t &count,
             {1, 1, 1}, {1, 1, 1}};
 }
 
+// A shared input forks to disjoint views of one allocation, then each result
+// is consumed and overwritten. Both submission paths must join the group.
+void independentDispatches(const char *library) {
+    MetalBackend backend(library);
+    constexpr uint32_t count = 1024;
+    auto source = backend.allocateBuffer(count * sizeof(uint32_t), BufferStorage::Shared, "fork-source");
+    auto storage = backend.allocateBuffer(2 * count * sizeof(uint32_t), BufferStorage::Shared, "fork-outputs");
+    auto left = backend.view(storage, 0, count * sizeof(uint32_t));
+    auto right = backend.view(storage, count * sizeof(uint32_t), count * sizeof(uint32_t));
+    for (bool encoded : {false, true}) {
+        for (bool independent : {false, true}) {
+          for (bool events : {false, true}) {
+            std::fill_n(static_cast<uint32_t *>(source.contents()), count, 7);
+            splash::metal::CommandGraph graph;
+            graph.add("test_add_u32", {source}, count, {}, uint32_t{5}, {4, 1, 1}, {256, 1, 1});
+            graph.add("test_copy_u32", {source, left}, count, {4, 1, 1}, {256, 1, 1});
+            graph.add("test_copy_u32", {source, right}, count, {4, 1, 1}, {256, 1, 1});
+            if (independent) graph.independent(1, 3);
+            if (events) {
+                auto event = backend.newSharedEvent();
+                graph.signal(event, 1);
+                graph.wait(event, 1);
+            }
+            graph.add("test_add_u32", {left}, count, {}, uint32_t{3}, {4, 1, 1}, {256, 1, 1});
+            graph.add("test_add_u32", {right}, count, {}, uint32_t{9}, {4, 1, 1}, {256, 1, 1});
+            graph.add("test_copy_u32", {right, source}, count, {4, 1, 1}, {256, 1, 1});
+            if (encoded) {
+                auto command = backend.encodeCommand(graph.command());
+                (void)backend.submitEncoded(std::move(command)).wait();
+            } else {
+                (void)backend.submitCommandAsync(graph.command()).wait();
+            }
+            for (uint32_t i = 0; i < count; ++i) {
+                require(static_cast<uint32_t *>(left.contents())[i] == 15, "fork left lost ordering");
+                require(static_cast<uint32_t *>(right.contents())[i] == 21, "fork right lost ordering");
+                require(static_cast<uint32_t *>(source.contents())[i] == 21, "fork join lost ordering");
+            }
+          }
+        }
+    }
+}
+
 struct TemporaryMetallib final {
     TemporaryMetallib()
         : path((std::filesystem::temp_directory_path() /
@@ -1932,6 +1974,7 @@ int main(int argc, const char *argv[]) {
             return 2;
         }
         try {
+            independentDispatches(argv[1]);
             completionDoesNotWaitForMemoryTelemetry(argv[1]);
             terminalCommandRecovers(argv[1], false);
             terminalCommandRecovers(argv[1], false, true);
