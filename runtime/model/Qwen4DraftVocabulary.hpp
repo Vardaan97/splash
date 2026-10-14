@@ -29,17 +29,21 @@ inline constexpr uint32_t kQwen4DraftVocabularySource = 248320;
 inline constexpr uint32_t kQwen4DraftContextTokens = 4096;
 
 // The draft vocabulary's tokens, ascending, when `tokens` is its size; none
-// for 0. Throws for any other size.
+// for 0. Sizes 32768, 49152 and 65536 are supported; throws otherwise.
 [[nodiscard]] std::span<const uint32_t> qwen4DraftVocabulary(uint32_t tokens);
 // Whether `token` is one of the draft vocabulary's.
 [[nodiscard]] bool inQwen4DraftVocabulary(uint32_t token) noexcept;
+[[nodiscard]] bool qwen4DraftContains(uint32_t token, uint32_t tokens) noexcept;
 
 // The draft vocabulary size for a head with `vocabulary` rows: 32768
-// for 248320 rows unless SPLASH_MTP_DRAFT_VOCAB=0; otherwise 0. This size
+// for 248320 rows by default (1 is a legacy alias). The environment accepts
+// 0, 32768, 49152 or 65536; other model vocabularies use 0. This size
 // check assumes Qwen3.8 token IDs and does not validate tokenizer identity.
 [[nodiscard]] uint32_t qwen4DraftTokensFor(uint32_t vocabulary);
 
 namespace detail {
+extern const uint64_t kQwen4DraftVocabularyWords49152[kQwen4DraftVocabularySource / 64];
+extern const uint64_t kQwen4DraftVocabularyWords65536[kQwen4DraftVocabularySource / 64];
 extern const uint64_t kQwen4DraftVocabularyWords[kQwen4DraftVocabularySource / 64];
 } // namespace detail
 
