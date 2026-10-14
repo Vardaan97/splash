@@ -399,3 +399,25 @@ kernel void moe_combine(
   }
   output[ulong(row) * params.hidden_size + dimension] = bfloat(value);
 }
+
+// Combine in route order, round the branch once, then inject in stream order.
+[[max_total_threads_per_threadgroup(256)]]
+kernel void moe_combine_hyper(
+    device const bfloat *expert_output [[buffer(0)]], device const uint *route_rows [[buffer(1)]],
+    device const float *routing_weights [[buffer(2)]], device const bfloat *residual [[buffer(3)]],
+    device float *streams [[buffer(4)]], device const float *weights [[buffer(5)]],
+    constant MoeCombineParams &params [[buffer(6)]], uint2 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+  uint row = group.x;
+  uint dimension = group.y * 256 + thread_index;
+  if (row >= params.rows || dimension >= params.hidden_size) return;
+  float value = float(residual[ulong(row) * params.hidden_size + dimension]);
+  ulong route = ulong(row) * params.routes_per_row;
+  for (uint slot = 0; slot < params.routes_per_row; ++slot) {
+    value += routing_weights[route + slot] *
+             float(expert_output[ulong(route_rows[route + slot]) * params.hidden_size + dimension]);
+  }
+  const float b = float(bfloat(value));
+  device float *x = streams + ulong(row) * 4 * params.hidden_size + dimension;
+  for (uint s = 0; s < 4; ++s) x[s * params.hidden_size] += b * weights[row * 4 + s];
+}

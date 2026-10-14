@@ -221,6 +221,9 @@ void LinearPlan::requireConfiguration() const {
       (!decode || c.tile != LinearTile::GgufStaged || c.splits != 1 ||
        destination_ != FloatOutput::BFloat16 || workload_.matrix.outputSize % 256))
     throw std::invalid_argument("hyper mix takes an unsplit staged four-stream decode plan");
+  if (workload_.epilogue == LinearEpilogue::HyperCombine &&
+      (!decode || c.tile != LinearTile::GgufStaged || destination_ != FloatOutput::BFloat16))
+    throw std::invalid_argument("hyper combine takes a staged bf16 decode plan");
   if (workload_.epilogue == LinearEpilogue::HyperLow &&
       (!decode || c.tile != LinearTile::GgufStaged || destination_ != FloatOutput::BFloat16))
     throw std::invalid_argument("hyper low takes a staged bf16 decode plan");
@@ -343,9 +346,13 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
   requireSegments(p, w.matrix);
   if (gate) requireSegments(*gate, w.matrix);
   const std::vector<QuantizedSegment> &segments = p.blocks().segments;
-  if ((w.epilogue == LinearEpilogue::HyperLow || w.epilogue == LinearEpilogue::HyperMix) &&
+  if ((w.epilogue == LinearEpilogue::HyperLow || w.epilogue == LinearEpilogue::HyperMix ||
+       w.epilogue == LinearEpilogue::HyperCombine) &&
       (segments.size() != 1 || segments.front().formatId != GGUF_FMT_Q80))
-    throw std::invalid_argument("hyper low takes one Q8_0 tensor");
+    throw std::invalid_argument("hyper epilogues take one Q8_0 tensor");
+  if ((w.epilogue == LinearEpilogue::HyperMix || w.epilogue == LinearEpilogue::HyperCombine) &&
+      (segments.front().columnOffset != 0 || segments.front().outputSize != w.matrix.outputSize))
+    throw std::invalid_argument("hyper stream epilogues take a whole output tensor");
   // The fused kernels have no fp32 instance.
   if (plan.destination() == FloatOutput::Float32 && segments.size() > 1)
     throw std::invalid_argument("an fp32 destination takes a single-tensor block projection");
@@ -411,6 +418,15 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
   const std::vector<QuantizedSegment> &segments = p.blocks().segments;
   const uint32_t rows = plan.storageRows(), splits = config.splits;
   const auto [partials, counters] = splitScratch(b, splits);
+  if (w.epilogue == LinearEpilogue::HyperCombine) {
+    const auto &s = segments.front();
+    graph.add("gguf_decode_q80_m" + std::to_string(rows) + "_hc",
+              {b.input, s.plane0, s.plane1Slot(), s.meta, b.output, partials, counters, b.output,
+               b.hyperCombine.streams, b.hyperCombine.weights},
+              GgufDecodeParams{k, splits, n, 0, config.spread},
+              {n / GGUF_TILE_COLUMNS, splits, 1}, {GGUF_STAGED_THREADS, 1, 1});
+    return;
+  }
   if (w.epilogue == LinearEpilogue::HyperMix) {
     const auto &s = segments.front();
     graph.add("gguf_decode_q80_m" + std::to_string(rows) + "_hcmix",

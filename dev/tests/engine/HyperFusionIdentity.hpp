@@ -102,5 +102,39 @@ inline void hyperFusionIdentity(metal::MetalBackend &backend) {
           if (counts[i]) throw std::runtime_error("hyper mix leaves counters nonzero");
       }
 
+  const auto out = projection(2560, 6144);
+  for (uint32_t rows : {8u, 16u, 24u, 32u})
+    for (uint32_t splits : {1u, 2u, 4u, 8u})
+      for (bool spread : {false, true})
+        for (uint32_t inject : {0u, 1u}) {
+          const LinearConfig config{.tile = LinearTile::GgufStaged, .splits = splits, .spread = spread};
+          auto plain = Linear::plan({{2560, 6144}, rows, LinearPhase::Decode}, config, FloatOutput::BFloat16);
+          auto fused = Linear::plan({{2560, 6144}, rows, LinearPhase::Decode, LinearEpilogue::HyperCombine},
+                                    config, FloatOutput::BFloat16);
+          const uint32_t storage = plain.storageRows();
+          std::vector<uint16_t> x(storage * 6144);
+          std::vector<float> stream(storage * 10240), weight(storage * 4, float(inject));
+          for (auto &v : x) v = floatToBf16(float(int(rng() % 2001) - 1000) / 1000);
+          for (auto &v : stream) v = float(int(rng() % 2001) - 1000) / 500;
+          if (inject) for (auto &v : weight) v = 0.1f + float(rng() % 1000001) / 555557.0f;
+          auto input = upload(x), ref = upload(stream), got = upload(stream), weights = upload(weight);
+          auto branch = buffer(storage * 2560 * 2), unused = buffer(storage * 2560 * 2);
+          std::memset(unused.contents(), 0xA5, unused.sizeBytes());
+          const auto size = fused.scratchSize();
+          LinearScratch scratch{.partials = buffer(std::max<uint64_t>(size.partials, 16)),
+                                .counters = buffer(std::max<uint64_t>(size.counters, 16))};
+          std::memset(scratch.counters.contents(), 0, scratch.counters.sizeBytes());
+          metal::CommandGraph graph;
+          linear.add(graph, {.input = input, .output = branch, .scratch = scratch}, out, plain);
+          Qwen4::addCombine(graph, ref, branch, weights, {2560, 4, 320}, storage);
+          linear.add(graph, {.input = input, .output = unused, .scratch = scratch,
+                            .hyperCombine = {got, weights}}, out, fused);
+          static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+          same(ref, got, ref.sizeBytes(), "hyper projection streams differ bitwise");
+          const auto *bytes = static_cast<const uint8_t *>(unused.contents());
+          for (uint64_t i = 0; i < unused.sizeBytes(); ++i)
+            if (bytes[i] != 0xA5) throw std::runtime_error("hyper combine writes branch");
+        }
+
 }
 } // namespace splash::test

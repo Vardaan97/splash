@@ -157,7 +157,7 @@ MoePlan::MoePlan(MoeShape shape, uint32_t rows, MoeConfig config,
 
 void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
               const BlockMoeWeights &weights, const MoePlan &plan, uint32_t firstRow,
-              std::span<const uint32_t> lastRows) {
+              std::span<const uint32_t> lastRows, HyperCombine hyper) {
   static_assert(SPLASH_MAXIMUM_BATCH_WIDTH <= 4 && SPLASH_TARGET_VERIFY_ROWS < 256,
                 "a lane's last row bound is a byte of MoeGroupParams::last_rows");
   const MoeShape shape = plan.shape();
@@ -227,6 +227,16 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
                scratch.tileCount, scratch.groupedInput},
               gather, {tiles, shape.hiddenSize / 256, 1});
   addExperts(graph, scratch, weights, plan, group, group.in_place ? buffers.input : scratch.groupedInput);
+  if (hyper) {
+    requireBytes(hyper.streams, uint64_t{rows} * shape.hiddenSize * 4 * sizeof(float), "MoE hyper streams");
+    requireBytes(hyper.weights, uint64_t{rows} * 4 * sizeof(float), "MoE hyper weights");
+    graph.add("moe_combine_hyper",
+              {scratch.expertOutput, scratch.routeRows, scratch.routingWeights,
+               buffers.residual, hyper.streams, hyper.weights},
+              MoeCombineParams{rows, shape.hiddenSize, shape.routesPerToken()},
+              {rows, shape.hiddenSize / 256, 1}, {256, 1, 1});
+    return;
+  }
   graph.add("moe_combine",
             {scratch.expertOutput, scratch.routeRows, scratch.routingWeights,
              buffers.residual, buffers.output},

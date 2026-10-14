@@ -3,7 +3,7 @@
 
 // What both GGUF GEMM families (kernels/shared/gguf_linear.metal and
 // kernels/decode/linear_gguf_sgmatrix.metal) do to a finished fp32 sum.
-enum GgufEpilogue : ushort { EpNone, EpResidual, EpUpWithGate, EpHyperLow };
+enum GgufEpilogue : ushort { EpNone, EpResidual, EpUpWithGate, EpHyperLow, EpHyperCombine };
 
 // The output of sum v at element `at`: v, v plus the residual aux[at], or the bf16-rounded up value v times silu of
 // the gate aux[at], as the destination's type Out: bf16, or fp32 (the plain epilogue's logits).

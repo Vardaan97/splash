@@ -1,3 +1,4 @@
+#include "MoeHyperIdentity.hpp"
 // GGUF sparse MoE (ops::MoE over BlockMoeWeights) and the fp32 projection of
 // GGUF float tensors, against fp64 references over GGML's dequantized weights
 // (GgufFormatReference.hpp), through the production dispatch code.
@@ -782,6 +783,21 @@ void checkLiveRows(MetalBackend &backend, const Model &m, Buffers &b, const MoeP
   CommandGraph graph;
   MoE::add(graph, b.moe, m.weights, plan, firstRow, lastRows);
   static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+  std::vector<float> initial(uint64_t{rows} * kHidden * 4, 0.375f), injection(rows * 4, 0.625f);
+  for (uint32_t i = 0; i < injection.size(); ++i) injection[i] = 0.375f + float(i % 17) / 23.0f;
+  auto referenceStreams = splash::test::sharedBuffer(backend, initial.size() * sizeof(float));
+  auto fusedStreams = splash::test::sharedBuffer(backend, initial.size() * sizeof(float));
+  auto injectionWeights = splash::test::sharedBuffer(backend, injection.size() * sizeof(float));
+  std::memcpy(referenceStreams.contents(), initial.data(), referenceStreams.sizeBytes());
+  std::memcpy(fusedStreams.contents(), initial.data(), fusedStreams.sizeBytes());
+  std::memcpy(injectionWeights.contents(), injection.data(), injectionWeights.sizeBytes());
+  CommandGraph hyper;
+  splash::ops::Qwen4::addCombine(hyper, referenceStreams, b.moe.output, injectionWeights,
+                                {kHidden, 4, 64}, rows);
+  MoE::add(hyper, b.moe, m.weights, plan, firstRow, lastRows, {fusedStreams, injectionWeights});
+  static_cast<void>(backend.submitCommandAsync(hyper.dispatches()).wait());
+  require(!std::memcmp(referenceStreams.contents(), fusedStreams.contents(), referenceStreams.sizeBytes()),
+          label + ": fused MoE streams differ bitwise");
   const auto *routeRows = static_cast<const uint32_t *>(b.moe.scratch.routeRows.contents());
   const auto *groupedRoutes = static_cast<const uint32_t *>(b.moe.scratch.groupedRoutes.contents());
   const auto *tiles = static_cast<const MoeTileDescriptor *>(b.moe.scratch.tileDescriptors.contents());
@@ -1045,6 +1061,7 @@ int main(int argc, const char *argv[]) {
     }
     try {
       MetalBackend backend(argv[1]);
+      splash::test::moeHyperIdentity(backend);
       bufferExtents(backend);
       const int failures = floatProjection(backend) + floatSegments(backend, 64) + floatSegments(backend, 96) +
                            floatOnlyChain(backend) + moe(backend) + routingLoads(backend);

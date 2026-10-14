@@ -1,3 +1,4 @@
+#include "HyperRuntimeFixture.hpp"
 #include "LinearNumerics.hpp"
 #include "TestChecks.hpp"
 #include "ane/ProgramInstrumentation.hpp"
@@ -2350,6 +2351,51 @@ void requireGridCheckpointEditReplay(model::Runtime &executor,
 
 int main(int argc, char **argv) {
   try {
+    if (argc == 3 && std::string_view(argv[2]) == "--synthetic-hyper") {
+      struct Receipt {
+        std::vector<std::vector<uint32_t>> tokens;
+        std::vector<std::vector<uint8_t>> states;
+        std::vector<uint64_t> lengths;
+      };
+      const auto run = [&](const char *bits, uint32_t width) {
+        setenv("SPLASH_HYPER_FUSION", bits, 1);
+        splash::test::mtp::Fixture f(argv[1], false, false, false, false, true);
+        Receipt receipt;
+        std::vector<uint64_t> ids(width);
+        std::vector<uint32_t> lanes(width);
+        for (uint32_t lane = 0; lane < width; ++lane) {
+          ids[lane] = lane + 1;
+          lanes[lane] = lane;
+          f.prefill(f.request(ids[lane], lane % 2 ? std::vector<uint32_t>{11, 10, 11}
+                                                : std::vector<uint32_t>{10, 11, 10}), lane);
+        }
+        for (uint32_t cycle = 0; cycle < 4; ++cycle) {
+          const auto results = f.submit(ids, lanes)->wait();
+          require(results.size() == width, "synthetic hyper result width");
+          for (uint32_t lane = 0; lane < width; ++lane) {
+            require(results[lane].failure.empty() && !results[lane].finished && results[lane].requestId == ids[lane],
+                    "synthetic hyper decode failed");
+            receipt.tokens.push_back(results[lane].outputTokens);
+            receipt.states.push_back(bytesOf(f.states->current(lane).stateBase));
+            receipt.lengths.push_back(f.states->metadata(lane).lengths.targetTokens);
+            const auto recurrent = bytesOf(f.states->current(lane).recurrentLayers.front());
+            require(std::any_of(recurrent.begin(), recurrent.end(), [](uint8_t b) { return b != 0; }),
+                    "synthetic hyper oracle exercises nonzero recurrent state");
+          }
+        }
+        return receipt;
+      };
+      for (uint32_t width : {1u, 2u, 3u, 4u}) {
+        const auto off = run("0", width);
+        for (const char *bits : {"1", "2", "4", "5", "7"}) {
+          const auto on = run(bits, width);
+          require(off.tokens == on.tokens && off.states == on.states && off.lengths == on.lengths,
+                  "synthetic hyper oracle differs bitwise");
+        }
+      }
+      std::cout << "model-runtime-oracle synthetic hyper PASS\n";
+      return 0;
+    }
     bool imagesOnly = false, warmupEosOnly = false;
     bool gdnCheckpointsOnly = false;
     kv::Format format = kv::Format::Int8;

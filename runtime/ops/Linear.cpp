@@ -169,7 +169,8 @@ LinearPlan Linear::decodePlan(const Projection &p, uint32_t lanes, LinearEpilogu
   return plan(decode({p.outputSize, p.inputSize}, lanes, epilogue), p, gate);
 }
 bool Linear::supportsHyperEpilogue(const Projection &p, uint32_t lanes, LinearEpilogue epilogue) const {
-  if ((epilogue != LinearEpilogue::HyperLow && epilogue != LinearEpilogue::HyperMix) ||
+  if ((epilogue != LinearEpilogue::HyperLow && epilogue != LinearEpilogue::HyperMix &&
+       epilogue != LinearEpilogue::HyperCombine) ||
       p.blocks().segments.size() != 1 ||
       p.blocks().segments.front().formatId != GGUF_FMT_Q80)
     return false;
@@ -224,6 +225,10 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
   const uint64_t rows = selected.storageRows();
   requireBytes(b.input, rows * k * 2, "projection input");
   requireBytes(b.output, rows * n * elementBytes(selected.destination()), "projection output");
+  if (w.epilogue == LinearEpilogue::HyperCombine) {
+    requireBytes(b.hyperCombine.streams, rows * n * 4 * sizeof(float), "hyper streams");
+    requireBytes(b.hyperCombine.weights, rows * 4 * sizeof(float), "hyper weights");
+  }
   if (w.epilogue == LinearEpilogue::HyperMix) {
     requireBytes(b.hyperNormalized, rows * n * 2, "hyper normalized");
     requireBytes(b.hyperMixed, rows * (n / 4) * 2, "hyper mixed");

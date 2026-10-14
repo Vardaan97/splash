@@ -289,6 +289,21 @@ void addDecodeProjection(metal::CommandGraph &graph, const ops::Linear &linear, 
              projection, linear.decodePlan(projection, lanes));
 }
 
+// Returns whether the output projection injected its rounded branch itself.
+bool addDecodeHyperProjection(metal::CommandGraph &graph, const ops::Linear &linear,
+    metal::MetalBuffer input, const ops::Projection &projection, metal::MetalBuffer branch,
+    uint32_t lanes, ops::LinearScratch scratch, ops::PreparedInput prepared, ops::HyperCombine hyper) {
+  const bool fused = hyper && (ops::hyperFusionBits() & 4) &&
+      linear.supportsHyperEpilogue(projection, lanes, ops::LinearEpilogue::HyperCombine);
+  if (fused)
+    linear.add(graph, {.input = input, .output = branch, .scratch = scratch, .prepared = prepared,
+                      .hyperCombine = hyper}, projection,
+               linear.decodePlan(projection, lanes, ops::LinearEpilogue::HyperCombine));
+  else
+    addDecodeProjection(graph, linear, input, projection, branch, lanes, scratch, prepared);
+  return fused;
+}
+
 // Rows `begin`.. of a row-major buffer of `width` values of T, to the end of
 // the buffer: a projection's tile may read and write rows past its own, which
 // for the MTP head's stream-major rows are the next stream's, projected after.
@@ -976,9 +991,9 @@ ops::PreparedInput QwenTarget::addQwen4VerifyMix(VerifyStep &step, const Qwen4Hy
                             next ? layout(*next) : ops::LinearInput::Plain);
 }
 
-void QwenTarget::addQwen4VerifyAttention(VerifyStep &step, const Qwen4ExpLayerWeights &layer,
+bool QwenTarget::addQwen4VerifyAttention(VerifyStep &step, const Qwen4ExpLayerWeights &layer,
                                          const QwenAttentionWeights &mixer, uint32_t attentionLayer,
-                                         ops::PreparedInput input, bool attend) const {
+                                         ops::PreparedInput input, ops::HyperCombine hyper, bool attend) const {
   constexpr uint32_t laneRows = ExecutionLimits::targetVerifyRows;
   constexpr uint32_t indexWidth = QWEN4_QSA_HEADS * QWEN4_QSA_DIMENSION;
   const QwenTargetVerifyBuffers &b = step.buffers;
@@ -1034,7 +1049,7 @@ void QwenTarget::addQwen4VerifyAttention(VerifyStep &step, const Qwen4ExpLayerWe
                                         {b.chunkKeys[attentionLayer], b.chunkValues[attentionLayer], b.fullQueries,
                                          b.attentionPartials, b.attentionStatistics, b.fullAttention, b.pageTables},
                                         step.chunks, step.attention);
-    return;
+    return false;
   }
   ops::PagedAttention::addVerify(step.graph, step.kvLayers[attentionLayer],
                                  {b.chunkKeys[attentionLayer], b.chunkValues[attentionLayer], b.fullQueries,
@@ -1045,7 +1060,8 @@ void QwenTarget::addQwen4VerifyAttention(VerifyStep &step, const Qwen4ExpLayerWe
       step.graph, b.fullPacked, b.fullAttention, b.attentionHidden, geometry_.attentionQueryHeads,
       geometry_.kvLayout, step.lanes, b.linearScratch,
       linear.decodePlan(mixer.outputProjection, step.lanes).input());
-  project(b.attentionHidden, mixer.outputProjection, h.branch, hidden);
+  return addDecodeHyperProjection(step.graph, linear, b.attentionHidden, mixer.outputProjection, h.branch,
+                                   step.lanes, b.linearScratch, hidden, hyper);
 }
 
 void QwenTarget::addQwen4Verify(VerifyStep &step, const Qwen4ExpWeights &weights) const {
@@ -1088,6 +1104,7 @@ void QwenTarget::addQwen4Verify(VerifyStep &step, const Qwen4ExpWeights &weights
             rowsOf<float>(backend_, h.pleGated, lane * laneRows, laneRows, ps.width()),
             rowsOf<float>(backend_, h.streams, lane * laneRows, laneRows, ps.width()), ps, laneRows);
     }
+    bool mixerCombined = false;
     std::visit(
         [&](const auto &mixer) {
           using Mixer = std::remove_cvref_t<decltype(mixer)>;
@@ -1103,17 +1120,23 @@ void QwenTarget::addQwen4Verify(VerifyStep &step, const Qwen4ExpWeights &weights
                  b.gdnHidden, b.linearScratch},
                 geometry_.gdnShape(), step.lanes, gdnLayer, geometry_.stateLayout.strides(),
                 mixer.outputHeadOrder, linear.decodePlan(mixer.outputProjection, step.lanes).input());
-            project(b.gdnHidden, mixer.outputProjection, h.branch, hidden);
+            mixerCombined = addDecodeHyperProjection(step.graph, linear, b.gdnHidden, mixer.outputProjection,
+                h.branch, step.lanes, b.linearScratch, hidden,
+                hs.streams == 4 ? ops::HyperCombine{h.streams, h.weights} : ops::HyperCombine{});
           } else {
-            addQwen4VerifyAttention(step, layer, mixer, step.attentionLayer++, std::move(input));
+            mixerCombined = addQwen4VerifyAttention(step, layer, mixer, step.attentionLayer++,
+                                                    std::move(input), hs.streams == 4 ? ops::HyperCombine{h.streams, h.weights}
+                                                                                  : ops::HyperCombine{});
           }
         },
         layer.mixer);
-    ops::Qwen4::addCombine(step.graph, h.streams, h.branch, h.weights, hs, rows);
+    if (!mixerCombined) ops::Qwen4::addCombine(step.graph, h.streams, h.branch, h.weights, hs, rows);
     addQwen4VerifyMix(step, layer.ffnHyper, h.streams, b.normalized);
+    const bool moeCombined = (ops::hyperFusionBits() & 4) && hs.streams == 4;
     ops::MoE::add(step.graph, {b.normalized, h.zeros, h.branch, b.moe}, layer.ffn, *step.moe, 0,
-                  std::span(step.lastRows).first(step.lastRowLanes));
-    ops::Qwen4::addCombine(step.graph, h.streams, h.branch, h.weights, hs, rows);
+                  std::span(step.lastRows).first(step.lastRowLanes),
+                  moeCombined ? ops::HyperCombine{h.streams, h.weights} : ops::HyperCombine{});
+    if (!moeCombined) ops::Qwen4::addCombine(step.graph, h.streams, h.branch, h.weights, hs, rows);
   }
   requireLayerPartition(geometry_, step.gdnLayer, step.attentionLayer);
   project(b.finalHidden, weights.logitsProjection, b.logits,
@@ -1165,16 +1188,19 @@ void QwenTarget::addQwen4MtpVerify(VerifyStep &step, const Qwen4ExpWeights &weig
   ops::Qwen4::addMtpWiden(step.graph, h.gate, h.mtpStreams, hs, rows);
   const uint32_t attentionLayer = geometry_.kvLayout.attentionLayers - geometry_.mtpLayers;
   const QwenAttentionWeights &attention = std::get<QwenAttentionWeights>(mtp.block.mixer);
-  addQwen4VerifyAttention(
+  const bool mixerCombined = addQwen4VerifyAttention(
       step, mtp.block, attention, attentionLayer,
       addQwen4VerifyMix(step, mtp.block.mixerHyper, h.mtpStreams, b.normalized, &attention.inputProjection),
+      full && hs.streams == 4 ? ops::HyperCombine{h.mtpStreams, h.weights} : ops::HyperCombine{},
       full || !(mtpHeadTrim() & kTrimKv));
   if (!full) return;
-  ops::Qwen4::addCombine(step.graph, h.mtpStreams, h.branch, h.weights, hs, rows);
+  if (!mixerCombined) ops::Qwen4::addCombine(step.graph, h.mtpStreams, h.branch, h.weights, hs, rows);
   addQwen4VerifyMix(step, mtp.block.ffnHyper, h.mtpStreams, b.normalized);
+  const bool moeCombined = (ops::hyperFusionBits() & 4) && hs.streams == 4;
   ops::MoE::add(step.graph, {b.normalized, h.zeros, h.branch, b.moe}, mtp.block.ffn, *step.moe, firstRow,
-                std::span(step.lastRows).first(step.lastRowLanes));
-  ops::Qwen4::addCombine(step.graph, h.mtpStreams, h.branch, h.weights, hs, rows);
+                std::span(step.lastRows).first(step.lastRowLanes),
+                moeCombined ? ops::HyperCombine{h.mtpStreams, h.weights} : ops::HyperCombine{});
+  if (!moeCombined) ops::Qwen4::addCombine(step.graph, h.mtpStreams, h.branch, h.weights, hs, rows);
   const ops::Projection &logits = draftHead ? draftHead->logits : weights.logitsProjection;
   addDecodeProjection(step.graph, linear, b.finalHidden, logits, b.logits, step.lanes, b.linearScratch,
                       addQwen4VerifyMix(step, mtp.head, h.mtpStreams, b.finalHidden, &logits));

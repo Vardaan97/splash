@@ -252,7 +252,7 @@ struct MoE final {
   // firstRow on.
   static void add(metal::CommandGraph &graph, const MoeBuffers &buffers,
                   const BlockMoeWeights &weights, const MoePlan &plan, uint32_t firstRow = 0,
-                  std::span<const uint32_t> lastRows = {});
+                  std::span<const uint32_t> lastRows = {}, HyperCombine hyper = {});
 };
 
 } // namespace splash::ops

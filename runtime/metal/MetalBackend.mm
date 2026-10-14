@@ -321,6 +321,9 @@ struct BackendAsyncState {
         healthy.store(false, std::memory_order_release);
     }
 
+#ifdef SPLASH_BACKEND_INSTRUMENTATION
+    uint64_t submittedDispatchCount = 0;
+#endif
     uint64_t beginSubmission(size_t dispatchCount) {
         ensureHealthy();
         std::lock_guard lock(gateMutex);
@@ -332,6 +335,9 @@ struct BackendAsyncState {
         }
         activeSequence = ++nextSequence;
         activeDispatchCount = dispatchCount;
+#ifdef SPLASH_BACKEND_INSTRUMENTATION
+        submittedDispatchCount += dispatchCount;
+#endif
         return activeSequence;
     }
 
@@ -1772,6 +1778,11 @@ uint64_t BackendInstrumentation::submittedCommands(
     const MetalBackend &backend) {
     std::lock_guard lock(backend.impl_->asyncState->gateMutex);
     return backend.impl_->asyncState->nextSequence;
+}
+
+uint64_t BackendInstrumentation::submittedDispatches(const MetalBackend &backend) {
+    std::lock_guard lock(backend.impl_->asyncState->gateMutex);
+    return backend.impl_->asyncState->submittedDispatchCount;
 }
 
 size_t BackendInstrumentation::cachedPipelines(const MetalBackend &backend) {

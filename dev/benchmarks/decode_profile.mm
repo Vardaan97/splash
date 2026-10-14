@@ -256,6 +256,7 @@ struct CycleTiming final {
   double gpuSeconds = 0.0;
   double wallSeconds = 0.0;
   uint64_t commands = 0;
+  uint64_t dispatches = 0;
 };
 
 CycleTiming decodeCycle(metal::MetalBackend &backend,
@@ -263,6 +264,7 @@ CycleTiming decodeCycle(metal::MetalBackend &backend,
                         std::span<Lane> lanes) {
   const uint64_t submissionsBefore =
       BackendInstrumentation::submittedCommands(backend);
+  const uint64_t dispatchesBefore = BackendInstrumentation::submittedDispatches(backend);
   const auto started = std::chrono::steady_clock::now();
   BatchPlan plan;
   plan.kind = WorkKind::Decode;
@@ -286,7 +288,8 @@ CycleTiming decodeCycle(metal::MetalBackend &backend,
   const auto finished = std::chrono::steady_clock::now();
   return {executor.telemetry().lastDecodeGpuSeconds,
           std::chrono::duration<double>(finished - started).count(),
-          BackendInstrumentation::submittedCommands(backend) - submissionsBefore};
+          BackendInstrumentation::submittedCommands(backend) - submissionsBefore,
+          BackendInstrumentation::submittedDispatches(backend) - dispatchesBefore};
 }
 
 } // namespace
@@ -450,9 +453,10 @@ int main(int argc, char **argv) {
                   });
         const CycleTiming median = fused[fused.size() / 2];
         std::printf("\n%s: median fused gpu %.2f ms, wall %.2f ms, %llu "
-                    "command(s) per cycle\n",
+                    "command(s), %llu dispatches per cycle\n",
                     title, median.gpuSeconds * 1e3, median.wallSeconds * 1e3,
-                    static_cast<unsigned long long>(median.commands));
+                    static_cast<unsigned long long>(median.commands),
+                    static_cast<unsigned long long>(median.dispatches));
         if (!profileDispatches) return;
         BackendInstrumentation::setDispatchProfiling(backend, true);
         for (uint32_t cycle = 0; cycle < cycles; ++cycle)

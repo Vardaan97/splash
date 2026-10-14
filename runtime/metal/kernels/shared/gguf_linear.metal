@@ -137,6 +137,45 @@ kernel void gguf_decode_low(device bfloat *input [[buffer(0)]], device uchar *w0
 GGUF_LOW(8) GGUF_LOW(16) GGUF_LOW(32)
 #undef GGUF_LOW
 
+// Out-projection stores apply the same bf16 boundary and stream injection
+// as the standalone combine. Split-K still reduces in partition order.
+template <ushort Rows, GgufEpilogue Ep>
+[[max_total_threads_per_threadgroup(GGUF_STAGED_THREADS)]]
+kernel void gguf_decode_hc(device bfloat *input [[buffer(0)]], device uchar *w0 [[buffer(1)]],
+    device uchar *w1 [[buffer(2)]], device uchar *meta [[buffer(3)]], device bfloat *branch [[buffer(4)]],
+    device coherent(device) float *partials [[buffer(5)]], device atomic_uint *counters [[buffer(6)]],
+    device bfloat *aux [[buffer(7)]], device float *streams [[buffer(8)]],
+    device const float *weights [[buffer(9)]], constant GgufDecodeParams &p [[buffer(10)]], uint2 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+  // Preserve the projection's existing branch and auxiliary binding slots.
+  (void)branch;
+  (void)aux;
+  threadgroup half stage[kStagedStages];
+  threadgroup half2 tl[1];
+  threadgroup uint arrival;
+  const uint per = p.input_size / GGUF_STAGED_STEP / p.splits, sb = group.y * per, se = sb + per,
+             origin = group.x * GGUF_TILE_COLUMNS + sg * GGUF_STAGED_COLUMNS;
+  auto acc = staged_accumulator<Rows, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(input, p.input_size,
+      stage + sg * kStagedSimdgroupStage);
+  gguf_zero(acc);
+  staged_accumulate<FmtQ80, Rows, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(input, w0, w1, meta, p.input_size,
+      origin, stage + sg * kStagedSimdgroupStage, tl, lane, sb, se,
+      staged_first_step(group.x, sb, se, p.spread), acc);
+  gguf_store_sums<Rows>(acc, p.splits, group.y, partials, counters + group.x, p.out_stride, origin,
+      sg * 32 + lane, &arrival, [&](uint r, uint c, float v) {
+    const float b = float(bfloat(v));
+    device float *x = streams + ulong(r) * 4 * p.out_stride + origin + c;
+    for (uint s = 0; s < 4; ++s) x[s * p.out_stride] += b * weights[r * 4 + s];
+  });
+}
+#define GGUF_HC(R) \
+  template [[host_name("gguf_decode_q80_m" #R "_hc")]] kernel void gguf_decode_hc<R, EpHyperCombine>( \
+      device bfloat *, device uchar *, device uchar *, device uchar *, device bfloat *, \
+      device coherent(device) float *, device atomic_uint *, device bfloat *, device float *, device const float *, \
+      constant GgufDecodeParams &, uint2, uint, uint);
+GGUF_HC(8) GGUF_HC(16) GGUF_HC(32)
+#undef GGUF_HC
+
 // Four stream tiles publish their bf16 gates before the last tile reads
 // them. Each slice owns one counter, covers every row, and sums s=0..3.
 template <ushort Rows>
