@@ -67,3 +67,13 @@ reference gate pass may performance be measured: attention sweep and 38K/114K/22
 TTFT ABBA, per-dispatch GPU times and off/off spread. Expected +15%/+25%/+40%
 throughput at 32K/128K/200K are hypotheses, not results. No promotion is authorized
 by this implementation, a build, or a microbenchmark alone.
+
+`m5-real-oracle.py` runs the normal U7 ABBA configurations and emits their existing
+partition tolerance reports. `m5-long-greedy.py` runs `--long-greedy 128` on a supplied
+pinned suite and collects off/on/on/off token vectors and decoded needle answers.
+The suite must supply 14 distinct prompts for each quality length and all 18
+needle cases. This does not synthesize a passing test set. The independent
+teacher-forced acceptance receipt must include off_accepted/off_proposed and
+on_accepted/on_proposed, at least 4096 proposals per arm. Missing data fails the gate.
+Context entries also require `prompt`, the relative token-file path whose SHA and
+word count the comparator verifies. Preserve the collector logs with the report.

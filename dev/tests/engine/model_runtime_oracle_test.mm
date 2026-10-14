@@ -2411,16 +2411,20 @@ int main(int argc, char **argv) {
     // from its file through a cache of BYTES, as splash serve's option does;
     // its TOKENS line equals the resident table's.
     std::vector<uint32_t> longPrompt;
-    uint32_t longWindow = 16384, longStride = 64;
+    uint32_t longWindow = 16384, longStride = 64, longGreedy = 0;
     model::ModelLoadOptions loadOptions;
     if (argc < 3)
       fail("usage: model-runtime-oracle METALLIB MODEL_ROOT [--kv-format int8|bf16] [--state-format fp32|bf16] "
-           "[--ane-ffn-share SHARE] [--ane-ffn-fault EVALUATION] [--ple-ssd-cache BYTES]");
+           "[--ane-ffn-share SHARE] [--ane-ffn-fault EVALUATION] [--ple-ssd-cache BYTES] "
+           "[--long-prompt-file TOKENS [--long-score-stride 64 | --long-greedy 128]]");
     for (int i = 3; i < argc; ++i) {
       const std::string_view option(argv[i]);
       if (option == "--long-prompt-file" && i + 1 < argc) {
         std::ifstream input(argv[++i]);
         longPrompt = splash::bench::profilePrompt(input);
+      } else if (option == "--long-greedy" && i + 1 < argc) {
+        longGreedy = static_cast<uint32_t>(std::stoul(argv[++i]));
+        require(longGreedy > 0 && longGreedy <= 1024, "invalid long-greedy budget");
       } else if (option == "--long-score-stride" && i + 1 < argc) {
         longStride = static_cast<uint32_t>(std::stoul(argv[++i]));
         require(longStride > 0 && longStride <= 2048, "invalid long-score stride");
@@ -2503,7 +2507,7 @@ int main(int argc, char **argv) {
     // of the size the memory plan would pick for it.
     const kv::Layout kvLayout = model.targetKvLayout(format);
     const uint32_t neededPages = longPrompt.empty() ? 128u :
-        static_cast<uint32_t>((longPrompt.size() + kv::kPageTokens - 1) / kv::kPageTokens);
+        static_cast<uint32_t>((longPrompt.size() + longGreedy + kv::kVerifyRows + kv::kPageTokens - 1) / kv::kPageTokens);
     const uint32_t budgetPages = std::max(neededPages, kvLayout.minimumExtentPages());
     const uint32_t extentPages = kvLayout.extentPagesFor(budgetPages);
     const uint32_t pageCount = longPrompt.empty() ? budgetPages - budgetPages % extentPages :
@@ -2632,6 +2636,32 @@ int main(int argc, char **argv) {
       require(longPrompt.size() > longWindow && longPrompt.size() <= automaticContext,
               "long prompt is outside the admitted model context");
       const auto table = pageRange(0, neededPages);
+      if (longGreedy) {
+        const uint64_t id = 999999;
+        EngineRequest request = makeRequest(id, longPrompt, longGreedy);
+        beginCold(executor, request, 0);
+        ModelStepResult step;
+        for (uint32_t position = 0; position < longPrompt.size();) {
+          const uint32_t count = std::min(2048u, static_cast<uint32_t>(longPrompt.size()) - position);
+          step = prefillChunk(executor, id, position, std::span(longPrompt).subspan(position, count), table);
+          require(step.failure.empty(), "long greedy prefill failed: " + step.failure);
+          position += count;
+        }
+        step = firstStep(executor, std::move(step), id, longPrompt.size(), table);
+        std::vector<uint32_t> generated;
+        while (true) {
+          require(step.failure.empty(), "long greedy decode failed: " + step.failure);
+          require(!step.outputTokens.empty() || step.finished, "long greedy made no progress");
+          generated.insert(generated.end(), step.outputTokens.begin(), step.outputTokens.end());
+          if (step.finished || generated.size() >= longGreedy) break;
+          step = decodeOne(executor, id, states.metadata(0).lengths.targetTokens, table);
+        }
+        std::cout << "LONG_GREEDY";
+        for (const auto token : generated) std::cout << ' ' << token;
+        std::cout << "\nPASS long-context-greedy context=" << longPrompt.size() << " output=" << generated.size() << '\n';
+        executor.end(id);
+        return 0;
+      }
       std::shared_ptr<const CompositeState> checkpoint;
       uint32_t boundary = 0, captured = 0;
       const uint32_t start = static_cast<uint32_t>(longPrompt.size()) - longWindow;

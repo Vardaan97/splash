@@ -10,6 +10,10 @@ import sys
 
 if os.environ.get('M5_WINDOW')!='1': sys.exit('Requires main-session M5_WINDOW=1')
 root,prompts,model,out=map(lambda s:Path(s).resolve(),sys.argv[1:5])
+if subprocess.check_output(['git','-C',str(root),'rev-parse','HEAD'],text=True).strip() != (root/'build/pf-m4.sha').read_text().strip():
+    sys.exit('Source SHA differs from M4 receipt')
+if subprocess.check_output(['git','-C',str(root),'status','--porcelain'],text=True).strip():
+    sys.exit('Candidate source tree is dirty')
 if (out/'identity.result').read_text().strip()!='PASS': sys.exit('M5 identity first')
 # Verify the exact M4-built artifacts before the quality arms too.
 for line in (root/'build/pf-artifacts.sha256').read_text().splitlines():
@@ -37,7 +41,7 @@ with open('/tmp/m5-gpu.lock','a') as lock:
             log=out/f'{prompt["tokens"]}-{arm}.log'
             with log.open('w') as stream: subprocess.run(command,env=arm_env,stdout=stream,stderr=subprocess.STDOUT,check=True)
             if f'PASS long-context-capture rows=256 context={prompt["tokens"]}' not in log.read_text(): sys.exit('Incomplete capture')
-            if arm.startswith('on') and 'PF7 tolerance pass' not in log.read_text(): sys.exit('Candidate fell back; quality result invalid')
+            if arm.startswith('on') and ('PF7 tolerance pass' not in log.read_text() or 'PF7 runtime compact dispatched' not in log.read_text()): sys.exit('Candidate fell back; quality result invalid')
             record[arm]=f'{prompt["tokens"]}-{arm}.f32'
         manifest['contexts'].append(record)
 (out/'captures.json').write_text(json.dumps(manifest,indent=2)+'\n')

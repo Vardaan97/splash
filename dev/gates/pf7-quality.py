@@ -83,15 +83,15 @@ def evaluate(manifest, root):
         report['contexts'].append(result)
         report['pass'] &= result['pass']
     oracle = manifest['oracle']
-    expected = {('int8', 'fp32'), ('bf16', 'bf16')}
-    if {(x['kv'], x['state']) for x in oracle} != expected:
+    expected = {('int8', 'fp32', 0), ('int8', 'fp32', 2147483648), ('bf16', 'bf16', 0)}
+    if {(x['kv'], x['state'], x['ple_bytes']) for x in oracle} != expected:
         raise ValueError('both oracle tolerance configurations required')
     report['oracle_pass'] = all(x['off_pass'] is True and x['on_pass'] is True and
         x['min_state_cosine'] >= (.999 if x['state'] == 'fp32' else .99) for x in oracle)
     report['greedy'] = []
     for length in (32768, 131072, 204800):
         prompts = [x for x in manifest['greedy'] if x['context'] == length]
-        if len(prompts) < 14 or any(len(x['off']) < 128 or len(x['on']) < 128 for x in prompts):
+        if len(prompts) < 14 or len({x['prompt_sha256'] for x in prompts}) != len(prompts) or any(len(x['prompt_sha256']) != 64 or len(x['off']) < 128 or len(x['on']) < 128 for x in prompts):
             raise ValueError('14 long prompts x 128 greedy tokens per length required')
         equal = sum(x['off'] == x['on'] for x in prompts)
         agreement = sum(sum(a == b for a, b in zip(x['off'], x['on'])) for x in prompts) / sum(max(len(x['off']), len(x['on'])) for x in prompts)
@@ -101,7 +101,7 @@ def evaluate(manifest, root):
     required = {(c,d,s) for c in (65536,131072,204800) for d in (.1,.5,.9) for s in (0,1)}
     if {(x['context'],x['depth'],x['seed']) for x in needles} != required:
         raise ValueError('18 needle checks (64K/128K/200K x 10/50/90% x 2 seeds) required')
-    report['needle_pass'] = all(x['off'] == x['expected'] and x['on'] == x['expected'] for x in needles)
+    report['needle_pass'] = all(isinstance(x['expected'], str) and bool(x['expected'].strip()) and x['off'] == x['expected'] and x['on'] == x['expected'] for x in needles)
     acceptance = manifest['acceptance']
     rates = {}
     for arm in ('off', 'on'):

@@ -60,6 +60,15 @@ void addPrefillCompact(metal::CommandGraph &graph, SplashKvLayer layer,
     metal::MetalBuffer queries, metal::MetalBuffer output, metal::MetalBuffer partials,
     metal::MetalBuffer statistics, metal::MetalBuffer table,
     const kv::ChunkedPrefillParams &chunk, QsaMask mask, kv::Format format) {
+  // U2 uses a short history. This marker proves long-context collectors
+  // exercised production graph selection rather than merely passing U2.
+  if (chunk.committed_tokens >= SPLASH_PREFILL_TOKEN_BUDGET) {
+    static thread_local bool reported = false;
+    if (!reported) {
+      std::cerr << "PF7 runtime compact dispatched context=" << chunk.committed_tokens << " rows=" << chunk.chunk_tokens << '\n';
+      reported = true;
+    }
+  }
   const auto workspace = prefillCompactWorkspace(chunk.chunk_tokens);
   requireBytes(partials, workspace.partialsBytes, "compact attention partials");
   requireBytes(statistics, workspace.statisticsBytes, "compact attention statistics/list");
@@ -168,7 +177,7 @@ bool compactProbe(metal::MetalBackend &backend, const std::string &) {
                   dot += a * b; aa += a * a; bb += b * b;
                   maximum = std::max(maximum, std::fabs(a - b));
                 }
-              if (maximum > 0.02f || ((aa || bb) && dot / std::sqrt(aa * bb) < 0.999)) return false;
+              if (maximum > 0.02f || ((aa || bb) && (!(aa && bb) || dot / std::sqrt(aa * bb) < 0.999))) return false;
             } else if (std::memcmp(repeated.data(), output.contents(), output.sizeBytes())) return false;
           }
         }
