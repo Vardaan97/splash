@@ -686,3 +686,5 @@ $(TEST_DISPATCH_FLOOR_BENCHMARK): dev/benchmarks/dispatch_floor_benchmark.mm $(L
 TEST_CONFIG_TARGETS += $(ENGINE_TEST_BUILD)/prefill-attention-variants
 $(ENGINE_TEST_BUILD)/prefill-attention-variants: dev/tests/engine/prefill_attention_variants_test.mm $(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
+$(ENGINE_TEST_BUILD)/prefill-qsa-compact: dev/tests/engine/prefill_qsa_compact_test.mm $(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
