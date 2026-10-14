@@ -328,7 +328,8 @@ metal::MetalBuffer QwenTarget::addPrefill(
     if (!everyLayer(sequence.convolutionIn) || !everyLayer(sequence.convolutionOut) ||
         !everyLayer(sequence.recurrentIn) || !everyLayer(sequence.recurrentOut) ||
         !std::ranges::all_of(sequence.stateCaptures, [&](const QwenTargetStateCapture &capture) {
-          return everyLayer(capture.convolution) && everyLayer(capture.recurrent);
+          return everyLayer(capture.convolution) && everyLayer(capture.recurrent) &&
+                 (capture.auxiliary || !geometry_.stateLayout.auxiliaryBytes);
         })) {
       throw std::invalid_argument("Qwen prefill state layer mismatch");
     }
@@ -705,12 +706,18 @@ metal::MetalBuffer QwenTarget::addQwen4Prefill(PrefillStep &step, const Qwen4Exp
       project(h.pleRows, ple.value, h.pleValue);
       ops::Qwen4::addPleGate(step.graph, h.gate, h.pleValue, h.streams, ple.keyNorm, ple.queryNorm,
                              ple.convolutionNorm, h.pleGated, h.pleConvolution, ps, rows);
-      for (const QwenTargetPrefillSequence &sequence : step.sequences)
+      for (const QwenTargetPrefillSequence &sequence : step.sequences) {
         ops::Qwen4::addPleConvolution(
             step.graph, u16Rows(h.pleConvolution, sequence.rowBegin, sequence.rows, ps.width()),
             sequence.pleHistoryIn, sequence.pleHistoryOut, ple.convolution,
             f32Rows(h.pleGated, sequence.rowBegin, sequence.rows, ps.width()),
             f32Rows(h.streams, sequence.rowBegin, sequence.rows, ps.width()), ps, sequence.rows);
+        // A state captured inside the command holds the history after its row.
+        for (const QwenTargetStateCapture &capture : sequence.stateCaptures)
+          ops::Qwen4::addPleHistory(step.graph,
+                                    u16Rows(h.pleConvolution, sequence.rowBegin, capture.row, ps.width()),
+                                    sequence.pleHistoryIn, capture.auxiliary, ps, capture.row);
+      }
     }
     mix(layer.mixerHyper, b.normalized, h.streams);
     std::visit(
@@ -828,6 +835,10 @@ metal::MetalBuffer QwenTarget::addQwen4Prefill(PrefillStep &step, const Qwen4Exp
                               mtp.hiddenNorm, h.mtpInput, hs, sequence.rows, sequence.rows, sequence.rowBegin, rows);
       ops::Qwen4::addMtpCarry(step.graph, f32Rows(h.streams, sequence.rowBegin, sequence.rows, width),
                               mtpCarried(sequence.pleHistoryOut), {}, hs, sequence.rows);
+      // A state captured inside the command carries its row's streams.
+      for (const QwenTargetStateCapture &capture : sequence.stateCaptures)
+        ops::Qwen4::addMtpCarry(step.graph, f32Rows(h.streams, sequence.rowBegin, capture.row, width),
+                                mtpCarried(capture.auxiliary), {}, hs, capture.row);
     }
     for (uint32_t s = 0; s < hs.streams; ++s)
       project(rowsFrom<uint16_t>(backend_, h.mtpInput, s * rows, 2 * hidden), mtp.embedHidden,
