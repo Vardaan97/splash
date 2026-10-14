@@ -96,7 +96,7 @@ struct Fixture {
     return {floats(16, hidden).blocks().segments.front(), floats(1, hidden).blocks().segments.front(),
             forward, forward, down};
   }
-  explicit Fixture(const char *library, bool adaptive = true, bool withContext = false, bool zeroDepth = false, bool lookup = false, bool mtpLookup = false, const char *depth = "cost", bool streamed = false)
+  explicit Fixture(const char *library, bool adaptive = true, bool withContext = false, bool zeroDepth = false, bool lookup = false, bool mtpLookup = false, const char *depth = "cost", bool streamed = false, ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32, kv::Format kvFormat = kv::Format::Int8)
       : backend(library), contextWeights(withContext), operators(backend.capabilities()) {
     setenv("SPLASH_MTP_ADAPTIVE", adaptive ? "1" : "0", 1);
     setenv("SPLASH_MTP_DRAFTS", "7", 1);
@@ -213,13 +213,13 @@ struct Fixture {
     const metal::AllocationAdmission admit = [](uint64_t, const std::function<void()> &allocate) {
       allocate(); return metal::AllocationResult{};
     };
-    const auto kvLayout = model.targetKvLayout(kv::Format::Int8);
+    const auto kvLayout = model.targetKvLayout(kvFormat);
     const uint32_t extent = kvLayout.minimumExtentPages();
     const uint32_t pageCount = ((64 + extent - 1) / extent) * extent;
     pages = std::make_unique<kv::PageStorage>(backend, admit, kvLayout, pageCount, extent);
     for (uint32_t i = 0; i < pageCount / extent; ++i)
       require(bool(pages->allocateExtent(i)), "fixture extent allocation");
-    states = std::make_unique<QwenStateStorage>(backend, admit, model.stateLayout(ops::GdnStateFormat::Float32), nullptr);
+    states = std::make_unique<QwenStateStorage>(backend, admit, model.stateLayout(stateFormat), nullptr);
     RuntimeContext context{backend, model, *pages, *states, operators};
     context.mtpDepth.probeCycles = context.mtpDepth.exploreCycles = 0;
     context.mtpDepth.measuredCosts = false; // deterministic plans, independent of GPU timings
@@ -289,6 +289,79 @@ void profileComposition(const char *library) {
   }
   for (uint64_t id : ids) f.runtime->end(id);
   std::cout << "runtime_streamed_profile_composition=PASS\n";
+}
+
+// Compare the real runtime's complete state/KV and raw first-position logits
+// at identical row partitions; force plan slices so make check exercises this
+// even with the environment flag absent. Include a peer decode at the yield.
+void slicedPrefillIdentity(const char *library) {
+  for (auto stateFormat : {ops::GdnStateFormat::Float32, ops::GdnStateFormat::BFloat16})
+    for (auto kvFormat : {kv::Format::Int8, kv::Format::BFloat16})
+      for (bool streamed : {false, true}) {
+        Fixture f(library, true, false, true, true, false, "cost", streamed, stateFormat, kvFormat);
+        const auto stateBytes = [&] {
+          std::vector<std::byte> result;
+          const auto append = [&](const metal::MetalBuffer &buffer) {
+            if (!buffer) return;
+            const auto *p = static_cast<const std::byte *>(buffer.contents());
+            require(p != nullptr, "state is not CPU-visible");
+            result.insert(result.end(), p, p + buffer.sizeBytes());
+          };
+          const auto &state = f.states->current(0);
+          for (const auto &buffer : state.convolutionLayers) append(buffer);
+          for (const auto &buffer : state.recurrentLayers) append(buffer);
+          append(state.auxiliary);
+          return result;
+        };
+        std::vector<std::byte> expectedState, expectedKv, expectedCapture, expectedLogits;
+        for (uint32_t slices : {0u, 2u, 8u}) {
+          f.pages->clearPages(std::array<uint32_t, 2>{0, 4});
+          auto peer = f.request(701, {11});
+          peer.sampling.temperature = 0.7F;
+          peer.sampling.seed = 77;
+          f.prefill(peer, 1);
+          auto request = f.request(700, std::vector<uint32_t>(48, 10));
+          request.maxNewTokens = 0;
+          request.scoreTokens = {0, 1, 10, 11};
+          f.runtime->beginColdRequest(request.modelView(), 0);
+          const std::array<uint32_t, 2> table{0, 4};
+          BatchPlan plan{.kind = WorkKind::Prefill, .items = {{request.id, 48}}, .prefillSlices = slices};
+          ModelBatchItem item{request.id, 0, 48, table};
+          item.inputTokens = request.prompt;
+          item.pageTableRevision = ++f.revisions[request.id];
+          item.stateCaptures.push_back({32, f.runtime->reserveState(request.id, 32)});
+          require(bool(item.stateCaptures[0].reservation), "capture reservation failed");
+          auto ticket = f.runtime->submit(plan, std::span(&item, 1), {});
+          unsigned yields = 0;
+          while (!ticket->ready()) {
+            if (!ticket->segmentReady()) { std::this_thread::yield(); continue; }
+            ticket->pauseSegment();
+            require(f.states->metadata(0).lengths.targetTokens == 0, "partial slice committed lengths");
+            require(f.decode(701, 1).failure.empty(), "peer decode failed between layers");
+            ticket->resumeSegment();
+            ++yields;
+          }
+          const auto result = ticket->wait().front();
+          require(result.failure.empty() && result.capturedStates.size() == 1, "sliced prefill failed");
+          require((slices == 0) == (yields == 0), "sliced runtime never yielded");
+          auto actualState = stateBytes();
+          std::vector<std::byte> actualKv;
+          for (uint32_t page : table)
+            for (const auto span : f.pages->spans(page)) actualKv.insert(actualKv.end(), span.begin(), span.end());
+          std::vector<std::byte> logits(result.scoreLogits.size() * sizeof(float));
+          std::memcpy(logits.data(), result.scoreLogits.data(), logits.size());
+          require(!f.runtime->beginRestore(request.id, 32, result.capturedStates[0], true, {}), "capture restore failed");
+          auto capture = stateBytes();
+          if (!slices) {
+            expectedState = actualState; expectedKv = actualKv; expectedCapture = capture; expectedLogits = logits;
+          } else {
+            require(actualState == expectedState && actualKv == expectedKv && capture == expectedCapture && logits == expectedLogits,
+                    "layer slicing changed state, PLE history, captures, KV or logits");
+          }
+          f.runtime->end(700); f.runtime->end(701);
+        }
+      }
+  std::cout << "runtime_sliced_prefill_identity=PASS\n";
 }
 
 void lookupMixing(const char *library, const char *depth = "cost") {
@@ -588,7 +661,7 @@ void constrainedTransitions(const char *library) {
 int main(int argc, char **argv) {
   try {
     require(argc == 2, "usage: mtp-runtime METALLIB");
-    profileComposition(argv[1]); ruleLaneIdentity(argv[1]); streamedPrefetch(argv[1]); lookupMixing(argv[1]); lookupMixing(argv[1], "rule"); lookupMixing(argv[1], "lane"); unequalCommit(argv[1]); thinkingZeroDepth(argv[1]); thinkingCutoff(argv[1]); contextLifetime(argv[1]); constrainedTransitions(argv[1]);
+    profileComposition(argv[1]); slicedPrefillIdentity(argv[1]); ruleLaneIdentity(argv[1]); streamedPrefetch(argv[1]); lookupMixing(argv[1]); lookupMixing(argv[1], "rule"); lookupMixing(argv[1], "lane"); unequalCommit(argv[1]); thinkingZeroDepth(argv[1]); thinkingCutoff(argv[1]); contextLifetime(argv[1]); constrainedTransitions(argv[1]);
   } catch (const std::exception &error) {
     std::cerr << "mtp-runtime: FAIL: " << error.what() << '\n'; return 1;
   }

@@ -249,7 +249,8 @@ ModelStepResult prefillChunk(model::Runtime &executor, uint64_t requestId,
   const uint32_t tokenCount = static_cast<uint32_t>(inputTokens.size());
   BatchPlan plan{.kind = WorkKind::Prefill,
                  .items = {{requestId, tokenCount}},
-                 .decodeStage = DecodeStage::Regular};
+                 .decodeStage = DecodeStage::Regular,
+                 .prefillSlices = executor.prefillSliceCount()};
   std::unique_ptr<ModelBatchTicket> ticket;
   {
     // The items go once the command is submitted, as the engine's do.

@@ -2978,3 +2978,18 @@ while a server runs. Running it again upgrades; installed models stay. To try
 an archive before uploading it, serve `dist/` (`python3 -m http.server`) and
 run the installer with `SPLASH_BASE_URL` naming that server, `SPLASH_VERSION`
 and any `SPLASH_TOKEN`.
+
+### Experimental layer-sliced prefill
+
+| Flag | Default | Scope | Sunset |
+| --- | --- | --- | --- |
+| `SPLASH_PREFILL_SLICES=2..48` | 0 (off) | Flash-Next GPU text prefill while same/higher priority peers decode | Remove or promote after bitwise state/KV oracle, cancellation/reclaim tests and contended 100K ABBA gate |
+
+The scheduler retains a full 2048-row budget and the runtime submits ordered
+layer groups one at a time. The engine may run one same/higher-priority decode
+batch between groups. The chunk keeps its lane, KV pages and captured-state
+reservations until final completion. Parity, lengths, captures and the first
+token commit only after the final group. Cancellation drains the submitted
+group and discards the provisional chunk. ANE splits, image encoding, other
+model families and multi-lane prefill use a single command. Invalid flag
+values disable slicing. Arithmetic and kernel order are unchanged (class B).

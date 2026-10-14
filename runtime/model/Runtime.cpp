@@ -1,4 +1,5 @@
 #include "model/Runtime.hpp"
+#include "model/PrefillPolicy.hpp"
 #include "AwakeClock.hpp"
 #include "StderrLine.hpp"
 #include "model/QwenState.hpp"
@@ -100,6 +101,68 @@ private:
   CommandTicket ticket_;
   double wallMilliseconds_ = 0.0;
   bool representativePrefillTiming_;
+};
+
+// Only one segment is submitted at a time. Completed tickets release the
+// backend before the engine schedules a peer's decode command.
+class SlicedPrefillTicket final : public ModelBatchTicket {
+public:
+  using Finish = DeferredMetalTicket::Completion;
+  SlicedPrefillTicket(MetalBackend &backend, std::vector<EncodedCommand> commands,
+                     std::function<void()> notify, std::function<void()> prepare,
+                     Finish finish, std::vector<ModelStepResult> discarded)
+      : backend_(backend), commands_(std::move(commands)), notify_(std::move(notify)),
+        prepare_(std::move(prepare)), finish_(std::move(finish)), discarded_(std::move(discarded)) {
+    submit();
+  }
+  bool ready() const noexcept override {
+    return ticket_.ready() && (cancelled_ || next_ == commands_.size());
+  }
+  bool segmentReady() const noexcept override {
+    return !cancelled_ && next_ < commands_.size() && ticket_.ready();
+  }
+  void abandonMask(uint64_t) noexcept override { cancelled_ = true; }
+  void pauseSegment() override {
+    if (!segmentReady() || paused_) throw std::logic_error("prefill segment is not pausable");
+    retire();
+    paused_ = true;
+  }
+  void resumeSegment() override {
+    if (!segmentReady()) throw std::logic_error("prefill segment is not complete");
+    if (!paused_) retire();
+    paused_ = false;
+    prepare_();
+    submit();
+  }
+  std::vector<ModelStepResult> wait() override {
+    if (!paused_) retire();
+    while (!cancelled_ && next_ < commands_.size()) {
+      prepare_();
+      submit();
+      retire();
+    }
+    if (!finish_) throw std::logic_error("prefill ticket was already consumed");
+    auto finish = std::move(finish_);
+    return cancelled_ ? std::move(discarded_) : finish(timing_);
+  }
+  double wallMilliseconds() const noexcept override { return timing_.wallSeconds * 1000.0; }
+private:
+  void retire() {
+    const auto timing = ticket_.wait();
+    timing_.gpuSeconds += timing.gpuSeconds;
+    timing_.wallSeconds += timing.wallSeconds;
+  }
+  void submit() { ticket_ = backend_.submitEncoded(std::move(commands_.at(next_++)), notify_); }
+  MetalBackend &backend_;
+  std::vector<EncodedCommand> commands_;
+  std::function<void()> notify_, prepare_;
+  Finish finish_;
+  std::vector<ModelStepResult> discarded_;
+  size_t next_ = 0;
+  bool cancelled_ = false, paused_ = false;
+  CommandTiming timing_{};
+  // Destroy the in-flight ticket before releasing captured reservations.
+  CommandTicket ticket_;
 };
 
 using kv::ChunkedPrefillParams;
@@ -742,6 +805,19 @@ struct Runtime::Impl {
       throw std::invalid_argument("a streamed PLE table runs with the MTP head or looked-up proposals");
     prefillArena = std::make_unique<PrefillArena>(backend, geometry, operators);
     decodeArena = std::make_unique<DecodeArena>(backend, geometry, operators);
+    if (prefillSlices()) {
+      for (uint32_t p = 0; p < prefillTensorCount; ++p) {
+        const auto a = prefillArena->get(static_cast<PrefillTensor>(p));
+        if (!a) continue;
+        for (uint32_t d = 0; d < decodeTensorCount; ++d)
+          for (uint32_t lane = 0; lane < kLaneCount; ++lane) {
+            const auto b = decodeArena->get(lane, static_cast<DecodeTensor>(d));
+            if (b && a.gpuAddress() < b.gpuAddress() + b.sizeBytes() &&
+                b.gpuAddress() < a.gpuAddress() + a.sizeBytes())
+              throw std::logic_error("prefill and decode scratch arenas alias");
+          }
+      }
+    }
     penaltyTable =
         decodeArena->batchSlice(DecodeTensor::PenaltyState, kLaneCount);
     if (geometry.target.qwen4())
@@ -3187,6 +3263,10 @@ void Runtime::setDraftContextPlan(uint64_t requestId, DraftContextPlan plan) {
   entry.draftContextPlan = std::move(plan);
 }
 
+uint32_t Runtime::prefillSliceCount() const noexcept {
+  return !impl_->aneFfn && impl_->geometry.target.qwen4() ? prefillSlices() : 0;
+}
+
 std::vector<ModelStepResult>
 Runtime::prefill(const BatchPlan &plan, std::span<const ModelBatchItem> items) {
   return prefillAsync(plan, items, {})->wait();
@@ -3241,9 +3321,16 @@ Runtime::prefillAsync(const BatchPlan &plan,
   // The completion's items hold the states' reservations until the ticket
   // has waited for every run of the command.
   std::vector<ModelBatchItem> copiedItems(items.begin(), items.end());
-  CommandTicket command =
-      impl_->aneFfn ? impl_->aneFfn->commit(graph, std::move(completion))
-                    : impl_->backend.submitCommandAsync(graph.command(), std::move(completion));
+  const bool sliced = impl_->geometry.target.qwen4() && plan.prefillSlices > 1 && items.size() == 1 &&
+                      !impl_->aneFfn && !encodesImages;
+  std::vector<EncodedCommand> segments;
+  if (sliced)
+    for (const auto &segment : graph.layerCommands(plan.prefillSlices))
+      segments.push_back(impl_->backend.encodeCommand(segment));
+  CommandTicket command;
+  if (!sliced)
+    command = impl_->aneFfn ? impl_->aneFfn->commit(graph, std::move(completion))
+                           : impl_->backend.submitCommandAsync(graph.command(), std::move(completion));
   Impl *impl = impl_.get();
   auto finish = [impl, entries, outputs, draws,
                  items = std::move(copiedItems)](CommandTiming &timing) mutable {
@@ -3420,6 +3507,19 @@ Runtime::prefillAsync(const BatchPlan &plan,
     impl->counters.totalPrefillGpuSeconds += timing.gpuSeconds;
     return results;
   };
+  if (sliced) {
+    // Decode reuses compact scratch lanes, including the sampled head's
+    // uniforms. The request's draws are stable; restore them without drawing.
+    auto prepare = [impl, entry = entries[0]] {
+      if (impl->samplingEnabled(*entry)) impl->uploadSamplingUniforms(*entry, 0);
+    };
+    std::vector<ModelStepResult> discarded{
+        {.requestId = items[0].requestId, .consumedPromptTokens = items[0].tokenCount,
+         .failure = "prefill chunk cancelled"}};
+    return std::make_unique<SlicedPrefillTicket>(
+        impl_->backend, std::move(segments), std::move(completion), std::move(prepare),
+        std::move(finish), std::move(discarded));
+  }
   return std::make_unique<DeferredMetalTicket>(
       std::move(command), std::move(finish), !encodesImages);
 }

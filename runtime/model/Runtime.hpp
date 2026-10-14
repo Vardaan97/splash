@@ -28,6 +28,7 @@ public:
   [[nodiscard]] std::vector<uint8_t> pendingGdnRows(uint64_t requestId) const;
   [[nodiscard]] StateAdmission
   begin(const ModelRequest &request) override;
+  [[nodiscard]] uint32_t prefillSliceCount() const noexcept override;
   void suspend(uint64_t requestId) override;
   [[nodiscard]] StateAdmission
   resume(const ModelRequest &request) override;

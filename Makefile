@@ -254,6 +254,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/metal/DeviceCapabilities.cpp \
 	runtime/engine/MemoryPlan.cpp \
 	runtime/engine/AneFfnStartup.cpp \
+	runtime/model/PrefillPolicy.cpp \
 	runtime/engine/Scheduler.cpp \
 	runtime/engine/Cache.cpp \
 	runtime/engine/WriteBehind.cpp \

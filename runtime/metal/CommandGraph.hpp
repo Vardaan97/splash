@@ -2,6 +2,7 @@
 
 #include "MetalBackend.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -107,6 +108,27 @@ public:
       dispatches_[i].independentOfPrevious = true;
   }
 
+  // Safe command boundaries, recorded only between complete layers.
+  void layerBoundary() {
+    if (!dispatches_.empty() && (layers_.empty() || layers_.back() != dispatches_.size()))
+      layers_.push_back(dispatches_.size());
+  }
+  [[nodiscard]] std::vector<Command> layerCommands(uint32_t count) const {
+    if (count < 2 || layers_.size() < 2 || !events_.empty()) return {command()};
+    count = std::min<uint32_t>(count, layers_.size());
+    std::vector<Command> result;
+    size_t begin = 0;
+    for (uint32_t i = 1; i < count; ++i) {
+      const size_t end = layers_[i * layers_.size() / count - 1];
+      if (end < dispatches_.size() && dispatches_[end].independentOfPrevious)
+        throw std::logic_error("layer boundary crosses an independent group");
+      result.push_back({dispatches().subspan(begin, end - begin), {}});
+      begin = end;
+    }
+    result.push_back({dispatches().subspan(begin), {}});
+    return result;
+  }
+
   [[nodiscard]] bool empty() const noexcept { return dispatches_.empty(); }
   // The dispatches alone; command() has the event steps too.
   [[nodiscard]] std::span<const ComputeDispatch> dispatches() const noexcept {
@@ -138,6 +160,7 @@ private:
   std::deque<std::vector<std::byte>> payloads_;
   std::vector<ComputeDispatch> dispatches_;
   std::vector<EventStep> events_;
+  std::vector<size_t> layers_;
 };
 
 } // namespace splash::metal

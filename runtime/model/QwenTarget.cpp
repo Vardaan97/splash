@@ -882,6 +882,7 @@ metal::MetalBuffer QwenTarget::addQwen4Prefill(PrefillStep &step, const Qwen4Exp
     mix(layer.ffnHyper, b.normalized, h.streams);
     ops::MoE::add(step.graph, {b.normalized, h.zeros, h.branch, b.moe}, layer.ffn, *step.moe);
     ops::Qwen4::addCombine(step.graph, h.streams, h.branch, h.weights, hs, rows);
+    step.graph.layerBoundary();
   }
   requireLayerPartition(geometry_, step.gdnLayer, step.attentionLayer);
   // The final mix, which the head reads as it is.

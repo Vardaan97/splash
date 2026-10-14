@@ -15,6 +15,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -302,6 +303,7 @@ struct BatchPlan final {
   bool constrained = false;
   std::vector<BatchItem> items;
   DecodeStage decodeStage = DecodeStage::Regular;
+  uint32_t prefillSlices = 0;
 
   [[nodiscard]] bool empty() const noexcept { return items.empty(); }
   [[nodiscard]] uint32_t width() const noexcept {
@@ -411,6 +413,9 @@ public:
     return false;
   }
   virtual void abandonMask(uint64_t) noexcept {}
+  [[nodiscard]] virtual bool segmentReady() const noexcept { return false; }
+  virtual void pauseSegment() { throw std::logic_error("ticket is not segmented"); }
+  virtual void resumeSegment() { throw std::logic_error("ticket is not segmented"); }
   [[nodiscard]] virtual bool ready() const noexcept = 0;
   [[nodiscard]] virtual std::vector<ModelStepResult> wait() = 0;
   [[nodiscard]] virtual double wallMilliseconds() const noexcept = 0;
@@ -574,6 +579,7 @@ class Model {
 public:
   virtual ~Model() = default;
   virtual void checkHealth() {}
+  [[nodiscard]] virtual uint32_t prefillSliceCount() const noexcept { return 0; }
   [[nodiscard]] virtual StateAdmission begin(const ModelRequest &request) = 0;
   // Safe-point preemption returns the request's state buffers, retaining
   // only its host-side sampling/constraint continuation. Resume replays the
