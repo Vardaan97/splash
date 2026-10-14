@@ -192,7 +192,7 @@ void prefillCompactSelfTest(metal::MetalBackend &backend) {
   const char *test = std::getenv("SPLASH_KERNEL_SELFTEST");
   const bool explicitTest = test && std::string_view(test) == "1";
   if (!prefillCompactRequested()) return;
-  if (backend.capabilities().appleGpuFamily < 10) {
+  if (backend.capabilities().appleGpuFamily != 10) {
     std::cerr << "kernel-selftest: PF7 unavailable on Apple" << backend.capabilities().appleGpuFamily << '\n';
     return;
   }

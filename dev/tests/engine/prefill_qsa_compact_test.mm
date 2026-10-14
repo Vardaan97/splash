@@ -56,8 +56,8 @@ int main(int argc, char **argv) {
   try {
     if (argc < 2) throw std::runtime_error("usage: prefill-attention-variants METALLIB [--full]");
     metal::MetalBackend backend(argv[1]);
-    if (backend.capabilities().appleGpuFamily < 10) {
-      std::cout << "UNAVAILABLE Apple9: candidates restricted to Apple10; M5 memcmp still required\n";
+    if (backend.capabilities().appleGpuFamily != 10) {
+      std::cout << "UNAVAILABLE Apple" << backend.capabilities().appleGpuFamily << ": candidates restricted to Apple10; M5 memcmp still required\n";
       return 0;
     }
     const bool full = argc > 2 && std::string_view(argv[2]) == "--full";
