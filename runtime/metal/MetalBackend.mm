@@ -841,6 +841,7 @@ struct MetalBackend::Impl {
     struct GraphCacheEntry {
         std::string key;
         PreparedCommand command;
+        std::vector<std::weak_ptr<MetalAllocation>> allocations;
         size_t bytes = 0;
     };
     std::deque<GraphCacheEntry> graphCache;
@@ -885,6 +886,19 @@ struct MetalBackend::Impl {
         for (auto it = graphCache.begin(); it != graphCache.end(); ++it) {
             if (it->key != key) continue;
             PreparedCommand result = it->command;
+            bool live = true;
+            for (const auto &allocation : it->allocations) {
+                auto retained = allocation.lock();
+                if (!retained) { live = false; break; }
+                result.retainedAllocations.push_back(std::move(retained));
+            }
+            // The cache never pins state cells or KV allocations after their
+            // owner releases them. A recycled address must miss, not revive
+            // the old command's retention list.
+            if (!live) {
+                graphCacheBytes -= it->bytes; graphCache.erase(it);
+                break;
+            }
             // Rebind to this cycle's graph-owned payloads. This patches every
             // byte struct, including position, parity, live rows and lookup
             // policy; data-dependent grids are part of the key and miss safely.
@@ -916,7 +930,10 @@ struct MetalBackend::Impl {
             }
             auto retained = fresh;
             for (auto &item : retained.dispatches) item.source = nullptr;
-            graphCache.push_back({std::move(key), std::move(retained), bytes}); graphCacheBytes += bytes;
+            std::vector<std::weak_ptr<MetalAllocation>> allocations;
+            for (const auto &allocation : retained.retainedAllocations) allocations.push_back(allocation);
+            retained.retainedAllocations.clear();
+            graphCache.push_back({std::move(key), std::move(retained), std::move(allocations), bytes}); graphCacheBytes += bytes;
         }
         return fresh;
     }

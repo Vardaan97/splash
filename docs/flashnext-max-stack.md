@@ -66,7 +66,9 @@ Runtime graph construction. Exact pipeline, grid, group, binding, view and
 byte-layout keys avoid omitted shape dimensions. All fresh payloads are
 rebound, including positions, parity, live rows and lookup. Thus position
 patches cannot become stale. 64-entry LRU, at most 32 MiB counted key/metadata;
-allocations retained by the command metadata are existing buffers. Verify
+cache entries hold weak allocation references and do not pin released state/KV
+memory; actual submitted commands retain their live allocations as before. The
+bounded host metadata sits within the existing 512 MiB runtime reserve. Verify
 re-resolves pipelines/grids/retained allocations and compares. Skipping fresh
 Runtime graph construction is deliberately deferred until every baked
 parameter can be audited; no 0.2–0.4 ms saving is claimed for this narrower
