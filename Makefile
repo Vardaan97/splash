@@ -54,7 +54,8 @@ PREFILL_CANDIDATE_SOURCES := runtime/metal/kernels/decode/paged_attention_qk2.me
 	runtime/metal/kernels/prefill/paged_attention_qk2.metal \
 	runtime/metal/kernels/prefill/paged_attention_prob2.metal \
 	runtime/metal/kernels/prefill/paged_attention_rows4.metal \
-	runtime/metal/kernels/prefill/paged_attention_compact.metal
+	runtime/metal/kernels/prefill/paged_attention_compact.metal \
+	runtime/metal/kernels/shared/dispatch_floor.metal
 PRODUCTION_KERNEL_SOURCES := $(filter-out $(PREFILL_CANDIDATE_SOURCES),$(PRODUCTION_KERNEL_SOURCES)) $(PREFILL_CANDIDATE_SOURCES)
 PRODUCTION_KERNEL_NAMES := \
 	$(patsubst runtime/metal/kernels/%.metal,%,$(PRODUCTION_KERNEL_SOURCES))
@@ -238,6 +239,7 @@ ENGINE_INSTRUMENTED_METAL_OBJECT := $(ENGINE_BUILD)/metal/MetalBackendInstrument
 # the same way.
 ENGINE_INSTRUMENTED_ANE_OBJECT := $(ENGINE_BUILD)/ane/ProgramInstrumented.o
 ENGINE_CPP_SOURCES := \
+	runtime/metal/KernelSelfTest.cpp \
 	runtime/metal/MoePrefillPolicy.cpp \
 	runtime/metal/MoePrefillSelfTest.cpp \
 	runtime/ops/AttentionPolicy.cpp \

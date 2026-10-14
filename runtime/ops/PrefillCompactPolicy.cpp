@@ -1,3 +1,4 @@
+#include "metal/KernelSelfTest.hpp"
 #include "ops/PrefillCompactPolicy.hpp"
 #include "metal/abi/PrefillCompact.h"
 #include "ops/BufferExtent.hpp"
@@ -203,4 +204,5 @@ void prefillCompactSelfTest(metal::MetalBackend &backend) {
   std::cerr << "kernel-selftest: PF7 " << (ok ? "tolerance pass; repeat bitwise" : "failed; fallback forced") << '\n';
   if (explicitTest && !ok) throw std::runtime_error("PF7 device self-test failed");
 }
+namespace { [[maybe_unused]] const bool registered = metal::registerKernelSelfTest(prefillCompactSelfTest); }
 } // namespace splash::ops

@@ -1,3 +1,4 @@
+#include "metal/KernelSelfTest.hpp"
 #include "ops/AttentionPolicy.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/CommandGraph.hpp"
@@ -254,4 +255,5 @@ void attentionKernelSelfTest(metal::MetalBackend &backend) {
   passed.store(ok);
   if (explicitTest && !ok) throw std::runtime_error("attention kernel self-test failed; fallback forced");
 }
+namespace { [[maybe_unused]] const bool registered = metal::registerKernelSelfTest(attentionKernelSelfTest); }
 } // namespace splash::ops
