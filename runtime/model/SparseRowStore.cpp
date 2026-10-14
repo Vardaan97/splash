@@ -160,11 +160,13 @@ uint64_t SparseRowStore::cacheBytesFor(uint64_t rows, uint32_t rowBytes) noexcep
 uint64_t SparseRowStore::workingBytes(uint32_t rowBytes, uint32_t prefetchRows) noexcept {
   // A prefetched row's bytes, id and destination; a stage's dedupe map (three
   // words in each of twice as many buckets), distinct and missing ids, and
-  // its read job's id and destination per row.
+  // its read job's id and destination per row. Prefetch deduplication keeps
+  // two words in each of twice as many buckets as a prefill's ids.
   const uint64_t prefetch = uint64_t{prefetchRows} * (uint64_t{rowBytes} + sizeof(uint32_t) + sizeof(uint8_t *));
   const uint64_t stage = uint64_t{kSparseRowStageRows} * (6 * sizeof(uint32_t) + 2 * sizeof(uint32_t) +
                                                           sizeof(uint32_t) + sizeof(uint8_t *));
-  return prefetch + stage;
+  const uint64_t prefetchMap = indexBuckets(kSparseRowStageRows) * 2 * sizeof(uint32_t);
+  return prefetch + stage + prefetchMap;
 }
 
 uint64_t SparseRowStore::cacheRowsFor(uint64_t cacheBytes, uint32_t rowBytes) noexcept {
