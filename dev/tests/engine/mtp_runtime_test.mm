@@ -266,6 +266,31 @@ struct Fixture {
   }
 };
 
+void profileComposition(const char *library) {
+  // Capture the caller's policy before other fixtures install controls.
+  const char *policy = std::getenv("SPLASH_MTP_DEPTH");
+  const std::string depth = policy ? policy : "rule";
+  const char *lookup = std::getenv("SPLASH_MTP_LOOKUP");
+  const bool enabled = lookup && std::string_view(lookup) == "1";
+  Fixture f(library, true, false, false, false, enabled, depth.c_str(), true);
+  const std::array<uint64_t, 4> ids{101, 102, 103, 104};
+  const std::array<uint32_t, 4> lanes{0, 1, 2, 3};
+  for (uint32_t lane = 0; lane < 4; ++lane)
+    f.prefill(f.request(ids[lane], lane % 2 ? std::vector<uint32_t>{11} : std::vector<uint32_t>(24, 0)), lanes[lane]);
+  for (uint32_t i = 0; i < 20; ++i) {
+    const auto results = f.submit(ids, lanes)->wait();
+    for (uint32_t lane = 0; lane < 4; ++lane) {
+      const auto &result = results[lane];
+      require(result.failure.empty() && result.acceptedDraftTokens <= result.draftedTokens,
+              "streamed profile commits only real proposals");
+      for (uint32_t token : result.outputTokens)
+        require(token == lane % 2, "streamed profile agrees with its synthetic greedy target oracle");
+    }
+  }
+  for (uint64_t id : ids) f.runtime->end(id);
+  std::cout << "runtime_streamed_profile_composition=PASS\n";
+}
+
 void lookupMixing(const char *library, const char *depth = "cost") {
   Fixture f(library, true, false, false, false, true, depth);
   const std::array<uint64_t, 2> ids{41, 42};
@@ -559,7 +584,7 @@ void constrainedTransitions(const char *library) {
 int main(int argc, char **argv) {
   try {
     require(argc == 2, "usage: mtp-runtime METALLIB");
-    ruleLaneIdentity(argv[1]); streamedPrefetch(argv[1]); lookupMixing(argv[1]); lookupMixing(argv[1], "rule"); lookupMixing(argv[1], "lane"); unequalCommit(argv[1]); thinkingZeroDepth(argv[1]); thinkingCutoff(argv[1]); contextLifetime(argv[1]); constrainedTransitions(argv[1]);
+    profileComposition(argv[1]); ruleLaneIdentity(argv[1]); streamedPrefetch(argv[1]); lookupMixing(argv[1]); lookupMixing(argv[1], "rule"); lookupMixing(argv[1], "lane"); unequalCommit(argv[1]); thinkingZeroDepth(argv[1]); thinkingCutoff(argv[1]); contextLifetime(argv[1]); constrainedTransitions(argv[1]);
   } catch (const std::exception &error) {
     std::cerr << "mtp-runtime: FAIL: " << error.what() << '\n'; return 1;
   }
