@@ -57,6 +57,25 @@ template QwenTarget::QwenTarget(const Qwen3_6MoeWeights &, const QwenTargetGeome
 
 namespace {
 
+// Prototype switch for the MTP head's verify work (both changes bitwise):
+// SPLASH_HOST_WINS=1 (or "all") projects the head's streams through its eh
+// weights together and keeps only the head's KV in a verify; "eh" or "kv"
+// only the one. Unset or anything else keeps one projection per stream and
+// the head's whole attention. Read once.
+enum MtpHeadTrim : unsigned { kTrimEh = 1, kTrimKv = 2 };
+unsigned mtpHeadTrim() {
+  static const unsigned trim = [] {
+    const char *value = std::getenv("SPLASH_HOST_WINS");
+    if (!value) return 0U;
+    const std::string_view name(value);
+    return name == "1" || name == "all" ? unsigned{kTrimEh | kTrimKv}
+           : name == "eh"               ? unsigned{kTrimEh}
+           : name == "kv"               ? unsigned{kTrimKv}
+                                        : 0U;
+  }();
+  return trim;
+}
+
 void includeProjection(QwenTargetGeometry &geometry, const ops::Projection &projection) {
   geometry.decodeProjections.push_back(projection.shape());
 }
@@ -938,7 +957,7 @@ ops::PreparedInput QwenTarget::addQwen4VerifyMix(VerifyStep &step, const Qwen4Hy
 
 void QwenTarget::addQwen4VerifyAttention(VerifyStep &step, const Qwen4ExpLayerWeights &layer,
                                          const QwenAttentionWeights &mixer, uint32_t attentionLayer,
-                                         ops::PreparedInput input) const {
+                                         ops::PreparedInput input, bool attend) const {
   constexpr uint32_t laneRows = ExecutionLimits::targetVerifyRows;
   constexpr uint32_t indexWidth = QWEN4_QSA_HEADS * QWEN4_QSA_DIMENSION;
   const QwenTargetVerifyBuffers &b = step.buffers;
@@ -979,7 +998,7 @@ void QwenTarget::addQwen4VerifyAttention(VerifyStep &step, const Qwen4ExpLayerWe
                               b.pageTables[lane], h.qsaIndex[attentionLayer], queries, qsa);
     ops::Qwen4::addQsaPool(step.graph, b.qsaBlocks[lane], b.qsaBlockCounts[lane], indexer.keyNorm, h.inverseFrequencies, b.pageTables[lane], h.qsaIndex[attentionLayer]);
   }
-  if (sparse)
+  if (sparse && attend)
     for (uint32_t lane = 0; lane < step.lanes; ++lane)
       ops::Qwen4::addQsaSelect(
           step.graph, rowsOf<float>(backend_, h.qsaQueries, lane * laneRows, laneRows, indexWidth),
@@ -990,6 +1009,13 @@ void QwenTarget::addQwen4VerifyAttention(VerifyStep &step, const Qwen4ExpLayerWe
                                            b.ropeSin, b.fullQueries, b.chunkKeys[attentionLayer],
                                            b.chunkValues[attentionLayer], geometry_.attentionQueryHeads,
                                            geometry_.kvLayout, step.lanes);
+  if (!attend) {
+    ops::PagedAttention::addVerifyStore(step.graph, step.kvLayers[attentionLayer],
+                                        {b.chunkKeys[attentionLayer], b.chunkValues[attentionLayer], b.fullQueries,
+                                         b.attentionPartials, b.attentionStatistics, b.fullAttention, b.pageTables},
+                                        step.chunks, step.attention);
+    return;
+  }
   ops::PagedAttention::addVerify(step.graph, step.kvLayers[attentionLayer],
                                  {b.chunkKeys[attentionLayer], b.chunkValues[attentionLayer], b.fullQueries,
                                   b.attentionPartials, b.attentionStatistics, b.fullAttention, b.pageTables},
@@ -1090,17 +1116,25 @@ void QwenTarget::addQwen4MtpVerify(VerifyStep &step, const Qwen4ExpWeights &weig
                             mtpCarried(b.pleHistories[lane]),
                             rowsOf<float>(backend_, history, lane * laneRows, laneRows, width), mtp.embedNorm,
                             mtp.hiddenNorm, h.mtpInput, hs, laneRows, limit, lane * laneRows, rows);
-  // The eh projection of each stream's rows, then the fp32 streams.
-  for (uint32_t s = 0; s < hs.streams; ++s)
+  // The eh projection of the streams' rows, then the fp32 streams. The
+  // streams' rows are consecutive, so under SPLASH_HOST_WINS streams go
+  // together into one decode projection of up to the batch limit's lanes of
+  // rows (all four at one lane): it reads the weights once for them, and each
+  // lane of rows of a decode projection is its one-lane projection bit for
+  // bit (the K split ignores the batch width). Otherwise one per stream.
+  const uint32_t together =
+      mtpHeadTrim() & kTrimEh ? std::max(1U, ExecutionLimits::maximumBatchWidth / step.lanes) : 1U;
+  for (uint32_t s = 0; s < hs.streams; s += together)
     addDecodeProjection(step.graph, linear, rowsFrom<uint16_t>(backend_, h.mtpInput, s * rows, 2 * hidden),
-                          mtp.embedHidden, rowsFrom<uint16_t>(backend_, h.gate, s * rows, hidden), step.lanes,
-                          b.linearScratch);
+                        mtp.embedHidden, rowsFrom<uint16_t>(backend_, h.gate, s * rows, hidden),
+                        step.lanes * std::min(together, hs.streams - s), b.linearScratch);
   ops::Qwen4::addMtpWiden(step.graph, h.gate, h.mtpStreams, hs, rows);
   const uint32_t attentionLayer = geometry_.kvLayout.attentionLayers - geometry_.mtpLayers;
   const QwenAttentionWeights &attention = std::get<QwenAttentionWeights>(mtp.block.mixer);
   addQwen4VerifyAttention(
       step, mtp.block, attention, attentionLayer,
-      addQwen4VerifyMix(step, mtp.block.mixerHyper, h.mtpStreams, b.normalized, &attention.inputProjection));
+      addQwen4VerifyMix(step, mtp.block.mixerHyper, h.mtpStreams, b.normalized, &attention.inputProjection),
+      full || !(mtpHeadTrim() & kTrimKv));
   if (!full) return;
   ops::Qwen4::addCombine(step.graph, h.mtpStreams, h.branch, h.weights, hs, rows);
   addQwen4VerifyMix(step, mtp.block.ffnHyper, h.mtpStreams, b.normalized);

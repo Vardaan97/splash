@@ -267,6 +267,12 @@ public:
                         PagedVerifyBuffers buffers,
                         std::span<const kv::ChunkedPrefillParams> chunks,
                         const VerifyAttentionPlan &plan, QsaMask mask = {});
+  // Only the store of addVerify: a layer whose rows' attention no one reads
+  // (the MTP head's in a verify) still keeps their KV.
+  static void addVerifyStore(metal::CommandGraph &graph, SplashKvLayer layer,
+                             PagedVerifyBuffers buffers,
+                             std::span<const kv::ChunkedPrefillParams> chunks,
+                             const VerifyAttentionPlan &plan);
 };
 
 } // namespace splash::ops
