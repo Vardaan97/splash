@@ -22,6 +22,7 @@ namespace {
 
 using namespace splash;
 using engine::NativeArguments;
+using engine::parseRetainedCheckpointTokens;
 using splash::test::rejects;
 using splash::test::require;
 
@@ -204,6 +205,14 @@ void testNeuralEngine() {
 
 // A command line the server never writes is refused with what is wrong.
 void testRefusals() {
+  require(parseRetainedCheckpointTokens("0") == 0 &&
+              parseRetainedCheckpointTokens("8192") == 8192 &&
+              parseRetainedCheckpointTokens("16384") == 16384,
+          "retained checkpoint grid was not parsed");
+  for (const char *grid : {"", "-1", "2048", "8193", "4294967296", "8K", "8192x"})
+    rejects([&] { static_cast<void>(parseRetainedCheckpointTokens(grid)); },
+            "SPLASH_GDN_CHECKPOINT_TOKENS requires",
+            "invalid retained checkpoint grid was accepted");
   const ModelDirectory model;
   const auto refuses = [&](const std::vector<std::string> &arguments,
                            std::string_view expected) {

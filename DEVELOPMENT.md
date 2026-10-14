@@ -2350,6 +2350,37 @@ mask request the server leaves unanswered for 5 s fails that request with the
 retryable `mask_timeout` (HTTP 503), so a stalled grammar cannot hold the
 batch's command.
 
+Experimental retained checkpoints are enabled with
+`SPLASH_GDN_CHECKPOINT_TOKENS=8192` (or `16384`) in the serving process's
+environment. Unset or `0` keeps the default policy. The interval must be a
+multiple of 2048 and at least 4096 tokens. Every grid boundary crossed before
+the prompt's replay point is captured, including short appends. Grid states
+are ordinary cache entries: rolling replacement leaves them alone, but the
+governor can evict them. The prompt's tail state is still captured. A deep
+history edit restores the deepest retained state on the matching KV prefix
+and prefills its suffix. With Flash-Next, MTP and fp32 state, each composite
+checkpoint currently occupies about 113.28 MiB of Metal shared memory; it
+includes GDN, PLE history, MTP carried streams and the allocated placeholder
+draft window. Existing SSD offload applies when enabled; persistent
+write-behind still guarantees only the newest restore point's policy.
+At the full 262144-token window, the 8K grid alone occupies about 3.43 GiB
+(31 points before the tail); the 16K grid occupies about 1.66 GiB (15 points).
+Prefer 16K spacing for a 128 GB host serving a large target at that window:
+the grid shares the remaining budget with KV, active lanes and scratch.
+Several edited branches retain distinct suffix states and KV until eviction;
+these figures describe one lineage, not a total cache limit.
+
+Checkpoint capture and replay can split prefill scans at different rows,
+especially after an off-grid restore or a refused allocation. BF16 state
+rounds at each scan boundary: bf16 + grid is class N, numerics-changing and
+opt-in only; greedy output identity is not promised. fp32 state is bitwise
+for any scan partition. Before deploying a grid,
+run the model oracle and `dev/benchmarks/gdn_checkpoint_replay.py` against a
+separate baseline checkout using `--baseline-repo` and `--baseline-binary`.
+The experiment requires matching growing-turn and edited outputs, a fresh
+cold edited reference, and a measured reduction in prefill rows; it writes
+receipts and fails when any of these gates fail.
+
 Long prefill uses disposable rolling checkpoints every 4096 tokens; none is
 planned within one prefill chunk (2048 tokens) of where the request resumes or
 of its replay boundary. Each retires only once the next one or a junction is

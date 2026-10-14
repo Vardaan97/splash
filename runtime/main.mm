@@ -213,6 +213,13 @@ bootstrapConfig(const engine::NativeArguments &arguments) {
   config.resources.pleCacheBytes = arguments.pleCacheBytes;
   config.nativeLoop.engine.maxContext = arguments.maxContext;
   config.nativeLoop.engine.decodeShare = arguments.decodeShare;
+  if (const char *grid = std::getenv("SPLASH_GDN_CHECKPOINT_TOKENS")) {
+    config.nativeLoop.engine.retainedCheckpointTokens =
+        engine::parseRetainedCheckpointTokens(grid);
+    if (config.nativeLoop.engine.retainedCheckpointTokens)
+      logLine("Retained GDN checkpoint grid: ",
+              config.nativeLoop.engine.retainedCheckpointTokens, " tokens");
+  }
   return config;
 }
 

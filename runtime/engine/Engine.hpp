@@ -51,6 +51,10 @@ struct EngineConfig final {
   double decodeShare = 0.5;
   // The prefill checkpoint interval and the resource wait limit.
   uint32_t prefillCheckpointTokens = kPrefillCheckpointTokens;
+  // Opt-in retained grid. These are ordinary composite states, so rolling
+  // replacement never retires them; the governor and cache may still evict
+  // them. Zero leaves the existing rolling and replay policy alone.
+  uint32_t retainedCheckpointTokens = 0;
   double resourceWaitTimeoutMilliseconds = kResourceWaitTimeoutMilliseconds;
   // Host growth admission, supplied by the runtime governor. Queried while
   // resident lanes drain after a suspension, and when a boundary's state
@@ -104,6 +108,19 @@ plannedCheckpoints(uint32_t resumeBoundary, uint32_t replayBoundary, uint32_t in
            (uint64_t{resumeBoundary} + chunk + interval - 1) / interval * interval;
        boundary + chunk <= replayBoundary; boundary += interval)
     checkpoints.push_back(static_cast<uint32_t>(boundary));
+  return checkpoints;
+}
+
+// A retained grid covers every crossed boundary, including a short append
+// across one. The rolling policy's near-end exclusion would leave permanent
+// holes when a conversation grows in small turns.
+[[nodiscard]] inline std::vector<uint32_t>
+retainedCheckpoints(uint32_t resumeBoundary, uint32_t replayBoundary, uint32_t interval) {
+  std::vector<uint32_t> checkpoints;
+  if (interval)
+    for (uint64_t boundary = (uint64_t{resumeBoundary} / interval + 1) * interval;
+         boundary <= replayBoundary; boundary += interval)
+      checkpoints.push_back(static_cast<uint32_t>(boundary));
   return checkpoints;
 }
 

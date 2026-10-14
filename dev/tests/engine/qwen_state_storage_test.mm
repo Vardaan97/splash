@@ -2,6 +2,7 @@
 #include "engine/MemoryGovernor.hpp"
 #include "tests/engine/AllocationFailure.hpp"
 #include "model/QwenState.hpp"
+#include "model/Qwen4Exp.hpp"
 #include "tests/engine/TestChecks.hpp"
 
 #include <unistd.h>
@@ -96,6 +97,20 @@ template <typename Ticket> bool finishWhenReady(Ticket &ticket) {
 }
 
 void testLayoutFormulas() {
+  model::Qwen4ExpLayout flash;
+  flash.mtpLayers = 1;
+  const auto flashState = flash.gdnStateLayout();
+  require(flashState.layers == 36 && flashState.recurrentGroups == 48 &&
+              flashState.recurrentRows == 128 && flashState.recurrentColumns == 128 &&
+              flashState.convolutionBytes() == 2'359'296 &&
+              flashState.recurrentBytes() == 113'246'208 &&
+              flash.pleHistoryBytes() == 184'320 && flash.mtpCarriedBytes() == 40'960 &&
+              flashState.cellBytes() == 115'834'880,
+          "Flash-Next checkpoint geometry or byte accounting is wrong");
+  const model::CompositeStateLayout flashComposite{flashState, {1, 1, 8, 2560}};
+  require(flashComposite.draft.windowBytes() == 2'949'120 &&
+              flashComposite.cachedBytes() == 118'784'000,
+          "Flash-Next's placeholder draft window was omitted from checkpoint accounting");
   require(kTargetState.convolutionLayerBytes() == 65'536,
           "GDN convolution layer formula is wrong");
   require(kTargetState.convolutionBytes() == 3'145'728,

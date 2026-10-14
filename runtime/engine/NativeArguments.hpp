@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <stdexcept>
+#include <string_view>
 
 namespace splash::engine {
 
@@ -68,5 +69,8 @@ inline constexpr uint64_t kMinimumPleCacheBytes = 64ULL << 20;
 // refuses.
 [[nodiscard]] NativeArguments parseNativeArguments(int argc,
                                                    const char *const *argv);
+
+// SPLASH_GDN_CHECKPOINT_TOKENS, consumed once when serving starts.
+[[nodiscard]] uint32_t parseRetainedCheckpointTokens(std::string_view value);
 
 } // namespace splash::engine

@@ -428,6 +428,14 @@ void pleTest(MetalBackend &backend) {
     for (uint32_t j = 0; j < history; ++j)
       for (uint32_t c = 0; c < width; ++c) ok &= f32(got[j * width + c]) == input(int(retained) - int(history) + int(j), c);
     check(ok, "PLE commit: the history after " + std::to_string(retained) + " retained rows");
+    // Prefill captures use a fixed row, with no verify retained-count
+    // buffer. They must preserve exactly the same convolution history.
+    MetalBuffer captured = scratch(backend, history * width * 2);
+    CommandGraph capture;
+    ops::Qwen4::addPleHistory(capture, conv, histIn, captured, shape, retained);
+    run(backend, capture);
+    check(download<uint16_t>(captured, history * width) == got,
+          "PLE prefill capture: bitwise history at row " + std::to_string(retained));
   }
 }
 
