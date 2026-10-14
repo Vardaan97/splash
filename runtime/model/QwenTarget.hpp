@@ -156,11 +156,13 @@ struct QwenTargetPrefillCapture final {
 
 // A state a prefill command captures at a row inside it (a state boundary):
 // each GDN layer's convolution and recurrent state, as a command ending at
-// that row stores them, in the views of a cache cell.
+// that row stores them, in the views of a cache cell, and Qwen3.8-Flash-Next's
+// auxiliary state (its PLE history and carried MTP streams) in the cell's.
 struct QwenTargetStateCapture final {
   uint32_t row = 0;
   std::span<const metal::MetalBuffer> convolution;
   std::span<const metal::MetalBuffer> recurrent;
+  metal::MetalBuffer auxiliary;
 };
 
 struct QwenTargetPrefillSequence final {

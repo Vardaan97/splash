@@ -321,8 +321,9 @@ kernel void qwen4_ple_conv(device const bfloat *input [[buffer(0)]],
   }
 }
 
-// The PLE history after each lane's retained rows of a verify step: its
-// history before the step, then the step's convolution inputs.
+// The PLE history after each lane's retained rows of a verify step (p.rows
+// 0) or after a prefill sequence's first p.rows rows (a state captured inside
+// its command): its history before, then the convolution inputs.
 kernel void qwen4_ple_commit(device const bfloat *input [[buffer(0)]],
                              device const bfloat *history_in [[buffer(1)]],
                              device bfloat *history_out [[buffer(2)]],
@@ -334,7 +335,7 @@ kernel void qwen4_ple_commit(device const bfloat *input [[buffer(0)]],
   const uint history = (p.taps - 1) * p.dilation;
   const uint c = group.y * kRowThreads + tid, j = group.x;
   if (c >= width || j >= history) return;
-  const int source = int(retained[0]) - int(history) + int(j);
+  const int source = int(p.rows ? p.rows : retained[0]) - int(history) + int(j);
   history_out[ulong(j) * width + c] = source >= 0 ? input[ulong(source) * width + c]
                                                   : history_in[ulong(int(history) + source) * width + c];
 }

@@ -117,6 +117,17 @@ void Qwen4::addPleConvolution(metal::CommandGraph &graph, metal::MetalBuffer con
             pleParams(shape, rows, writeHistory), {gridRows, groups(shape.width()), 1}, {kThreads, 1, 1});
 }
 
+void Qwen4::addPleHistory(metal::CommandGraph &graph, metal::MetalBuffer convolutionInput,
+                          metal::MetalBuffer historyIn, metal::MetalBuffer historyOut, PleShape shape,
+                          uint32_t rows) {
+  if (!rows) throw std::invalid_argument("invalid PLE history");
+  // p.rows in place of a retained count: the input binds as the unread count.
+  metal::MetalBuffer unread = convolutionInput;
+  graph.add("qwen4_ple_commit",
+            {std::move(convolutionInput), std::move(historyIn), std::move(historyOut), std::move(unread)},
+            pleParams(shape, rows, true), {shape.history(), groups(shape.width()), 1}, {kThreads, 1, 1});
+}
+
 void Qwen4::addPleCommit(metal::CommandGraph &graph, metal::MetalBuffer convolutionInput,
                          metal::MetalBuffer historyIn, metal::MetalBuffer historyOut, metal::MetalBuffer retained,
                          PleShape shape) {

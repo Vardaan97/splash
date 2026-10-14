@@ -1573,7 +1573,8 @@ struct Runtime::Impl {
         if (capture.atEnd)
           continue;
         const GdnParityBuffers &cell = capture.reservation->buffers().gdn->buffers();
-        stateCaptures[lane].push_back({capture.row, cell.convolutionLayers, cell.recurrentLayers});
+        stateCaptures[lane].push_back(
+            {capture.row, cell.convolutionLayers, cell.recurrentLayers, cell.auxiliary});
       }
       destination.stateCaptures = stateCaptures[lane];
       destination.pleHistoryIn = in.auxiliary;

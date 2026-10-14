@@ -123,6 +123,11 @@ struct Qwen4 final {
   static void addPleHash(metal::CommandGraph &graph, metal::MetalBuffer tokens, metal::MetalBuffer before,
                          metal::MetalBuffer indices, const Qwen4PleHashParams &params, uint32_t heads);
 
+  // The history after the first `rows` rows of one sequence's prefill (a
+  // state captured inside its command).
+  static void addPleHistory(metal::CommandGraph &graph, metal::MetalBuffer convolutionInput,
+                            metal::MetalBuffer historyIn, metal::MetalBuffer historyOut, PleShape shape,
+                            uint32_t rows);
   // The history after a lane's `retained` (a GPU count) rows.
   static void addPleCommit(metal::CommandGraph &graph, metal::MetalBuffer convolutionInput,
                            metal::MetalBuffer historyIn, metal::MetalBuffer historyOut,
