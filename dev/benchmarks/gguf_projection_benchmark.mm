@@ -5,7 +5,7 @@
 //                             [prefill=R[,R...]|variants=base,k64,k128,sg1,k64sg1]
 // The projection has one segment per format and width (up to three, fused, no epilogue), each a multiple of 64
 // columns. With prefill=, it times the 128-row prefill tile instead, one case per chunk of R rows (more than 32: the
-// decode tiles run the smaller chunks) of a single segment; gateup is then the up projection's gated epilogue. The
+// decode tiles run the smaller chunks) of a single segment; gateup is then the up projection's gated epilogue. The opt-in policy is timed beside the baseline when it differs. The
 // weights stay DRAM-cold: a command streams every copy of a ring of at least 384 MiB once, each projection with the
 // next copy (decode gate/up: the gate and up weights of two copies). The cases run in ABBA order after a warm-up;
 // printed are the medians of `rounds` (20) commands in ms per projection, the device policy's choice marked with *.
@@ -103,7 +103,7 @@ int main(int argc, char **argv) {
       for (size_t i = 0; i < formats.size(); ++i) {
         const Fmt f = fmtNamed(formats[i]);
         const uint32_t n = uint32_t(std::stoul(widths[i]));
-        if (f == FMT_COUNT || !n || n % 64 || !K || K % (32 * kQuantFormats[f].meta_groups) || K % 64) throw std::invalid_argument("bad segment " + formats[i]);
+        if (f == FMT_COUNT || !n || n % QUANT_TILE_ROWS || !K || K % 64 || K % kQuantFormats[f].block_elements) throw std::invalid_argument("bad segment " + formats[i]);
         images.push_back({f, n, N, repack(f, makeNative(f, n, K, rng), n, K, nullptr)});
         N += n;
         for (const std::vector<uint8_t> *plane : {&images.back().planes.w0, &images.back().planes.w1,
@@ -132,6 +132,9 @@ int main(int argc, char **argv) {
         const LinearConfig config{.tile = LinearTile::GgufPrefill};
         cases.push_back({"R" + std::to_string(rows), "prefill128", Linear::plan(w, config, FloatOutput::BFloat16),
                          config == linear.plan(w, ring.front()).configuration(), {}});
+        const auto policy = linear.plan(w, ring.front());
+        if (policy.configuration() != config)
+          cases.push_back({"R" + std::to_string(rows), "policy", policy, true, {}});
       }
       if (variants && (epilogue != LinearEpilogue::None ||
           !std::all_of(images.begin(), images.end(), [](const Image &i) { return i.format == Q80; })))
@@ -148,8 +151,8 @@ int main(int argc, char **argv) {
             const bool registerTile = tile == LinearTile::GgufRegister;
             if (variants && (registerTile || (lanes != 1 && lanes != 4))) continue;
             // The register tile takes the formats of quant_register_format only.
-            if (registerTile && !std::all_of(images.begin(), images.end(),
-                                             [](const Image &i) { return quant_register_format(i.format); }))
+            if (registerTile && (N % 256 || K % 256 || !std::all_of(images.begin(), images.end(),
+                                             [](const Image &i) { return quant_register_format(i.format); })))
               continue;
             if (registerTile ? K / 256 < splits : (K / 32) % splits) continue;
             LinearConfig config = variants ? policy : LinearConfig{};
