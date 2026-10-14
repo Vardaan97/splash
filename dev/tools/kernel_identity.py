@@ -44,10 +44,11 @@ def library(path: Path) -> Path:
     raise FileNotFoundError(f"no splash.metallib in {path}")
 
 
-def functions(metallib: Path) -> dict[str, str]:
+def functions(metallib: Path, objdump: Path | None = None) -> dict[str, str]:
     """The SHA-256 of each function's disassembled AIR in a metallib."""
     listing = subprocess.run(
-        ["xcrun", "-sdk", "macosx", "metal-objdump", "--metallib", "--disassemble"]
+        ([str(objdump)] if objdump else ["xcrun", "-sdk", "macosx", "metal-objdump"])
+        + ["--metallib", "--disassemble"]
         + [str(metallib)],
         capture_output=True,
         text=True,
@@ -106,13 +107,14 @@ def main(argv=None) -> int:
         action="store_true",
         help="allow candidate-only kernels; existing kernels must remain identical",
     )
+    parser.add_argument("--objdump", type=Path, help="metal-objdump from the build toolchain")
     args = parser.parse_args(argv)
     try:
         libraries = [library(args.baseline), library(args.candidate)]
     except FileNotFoundError as error:
         parser.error(str(error))
     try:
-        baseline, candidate = (functions(metallib) for metallib in libraries)
+        baseline, candidate = (functions(metallib, args.objdump) for metallib in libraries)
     except subprocess.CalledProcessError as error:
         print(f"kernel identity: {error.stderr.strip()}", file=sys.stderr)
         return 2

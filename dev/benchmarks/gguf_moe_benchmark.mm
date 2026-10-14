@@ -199,9 +199,16 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
         const double passMs = times[times.size() / 2];
         const bool pair = name.ends_with("_gate_up");
         const double flops = 2.0 * rows * (top + 1) * H * I * (pair ? 2 : 1);
-        printf("PF1 shape=%s routing=%s tile=%s rows=%u pass=%s ms=%.6f layer_ms=%.6f live_tiles=%u tflops=%.3f identity=PASS\n",
+        double weightBytes = 0;
+        const auto *descriptors = static_cast<const MoeTileDescriptor *>(b.scratch.tileDescriptors.contents());
+        for (uint32_t t = 0; t < liveTiles; ++t) {
+          const auto &f = kQuantFormats[descriptors[t].expert == E ? sharedFormat : (pair ? gateUpFormat : downFormat)];
+          weightBytes += double(H) * I / 32 *
+                         (f.plane0_bytes + f.plane1_bytes + double(f.meta_bytes) / f.meta_groups) * (pair ? 2 : 1);
+        }
+        printf("PF1 shape=%s routing=%s tile=%s rows=%u pass=%s ms=%.6f layer_ms=%.6f live_tiles=%u tflops=%.3f staged_weight_gbps=%.3f identity=PASS\n",
                flash ? "flashnext" : "35b", zipf ? "zipf" : "uniform", tile.c_str(), rows,
-               pair ? "gate_up" : "down", passMs, ms, liveTiles, flops / (passMs * 1e9));
+               pair ? "gate_up" : "down", passMs, ms, liveTiles, flops / (passMs * 1e9), weightBytes / (passMs * 1e6));
       }
     }
     return 0;
