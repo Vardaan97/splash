@@ -265,8 +265,8 @@ struct Fixture {
   }
 };
 
-void lookupMixing(const char *library) {
-  Fixture f(library, true, false, false, false, true);
+void lookupMixing(const char *library, const char *depth = "cost") {
+  Fixture f(library, true, false, false, false, true, depth);
   const std::array<uint64_t, 2> ids{41, 42};
   const std::array<uint32_t, 2> lanes{3, 1};
   f.prefill(f.request(ids[0], std::vector<uint32_t>(24, 0)), lanes[0]);
@@ -558,7 +558,7 @@ void constrainedTransitions(const char *library) {
 int main(int argc, char **argv) {
   try {
     require(argc == 2, "usage: mtp-runtime METALLIB");
-    ruleLaneIdentity(argv[1]); streamedPrefetch(argv[1]); lookupMixing(argv[1]); unequalCommit(argv[1]); thinkingZeroDepth(argv[1]); thinkingCutoff(argv[1]); contextLifetime(argv[1]); constrainedTransitions(argv[1]);
+    ruleLaneIdentity(argv[1]); streamedPrefetch(argv[1]); lookupMixing(argv[1]); lookupMixing(argv[1], "rule"); lookupMixing(argv[1], "lane"); unequalCommit(argv[1]); thinkingZeroDepth(argv[1]); thinkingCutoff(argv[1]); contextLifetime(argv[1]); constrainedTransitions(argv[1]);
   } catch (const std::exception &error) {
     std::cerr << "mtp-runtime: FAIL: " << error.what() << '\n'; return 1;
   }

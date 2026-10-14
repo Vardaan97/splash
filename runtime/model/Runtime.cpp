@@ -3450,6 +3450,8 @@ Runtime::decodeAsync(const BatchPlan &plan,
 
   const std::span<Impl::Request *const> entries(requests.data(), width);
   const uint32_t ropeRows = width * kDecodeRows;
+  impl_->plePrefetchEvent = {};
+  impl_->plePrefetchTokens = {};
   CommandGraph commandGraph;
   impl_->addRopeTables(
       commandGraph,
