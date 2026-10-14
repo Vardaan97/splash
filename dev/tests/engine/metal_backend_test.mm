@@ -97,6 +97,26 @@ void dispatchFloor(const char *library, unsigned seconds) {
     } while (std::chrono::steady_clock::now() < deadline);
 }
 
+void cachedDispatches(const char *library) {
+    MetalBackend backend(library);
+    auto source = backend.allocateBuffer(4, BufferStorage::Shared, "cache-input");
+    auto output = backend.allocateBuffer(4, BufferStorage::Shared, "cache-output");
+    for (const char *mode : {"1", "verify"}) {
+      setenv("SPLASH_GRAPH_CACHE", mode, 1);
+      for (uint32_t cycle = 1; cycle <= 200; ++cycle) {
+        *static_cast<uint32_t *>(source.contents()) = 0;
+        splash::metal::CommandGraph graph;
+        graph.add("test_add_u32", {source}, uint32_t{1}, {}, cycle, {1, 1, 1}, {1, 1, 1});
+        for (uint32_t i = 0; i < 64; ++i)
+          graph.add("test_copy_u32", {source, output}, uint32_t{1}, {cycle % 2 + 1, 1, 1}, {1, 1, 1});
+        if (cycle % 2) (void)backend.submitCommandAsync(graph.command()).wait();
+        else (void)backend.submitEncoded(backend.encodeCommand(graph.command())).wait();
+        require(*static_cast<uint32_t *>(output.contents()) == cycle, "cached payload patch became stale");
+      }
+    }
+    unsetenv("SPLASH_GRAPH_CACHE");
+}
+
 void independentDispatches(const char *library) {
     MetalBackend backend(library);
     constexpr uint32_t count = 1024;
@@ -2006,6 +2026,7 @@ int main(int argc, const char *argv[]) {
             return 2;
         }
         try {
+            cachedDispatches(argv[1]);
             independentDispatches(argv[1]);
             completionDoesNotWaitForMemoryTelemetry(argv[1]);
             terminalCommandRecovers(argv[1], false);

@@ -1,76 +1,112 @@
 # Combined Flash-Next test stack
 
-Local branch `flashnext-max-stack` starts at stack-review
-`0a08372e45874cf8e79ed6c77ad4c949e91e81a0`: #253
-`e5ce29f80affff9ba98722f35913f77a3bac9b78`, #410 PLE streaming,
-the draftless oracle fix, A hyper norm, B draft vocabulary and C lane depth.
-See `flashnext-stack.md` for inherited provenance and merge decisions.
+Local `flashnext-max-stack` starts at `0a08372e` (#253 `e5ce29f`, #410,
+A/B/C), with reviewed D `84f059d4`, E `293a3add`, F `e503457f` and native
+grid integration `7a483b91`. The October 14 follow-up keeps C modular and
+restores the pre-C common rule default. No speed claim accompanies these
+unmeasured fold-ins.
 
-Folded in order, each as one topic with its review fixes:
+Source `dev/scripts/flashnext-max.env` for **max** (C off). Then call
+`flashnext_profile max-c` for the otherwise identical C-on profile. Set
+`FLASHNEXT_MAX_PROFILE=max-c` before sourcing to select it directly. All new
+behaviors remain opt-in; A/B retain their inherited defaults. Use fp32 GDN
+state for strict identity and choose streamed cache size explicitly.
 
-| Item | Source base | Reviewed source head | Purpose |
-| --- | --- | --- | --- |
-| D | e5ce29f | ac81e2a55bb859d074c5b23d41f8263debc6e6eb | Retained GDN checkpoints (#387) |
-| E | 0a08372e | 8a15e912beae67fcf97c6fb28ce1678774f2d076 | Explicit concurrent dispatch groups |
-| F | 891a0fc75be775785caf132a60964b52d0f5c0b7 | 6d8e3db0469c8a60a9bb34c36a9d1fe7cd0faf85 | Prompt lookup in MTP lanes |
+B = bitwise tensor/output scheduling change; X = greedy exact, proposals and
+seeded streams can differ; N = numerics change. B4 output identity is checked
+where off/off repeats; existing B4 nondeterminism remains informational.
 
-## Flags
+| Flag | Default | Expected effect (unmeasured unless inherited) | Identity | Test |
+| --- | --- | --- | --- | --- |
+| `SPLASH_MTP` | 1 | Enable inherited MTP | X | mtp-runtime/oracle |
+| `SPLASH_MTP_DEPTH` | rule | cost opts into C; lane uses individual rule depths | X; lane B1 B with width-1 threshold .30 | planner, runtime B1 greedy/seeded and B4 live rows |
+| `SPLASH_MTP_WORTHWHILE` | .30,.35,.40,.45 | lane thresholds by width; one value applies to all widths | X | planner parsing and mixed depths 2/3/7/4 |
+| `SPLASH_MTP_ADAPTIVE` | 1 | Disable with 0 for fixed depth | X | mtp-runtime |
+| `SPLASH_MTP_DRAFTS` | 7 adaptive, 3 fixed | Cap proposals, sweep 3/4/5/7 | X | planner/runtime |
+| `SPLASH_MTP_DRAFT_VOCAB` | 32768 (1 alias) | 49152/65536 extend coverage; 0 uses full head | X | gguf-planner/context/runtime and 144-prompt sweep |
+| `SPLASH_GDN_CHECKPOINT_TOKENS` | 0 | D improves deep-edit reuse; max uses 16384 | B fp32; N bf16 | engine grids/oracle |
+| `SPLASH_DECODE_DISPATCH` | 0 | 1 narrow E; 2 audited E2 sites including draft | B | shader-validated backend/runtime/projection/Qwen4/MoE |
+| `SPLASH_DECODE_DISPATCH_SITES` | mode mask (1 or 57) | Restrict sites for bisection | B | E2 identity gates |
+| `SPLASH_DISPATCH_VERIFY` | unset | serial or shuffle:0..7 verifies marked independence | B | metal-backend fork/join/event tests, runtime shuffle |
+| `SPLASH_HOST_WINS` | off | 1/all both trims, eh/kv individually | B | projection and runtime; fp32/bf16 oracle gates |
+| `SPLASH_PLE_PREFETCH` | 0 | Anchor + midpoint prefix read-ahead during streamed draft | B | synthetic streamed runtime, event/backend, streamed oracle |
+| `SPLASH_GRAPH_CACHE` | off | 1 prepared topology LRU; verify compares fresh preparation | B | 200-cycle backend payload/grid test, runtime/oracle |
+| `SPLASH_MTP_LOOKUP` | 0 | F full lookup and graft in rule/lane/cost | X | mixed/all lookup runtime, matcher/planner |
+| `SPLASH_MTP_LOOKUP_BUCKETS` | 0 | Confidence by matched length <6/<12/<24/24+ | X | matcher bucket/262K bound, runtime |
+| `SPLASH_MTP_LOOKUP_SCAN` | 256 | 1..8192 newest tokens per sync; clamps input | X | 262K bounded work/node test |
+| `SPLASH_MTP_LOOKUP_REPROBE` | 0 | Confident seven-token cost lookup reprobe after 300 rounds | X | planner/runtime, greedy M5 gate |
+| `SPLASH_MTP_LOG` | 0 | Existing plan/cost/lookup diagnostics | B | diagnostic only |
 
-No D/E/F behavior is enabled by default. C retains the base's default cost
-policy; A/B retain the base's existing behavior. Source
-`dev/scripts/flashnext-max.env` to opt into the complete test configuration.
+## Audits and limits
 
-| Flag | Default / off | Test value / meaning |
-| --- | --- | --- |
-| SPLASH_MTP | 1 / 0 disables MTP | 1 |
-| SPLASH_MTP_DRAFT_VOCAB | 1 / 0 uses full head | 1 (B) |
-| SPLASH_MTP_DEPTH | cost / rule selects older policy | cost (C) |
-| SPLASH_MTP_ADAPTIVE | 1 / 0 fixes draft depth | 1 (C) |
-| SPLASH_MTP_DRAFTS | 7 | 7, maximum head proposals |
-| SPLASH_GDN_CHECKPOINT_TOKENS | unset or 0 | 16384 (D); multiples of 2048 >=4096; 8192 uses more memory |
-| SPLASH_DECODE_DISPATCH | unset or 0 | exactly 1 (E) |
-| SPLASH_MTP_LOOKUP | unset or 0 | exactly 1 (F) |
-| SPLASH_MTP_LOG | unset or 0 | optional 1 for plan/lookup diagnostics |
+The head trims port net changes from `32ec82b`, `7f14071`, `6bd352c`, keeping
+B's `draftHead` logits selection. EH streams share one projection where the
+existing bitwise batch-width projection tests permit it. KV-only head verify
+still stores KV and QSA keys; it drops only unread attention output.
 
-C's internal probe/exploration intervals retain their defaults of 8/32
-cycles; they are component parameters rather than environment flags. `--ple-ssd-cache 2G` enables inherited PLE streaming;
-it is a CLI option and is not forced by the environment file.
+E2 uses one design: G1 (mask 1) attention/indexer projections; G4 (8) float
+packed columns beside a **single**, unrotated, no-epilogue quantized dispatch;
+G5 (16) single-dispatch PLE key/value; G6 (32) disjoint per-lane MTP input and
+carry slices. Multi-dispatch shared scratch remains ordered. QSA project/pool
+across lanes needs pooled-page alias proof; QSA select needs scratch renaming.
+Context-head projections and EH use shared scratch and stay ordered. No
+speculative independence annotations were added. Shuffle operates on whole
+marked runs in both submission paths, respecting event boundaries. E2's
+15-minute M5 dispatch-floor script is prepared, not run: promotion requires
+at least 2 us saved per boundary and later identity/performance gates.
 
-## Integration and caveats
+PLE prefetch uses one midpoint signal (one extra command-buffer boundary),
+an immutable token snapshot before graft/cutoff, and copied hash/history
+inputs. The GPU never waits on host I/O. The ticket drains its callback before
+staging or teardown; synchronous staging remains authoritative. Prefetch
+failures do not waive staging checks. Resident PLE is unaffected.
 
-D's oracle conflict preserves `model.hasDraft()` in the inherited capture
-check and adds the new grid fixture only for Flash-Next targets. E/F's
-receipt README conflicts preserve all three source locations. F's lookup
-mix dispatch remains before verify-input construction and PLE hashing in
-the first streamed command; E gives it a conservative dependency barrier.
+The graph cache conservatively caches **prepared dispatch topology**, not
+Runtime graph construction. Exact pipeline, grid, group, binding, view and
+byte-layout keys avoid omitted shape dimensions. All fresh payloads are
+rebound, including positions, parity, live rows and lookup. Thus position
+patches cannot become stale. 64-entry LRU, at most 32 MiB counted key/metadata;
+allocations retained by the command metadata are existing buffers. Verify
+re-resolves pipelines/grids/retained allocations and compares. Skipping fresh
+Runtime graph construction is deliberately deferred until every baked
+parameter can be audited; no 0.2–0.4 ms saving is claimed for this narrower
+implementation.
 
-Use fp32 state for the mandatory greedy identity gates. D's fp32 split
-oracle checks complete cells and logits bitwise. bf16 state rounds at extra
-grid boundaries, so bf16 plus D is a numerics-changing experiment. D's
-states consume governor-managed memory; optional reservation refusal can
-split prefill commands and regress latency. Persistent cache restart does
-not guarantee every historical grid point survives.
+F's rule/lane integration chooses eligible lookup continuations that cover
+the planned head depth; graft retains the head fallback. Cost mode retains
+its planner and optional stale reprobe. Buckets extend matched suffixes
+backwards, capped at 8192 comparisons, with four-observation priors
+.75/.88/.93/.96. Maps remain at most 8192 nodes/request (~2 MiB allowance).
+Sampled/cutoff lanes skip lookup; no whole-prompt indexing allocation.
 
-E's independence annotations require manual alias proofs; shuffle/shadow
-modes remain future work. Profiling dispatch replay is attribution only.
-F indexes at most 256 new tokens per update and caps both maps at 4096 keys
-(estimated conservative 2 MiB per eligible lane). Skipping/eviction can
-reduce hits. Graft eligibility can freeze head acceptance even when no graft
-is applied; whole lookup saves head work, graft fallback retains it.
+B's retained `out-rank2.npy` has a top-32K set exactly equal to the original
+bitmap. `dev/tools/data/qwen4-draft-ranking.npy.gz` retains it for repeatable
+larger sets; the sizes manifest records its SHA256. Original tokenizer/corpus
+revisions were not recorded, so this does not invent their provenance. Sets
+are sorted top-K of the documented weighted ranking (`draft_vocabulary.py`),
+with added tokens first. Request context excludes the **selected** set;
+miss-based full-vocabulary fallback stays request-local and language-neutral
+(>3% exponentially decayed uncovered emissions). Larger sets add head image
+memory. No language classifier or new fallback threshold was introduced.
 
-B1 greedy token identity is mandatory, including C/F drafting changes.
-Known B4 nondeterminism makes free-running B4 comparison informational.
-Real model identity, streaming and speed remain pending the exclusive M5
-gates in `~/Developer/max-stack`; those scripts never build or download.
-M4 validation commands and receipts are recorded in that directory's STATUS.
+D's fp32 oracle remains bitwise; bf16 rounds at extra checkpoint boundaries.
+Optional checkpoint reservation refusal can split prefill and cost latency.
+F lookup mixing precedes verify-input/PLE hashing, composing with E barriers.
 
-The native transcript tool also reads D's environment flag through the same
-validated parser as `serve-native`; without that integration its bootstrap
-would silently leave the grid off. It uses fp32 state by default.
+## Deferred host proposals
 
-## Reserved follow-up slots
+Prefill co-batching needs an arrival trace before changing scheduler policy:
+`Scheduler::prefillBudget` already batches ready same-priority requests within
+a shared row budget. Instrument the ready list before `nextPrefill`, drain
+transport before planning if peers have not arrived, then consider a flag
+only for short leaders within the 2048-row budget. Require two-lane prefill
+KV/GDN/first-logit bitwise equivalence to separate commands before promotion;
+different matrix tiles make that a material gate. No new prefill flag yet.
 
-Leave 2–4 subsequent topics for explicit items in
-`~/Developer/overnight-1014/DECODE-GAP-REVIEW.md` and
-`~/Developer/gpu-arch-research/FOLD-IN-PLAN.md`. Neither existed at initial
-assembly; no speculative implementation is included.
+The optional draft attention window is deferred: paged verify plans expose
+committed prefix length, not a host-side first-page offset; merely shortening
+that length would attend the wrong prefix. A kernel ABI/window change is
+outside the host-only authorization for this item.
+
+M4 receipts and exact SHAs are in the handoff STATUS. M5 scripts in that
+handoff directory build/download nothing and await an exclusive window.
