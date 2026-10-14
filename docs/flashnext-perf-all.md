@@ -34,8 +34,8 @@ The exact old-to-new mapping and M4 receipt live in
 | PF7 | `SPLASH_PREFILL_QSA_COMPACT=validate`; capture path | unset | N; compact tolerance/repeat plus mandatory long-context quality. `=1` still refuses promotion |
 | CACHE | `--persistent-cache`, `FN2_CACHE_SIZE=16G` in copied launcher | off; FN2 size 0 | B output; disk hit/restart/deep-edit replay, D isolated with `--no-grid` |
 
-The stale B4 planner fixture used .7/.8 acceptance with B1's .30 threshold
-but asserted B4's old depths at .45. Restoring `2b853657` fixes the fixture;
+The stale B4 planner fixture expected 2/3/7/4 from rates .5/.7/.99/.8
+at threshold .45, which actually produces 2/2/7/3 (B1 .30 produces 2/3/7/5). Restoring `2b853657` fixes the fixture;
 the extra regression retains those old rates and independently checks the
 reach rule across every width threshold and caps 1/2/3/4/5/7. No production
 threshold is weakened to make the test pass.
