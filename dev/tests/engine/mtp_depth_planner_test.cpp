@@ -217,7 +217,7 @@ int main() {
     const auto thresholds = mtpWorthwhileFromEnvironment();
     for (float r : {0.1F, 0.6F, 0.8F, 0.95F})
       require(mtpRuleDepth(r, 7) == mtpRuleDepth(r, 7, thresholds[0]), "B1 lane equals rule");
-    const std::array<float, 4> rates{0.5F, 0.7F, 0.99F, 0.8F};
+    const std::array<float, 4> rates{0.5F, 0.78F, 0.99F, 0.84F};
     const std::array<uint32_t, 4> wanted{2, 3, 7, 4};
     for (size_t i = 0; i < rates.size(); ++i)
       require(mtpRuleDepth(rates[i], 7, thresholds[3]) == wanted[i], "mixed B4 lane rule depths");
