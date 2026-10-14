@@ -207,6 +207,31 @@ void cadence() {
 
 int main() {
   try {
+    unsetenv("SPLASH_MTP_DEPTH");
+    require(mtpDepthPolicyFromEnvironment() == MtpDepthPolicy::Rule, "unset depth uses rule");
+    setenv("SPLASH_MTP_DEPTH", "cost", 1);
+    require(mtpDepthPolicyFromEnvironment() == MtpDepthPolicy::Cost, "cost is opt-in");
+    setenv("SPLASH_MTP_DEPTH", "lane", 1);
+    require(mtpDepthPolicyFromEnvironment() == MtpDepthPolicy::Lane, "lane is opt-in");
+    unsetenv("SPLASH_MTP_WORTHWHILE");
+    const auto thresholds = mtpWorthwhileFromEnvironment();
+    for (float r : {0.1F, 0.6F, 0.8F, 0.95F})
+      require(mtpRuleDepth(r, 7) == mtpRuleDepth(r, 7, thresholds[0]), "B1 lane equals rule");
+    const std::array<float, 4> rates{0.5F, 0.7F, 0.99F, 0.8F};
+    const std::array<uint32_t, 4> wanted{2, 3, 7, 4};
+    for (size_t i = 0; i < rates.size(); ++i)
+      require(mtpRuleDepth(rates[i], 7, thresholds[3]) == wanted[i], "mixed B4 lane rule depths");
+    setenv("SPLASH_MTP_WORTHWHILE", "0.3,0.35,0.4,0.45", 1);
+    require(mtpWorthwhileFromEnvironment() == thresholds, "width thresholds parse");
+    setenv("SPLASH_MTP_WORTHWHILE", "0.4", 1);
+    require(mtpWorthwhileFromEnvironment()[0] == 0.4F && mtpWorthwhileFromEnvironment()[3] == 0.4F,
+            "scalar threshold applies at every width");
+    setenv("SPLASH_MTP_WORTHWHILE", "0.3,0.4", 1);
+    bool rejected = false;
+    try { (void)mtpWorthwhileFromEnvironment(); } catch (const std::invalid_argument &) { rejected = true; }
+    require(rejected, "reject partial threshold list");
+    unsetenv("SPLASH_MTP_WORTHWHILE");
+    unsetenv("SPLASH_MTP_DEPTH");
     acceptance();
     prior();
     fit();
