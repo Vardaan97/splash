@@ -313,6 +313,7 @@ void slicedPrefillIdentity(const char *library) {
           append(state.auxiliary);
           return result;
         };
+        for (bool scoring : {true, false}) {
         std::vector<std::byte> expectedState, expectedKv, expectedCapture, expectedLogits;
         for (uint32_t slices : {0u, 2u, 8u}) {
           f.pages->clearPages(std::array<uint32_t, 2>{0, 4});
@@ -321,8 +322,14 @@ void slicedPrefillIdentity(const char *library) {
           peer.sampling.seed = 77;
           f.prefill(peer, 1);
           auto request = f.request(700, std::vector<uint32_t>(48, 10));
-          request.maxNewTokens = 0;
-          request.scoreTokens = {0, 1, 10, 11};
+          if (scoring) {
+            request.maxNewTokens = 0;
+            request.scoreTokens = {0, 1, 10, 11};
+          } else {
+            request.maxNewTokens = 1;
+            request.sampling.temperature = 0.7F;
+            request.sampling.seed = 99;
+          }
           f.runtime->beginColdRequest(request.modelView(), 0);
           const std::array<uint32_t, 2> table{0, 4};
           BatchPlan plan{.kind = WorkKind::Prefill, .items = {{request.id, 48}}, .prefillSlices = slices};
@@ -350,6 +357,14 @@ void slicedPrefillIdentity(const char *library) {
             for (const auto span : f.pages->spans(page)) actualKv.insert(actualKv.end(), span.begin(), span.end());
           std::vector<std::byte> logits(result.scoreLogits.size() * sizeof(float));
           std::memcpy(logits.data(), result.scoreLogits.data(), logits.size());
+          for (uint32_t token : result.outputTokens) {
+            const auto *p = reinterpret_cast<const std::byte *>(&token);
+            logits.insert(logits.end(), p, p + sizeof(token));
+          }
+          if (result.firstToken) {
+            const auto *p = reinterpret_cast<const std::byte *>(&*result.firstToken);
+            logits.insert(logits.end(), p, p + sizeof(uint32_t));
+          }
           require(!f.runtime->beginRestore(request.id, 32, result.capturedStates[0], true, {}), "capture restore failed");
           auto capture = stateBytes();
           if (!slices) {
@@ -360,6 +375,22 @@ void slicedPrefillIdentity(const char *library) {
           }
           f.runtime->end(700); f.runtime->end(701);
         }
+        }
+        auto cancelled = f.request(702, std::vector<uint32_t>(48, 10));
+        f.runtime->beginColdRequest(cancelled.modelView(), 0);
+        const std::array<uint32_t, 2> table{0, 4};
+        BatchPlan plan{.kind = WorkKind::Prefill, .items = {{702, 48}}, .prefillSlices = 2};
+        ModelBatchItem item{702, 0, 48, table};
+        item.inputTokens = cancelled.prompt;
+        item.pageTableRevision = ++f.revisions[702];
+        auto ticket = f.runtime->submit(plan, std::span(&item, 1), {});
+        while (!ticket->segmentReady()) std::this_thread::yield();
+        ticket->pauseSegment();
+        ticket->abandonMask(702);
+        const auto discarded = ticket->wait().front();
+        require(!discarded.failure.empty() && discarded.capturedStates.empty() &&
+                f.states->metadata(0).lengths.targetTokens == 0, "cancelled chunk committed provisional state");
+        f.runtime->end(702);
       }
   std::cout << "runtime_sliced_prefill_identity=PASS\n";
 }
