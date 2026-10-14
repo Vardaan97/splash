@@ -68,7 +68,7 @@ To compare against the base behaviour in the same build:
 | Setting | Effect |
 | --- | --- |
 | `SPLASH_MTP_DRAFT_VOCAB=0` | Draft from the whole head (turns off PR B's draft vocabulary) |
-| `SPLASH_MTP_DEPTH=rule` | Use the threshold depth policy (turns off PR C's cost-aware depth) |
+| `SPLASH_MTP_DEPTH=rule` | Common threshold depth (default on max-stack; C remains available with cost) |
 | `SPLASH_MTP=0` | Turn MTP off |
 
 Leaving out `--ple-ssd-cache` keeps the PLE table in memory, as #253 does.

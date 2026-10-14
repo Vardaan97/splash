@@ -81,12 +81,15 @@ Adaptive depth defaults to a cap of seven proposals; `SPLASH_MTP_DRAFTS=1`–`7`
 sets the cap. `SPLASH_MTP_ADAPTIVE=0` fixes the depth (default three).
 By default, greedy and sampled batches draft from the vocabulary plus each
 request's context, falling back to the whole head when coverage is poor.
-`SPLASH_MTP_DRAFT_VOCAB=0` uses the whole head. Adaptive greedy-only batches
-use cost-aware per-lane depth; `SPLASH_MTP_DEPTH=rule` selects the threshold
-policy instead. Any batch containing a sampled lane uses the common
-acceptance-threshold depth, including constrained sampling. Its head and
-threshold decisions use token history rather than timings. Fixed mode keeps
-its configured depth. Vision runs from the repository's
+`SPLASH_MTP_DRAFT_VOCAB=0` uses the whole head; `32768` (default), `49152`
+and `65536` select nested draft sets. Adaptive depth defaults to the common
+acceptance-threshold rule (`SPLASH_MTP_DEPTH=rule`). `cost` opts greedy-only
+batches into measured per-lane cost planning; sampled cost-mode batches
+retain the common rule. `lane` applies the threshold separately to each lane,
+with `SPLASH_MTP_WORTHWHILE` thresholds by width. Its default width-1 threshold
+is the rule's 0.30, so one-stream lane mode repeats rule mode byte for byte.
+Head and rule decisions use token history rather than timings. Fixed mode
+keeps its configured depth. Vision runs from the repository's
 `mmproj-BF16.gguf`. `UD-Q4_K_XL` needs about 118 GB of Metal memory; its SSD cache
 (`--max-cache-disk`) keeps GDN states but not KV pages.
 
