@@ -16,6 +16,8 @@ Receipts on M4: `~/wp5-logs/G-check.log`, `G-check.exit`, `G-air-fresh.log`.
 
 ## Step 1a — gather fold and input prefetch, default off
 
+Implementation commit: `37a6df2e`.
+
 `SPLASH_MOE_GATHER_FOLD=1`: gather each K32 input slice inside gate/up.
 Mode `2`: additionally prefetch the next input slice into registers while the
 current matmul runs; applies to in-place B1 plans too. Eligible: staged M8,
@@ -32,7 +34,7 @@ strict AIR identity. No additional threadgroup allocation.
 | All 43 staged formats, rows 1–32, every legal firstRow, uniform/mixed lastRows; routing + live intermediate + output memcmp | PASS, 16,512 cases, both modes vs baseline, SV off and on |
 | Same matrix with reused maximum workspace (stale scratch coverage) | PASS, SV off and on |
 | Strict AIR vs fresh e8c386d6 | PASS, all 1,847 existing kernels identical; only G's two and gather's one added |
-| Every Cartesian lastRows combination, all firstRow, B1–B4, all formats | Running; 761,788 cases per SV mode; not yet a pass |
+| Every Cartesian lastRows combination, all firstRow, B1–B4, all formats | SV off PASS, 761,788 cases; SV on running |
 | M5 identity / performance / greedy | Not run; main-session queue only |
 
 Receipts: M4 `~/wp5-logs/{gather-off-final,gather-sv-final,gather-off-reuse,
@@ -49,6 +51,8 @@ ABI. Fresh baseline lives at `~/src/splash-expert-gemv-base` on M4; old failed
 comparisons are retained, not normalized away.
 
 ## Step 1b — single indirect expert grid, default off
+
+Implementation commit: `c44ff546`.
 
 `SPLASH_MOE_WHOLE_EXPERT=1` runs gate/up and down in one threadgroup per live
 expert tile, on a single indirect grid. Each threadgroup walks column tiles
