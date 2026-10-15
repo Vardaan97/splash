@@ -96,6 +96,11 @@ public:
   DiskSpace(std::shared_ptr<model::DiskBudget> budget,
             std::vector<std::shared_ptr<model::SlotFile>> files,
             std::vector<CacheDirectory::Idle> others = {});
+  // Start from a volume reading the caller already made. Tests use this
+  // before any pruning; nullopt retains the normal descriptor measurement.
+  DiskSpace(std::shared_ptr<model::DiskBudget> budget,
+            std::vector<std::shared_ptr<model::SlotFile>> files,
+            std::vector<CacheDirectory::Idle> others, std::optional<DiskVolume> initialVolume);
   DiskSpace(const DiskSpace &) = delete;
   DiskSpace &operator=(const DiskSpace &) = delete;
 

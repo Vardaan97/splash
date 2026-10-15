@@ -77,13 +77,21 @@ std::string gibibytes(uint64_t bytes) {
 DiskSpace::DiskSpace(std::shared_ptr<model::DiskBudget> budget,
                      std::vector<std::shared_ptr<model::SlotFile>> files,
                      std::vector<CacheDirectory::Idle> others)
+    : DiskSpace(std::move(budget), std::move(files), std::move(others), std::nullopt) {}
+
+DiskSpace::DiskSpace(std::shared_ptr<model::DiskBudget> budget,
+                     std::vector<std::shared_ptr<model::SlotFile>> files,
+                     std::vector<CacheDirectory::Idle> others, std::optional<DiskVolume> initialVolume)
     : budget_(std::move(budget)), files_(std::move(files)),
       others_(std::make_move_iterator(others.begin()), std::make_move_iterator(others.end())) {
   if (!budget_ || files_.empty())
     throw std::invalid_argument("a disk tier's space needs its budget and a file");
   for (const CacheDirectory::Idle &cache : others_)
     othersBytes_ += cache.bytes;
-  measure();
+  if (initialVolume)
+    measure(std::move(initialVolume));
+  else
+    measure();
 }
 
 void DiskSpace::measure() {

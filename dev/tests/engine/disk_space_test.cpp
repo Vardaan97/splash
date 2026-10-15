@@ -229,7 +229,7 @@ void testOtherCachesGoFirst() {
   const std::vector<CacheDirectory::Idle> others = otherCaches(root.path());
   auto budget = std::make_shared<model::DiskBudget>(kQuota);
   auto file = std::make_shared<model::SlotFile>(kHostPageBytes, budget);
-  DiskSpace space(budget, {file}, others);
+  DiskSpace space(budget, {file}, others, localVolume(500 * kGiB));
   require(space.othersBytes() == others[0].bytes + others[1].bytes,
           "the other caches were not counted");
   // A volume that leaves the root a limit of what the others hold less half
@@ -245,6 +245,20 @@ void testOtherCachesGoFirst() {
           "the oldest other cache did not go first, or the tier did not get the root's limit");
 }
 
+// The initial reading takes effect before a namespace can be pruned. This
+// pins the below-floor case without depending on the host's free space.
+void testInitialLowVolumePrunes() {
+  const test::TemporaryDirectory root("splash-disk-space-initial-low");
+  const auto others = otherCaches(root.path());
+  auto budget = std::make_shared<model::DiskBudget>(kQuota);
+  auto file = std::make_shared<model::SlotFile>(kHostPageBytes, budget);
+  DiskSpace space(budget, {file}, others, localVolume(0));
+  require(space.othersBytes() == 0 && budget->limitBytes() == 0 &&
+              !std::filesystem::exists(others[0].path / "kv.slots") &&
+              !std::filesystem::exists(others[1].path / "kv.slots"),
+          "an initial below-floor reading did not prune idle caches");
+}
+
 // The tier growing within the quota makes them go as well, on a volume
 // whose free space the tier follows or on one it does not.
 void testOtherCachesGoAsTheTierGrows() {
@@ -254,8 +268,8 @@ void testOtherCachesGoAsTheTierGrows() {
     const uint64_t quota = others[0].bytes + others[1].bytes + kMiB + kMiB / 2;
     auto budget = std::make_shared<model::DiskBudget>(quota);
     auto file = std::make_shared<model::SlotFile>(kMiB, budget);
-    DiskSpace space(budget, {file}, others);
     const DiskVolume volume{"/Volumes/Test", 500 * kGiB, 1000 * kGiB, local};
+    DiskSpace space(budget, {file}, others, volume);
     space.measure(volume);
     require(budget->limitBytes() == quota && space.othersBytes() == quota - kMiB - kMiB / 2,
             "the tier did not get the root's whole quota");
@@ -290,6 +304,7 @@ int main() {
     testAutomaticStart();
     testMeasureOfRealFiles();
     testOtherCachesGoFirst();
+    testInitialLowVolumePrunes();
     testOtherCachesGoAsTheTierGrows();
     std::cout << "Disk space tests passed\n";
   } catch (const std::exception &error) {
