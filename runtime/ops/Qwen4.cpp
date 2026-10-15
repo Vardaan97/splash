@@ -12,10 +12,19 @@
 
 namespace splash::ops {
 
+namespace { thread_local uint32_t fusionOverride = 8; }
+HyperFusionOverride::HyperFusionOverride(uint32_t bits) : previous_(fusionOverride) {
+  if (bits > 7) throw std::invalid_argument("invalid hyper fusion override");
+  fusionOverride = bits;
+}
+HyperFusionOverride::~HyperFusionOverride() { fusionOverride = previous_; }
 uint32_t hyperFusionBits() noexcept {
-  const char *value = std::getenv("SPLASH_HYPER_FUSION");
-  return value && value[0] >= '0' && value[0] <= '7' && value[1] == '\0'
-      ? uint32_t(value[0] - '0') : 0;
+  static const uint32_t bits = [] {
+    const char *value = std::getenv("SPLASH_HYPER_FUSION");
+    return value && value[0] >= '0' && value[0] <= '7' && value[1] == '\0'
+        ? uint32_t(value[0] - '0') : 0;
+  }();
+  return fusionOverride < 8 ? fusionOverride : bits;
 }
 
 namespace {

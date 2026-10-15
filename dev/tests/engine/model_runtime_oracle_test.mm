@@ -1,3 +1,4 @@
+#include "ops/Qwen4.hpp"
 #include "HyperRuntimeFixture.hpp"
 #include "LinearNumerics.hpp"
 #include "../../benchmarks/DecodeProfileInput.hpp"
@@ -2462,7 +2463,7 @@ int main(int argc, char **argv) {
         std::vector<uint64_t> lengths;
       };
       const auto run = [&](const char *bits, uint32_t width) {
-        setenv("SPLASH_HYPER_FUSION", bits, 1);
+        const splash::ops::HyperFusionOverride policy(static_cast<uint32_t>(std::strtoul(bits, nullptr, 10)));
         splash::test::mtp::Fixture f(argv[1], false, false, false, false, true);
         Receipt receipt;
         std::vector<uint64_t> ids(width);
