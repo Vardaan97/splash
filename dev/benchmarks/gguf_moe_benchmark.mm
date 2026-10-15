@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <iostream>
 #include <map>
 #include <numeric>
@@ -91,6 +92,10 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
   constexpr uint32_t kRowsMax = 2048;
   const uint32_t H = flash ? 2560 : 2048, I = flash ? 640 : 512,
                  E = flash ? 512 : 256, top = flash ? 10 : 8;
+  for (const auto &[format, k] : {std::pair{gateUpFormat, H}, std::pair{downFormat, I},
+                                  std::pair{sharedFormat, H}, std::pair{sharedFormat, I}})
+    if (k % quant_column_unit(kQuantFormats[format].block_elements))
+      throw std::invalid_argument("format does not fit the projection K");
   // gate and up hold most of the routed expert weights.
   const MoeShape ggufShape{H, E, top, I, uint32_t(gateUpFormat),
                            quant_register_format(gateUpFormat) && quant_register_format(downFormat) &&
@@ -158,6 +163,23 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
   printf("%s, GPU family %u, %u cores: median GPU ms per MoE layer of %u rounds\n",
          backend.capabilities().deviceName.c_str(), backend.capabilities().appleGpuFamily,
          backend.capabilities().gpuCoreCount, rounds);
+  if (tile == "decode") {
+    for (uint32_t rows : {1u, 4u, 8u, 16u, 32u}) {
+      b.input = bfloatBuffer(backend, input(rows, 24), "input");
+      const auto plan = MoE::prefillPlan(ggufShape, rows, MoeConfig{});
+      const double layer = time(gguf, plan);
+      CommandGraph graph;
+      MoE::add(graph, b, gguf, plan);
+      const uint32_t live = *static_cast<const uint32_t *>(b.scratch.tileCount.contents());
+      const char *fold = std::getenv("SPLASH_MOE_GATHER_FOLD");
+      printf("WP5 rows=%u gate_up=%s down=%s shared=%s gather_fold=%s layer_ms=%.6f live_tiles=%u dispatches=%zu\n",
+             rows, fmtName(gateUpFormat), fmtName(downFormat), fmtName(sharedFormat), fold ? fold : "0",
+             layer, live, graph.dispatches().size());
+      for (const auto &[name, seconds] : splash::benchmark::replayDispatches(backend, graph.dispatches()))
+        printf("WP5_REPLAY rows=%u kernel=%s ms=%.6f\n", rows, name.c_str(), seconds * 1e3);
+    }
+    return 0;
+  }
   if (!tile.empty()) {
     if (!splash::metal::moePrefillSelfTest(backend)) return 1;
     using splash::ops::MoeExpertTile;
@@ -257,21 +279,28 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
 
 int main(int argc, const char *argv[]) {
   @autoreleasepool {
-    const Fmt gateUp = argc > 3 ? fmtNamed(argv[3]) : Q4K, down = argc > 4 ? fmtNamed(argv[4]) : Q5K,
+#ifdef GGUF_MOE_BENCHMARK_E512
+    constexpr const char *defaultTile = "decode", *defaultShape = "flashnext";
+    constexpr Fmt defaultDown = Q51;
+#else
+    constexpr const char *defaultTile = "", *defaultShape = "35b";
+    constexpr Fmt defaultDown = Q5K;
+#endif
+    const Fmt gateUp = argc > 3 ? fmtNamed(argv[3]) : Q4K, down = argc > 4 ? fmtNamed(argv[4]) : defaultDown,
               shared = argc > 5 ? fmtNamed(argv[5]) : Q80;
     if (argc < 2 || argc > 9 || gateUp == FMT_COUNT || down == FMT_COUNT || shared == FMT_COUNT) {
-      std::cerr << "usage: gguf-moe-benchmark <metallib> [rounds] [gate/up format] [down format] [shared format] [m32|m64] [35b|flashnext] [uniform|zipf]\n";
+      std::cerr << "usage: gguf-moe-benchmark <metallib> [rounds] [gate/up format] [down format] [shared format] [m32|m64|decode] [35b|flashnext] [uniform|zipf]\n";
       return 2;
     }
     try {
       MetalBackend backend(argv[1]);
-      const std::string tile = argc > 6 ? argv[6] : "";
-      const std::string shape = argc > 7 ? argv[7] : "35b";
+      const std::string tile = argc > 6 ? argv[6] : defaultTile;
+      const std::string shape = argc > 7 ? argv[7] : defaultShape;
       const std::string routing = argc > 8 ? argv[8] : "uniform";
       const uint32_t rounds = argc > 2 ? std::stoul(argv[2]) : 20;
-      if (!rounds || (!tile.empty() && tile != "m32" && tile != "m64") ||
+      if (!rounds || (!tile.empty() && tile != "m32" && tile != "m64" && tile != "decode") ||
           (shape != "35b" && shape != "flashnext") || (routing != "uniform" && routing != "zipf"))
-        throw std::invalid_argument("expected rounds>0, tile m32|m64, shape 35b|flashnext, routing uniform|zipf");
+        throw std::invalid_argument("expected rounds>0, tile m32|m64|decode, shape 35b|flashnext, routing uniform|zipf");
       return timing(backend, rounds, gateUp, down, shared, tile, shape == "flashnext", routing == "zipf");
     } catch (const std::exception &error) {
       std::cerr << "gguf-moe-benchmark: " << error.what() << '\n';

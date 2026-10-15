@@ -225,7 +225,7 @@ TEST_METAL_TARGETS := $(ENGINE_TEST_BUILD)/expert-tile-test $(TEST_MTP_RUNTIME) 
 TEST_CONFIG_TARGETS := $(filter-out $(LIB),$(sort $(TEST_CPU_TARGETS) $(TEST_METAL_TARGETS))) \
 	$(TEST_MODEL_RUNTIME_ORACLE) $(TEST_VISION_ENCODER_TEST) \
 	$(TEST_DECODE_PROFILE) $(TEST_ATTENTION_SWEEP) \
-	$(TEST_GGUF_PROJECTION_BENCHMARK) $(TEST_GGUF_MOE_BENCHMARK) $(TEST_DISPATCH_FLOOR_BENCHMARK) $(ENGINE_TEST_BUILD)/expert-tile-benchmark \
+	$(TEST_GGUF_PROJECTION_BENCHMARK) $(TEST_GGUF_MOE_BENCHMARK) $(TEST_DISPATCH_FLOOR_BENCHMARK) $(ENGINE_TEST_BUILD)/expert-tile-benchmark $(ENGINE_TEST_BUILD)/gguf-moe-benchmark-e512 \
 	$(TEST_Q8_AIR) $(TEST_Q8_KERNEL_AIRS) $(TEST_RESIDENCY_AIR) $(TEST_METAL_BACKEND_AIR) \
 	$(TEST_GGUF_DEQUANT_AIR)
 # Benchmarks and tools that build with the production flags.
@@ -699,3 +699,8 @@ $(ENGINE_TEST_BUILD)/expert-tile-test: dev/tests/engine/expert_tile_test.mm \
 $(ENGINE_TEST_BUILD)/expert-tile-benchmark: dev/benchmarks/expert_tile_benchmark.mm \
         dev/tests/engine/GgufFormatReference.hpp $(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
+
+# Decode replay at the 512-expert model shape; only run on a queued GPU slot.
+$(ENGINE_TEST_BUILD)/gguf-moe-benchmark-e512: dev/benchmarks/gguf_moe_benchmark.mm \
+        dev/tests/engine/GgufFormatReference.hpp $(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -DGGUF_MOE_BENCHMARK_E512 -fobjc-arc $< $(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@

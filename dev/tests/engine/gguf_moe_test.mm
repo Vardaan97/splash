@@ -1,4 +1,6 @@
 #include "MoeHyperIdentity.hpp"
+#import <Metal/Metal.h>
+#include <cstdlib>
 // GGUF sparse MoE (ops::MoE over BlockMoeWeights) and the fp32 projection of
 // GGUF float tensors, against fp64 references over GGML's dequantized weights
 // (GgufFormatReference.hpp), through the production dispatch code.
@@ -1113,15 +1115,130 @@ int prefillM64(MetalBackend &backend) {
   return 0;
 }
 
+// Baseline and candidate executions of the production graph. Compare routing, the live
+// expert intermediates and the final output, including inactive output rows.
+int gatherFoldIdentity(MetalBackend &backend, bool exhaustive, const char *libraryPath) {
+  id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+  NSError *error = nil;
+  id<MTLLibrary> library = [device newLibraryWithURL:[NSURL fileURLWithPath:[NSString stringWithUTF8String:libraryPath]] error:&error];
+  require(library != nil, "load gather identity library");
+  for (NSString *name in @[@"moe_expert_gguf_m8_gate_up", @"moe_expert_gguf_m8_gather_gate_up"]) {
+    id<MTLFunction> function = [library newFunctionWithName:name];
+    require(function != nil, "find gather identity kernel");
+    id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:function error:&error];
+    require(pipeline != nil, "create gather identity pipeline");
+    const char *sv = std::getenv("MTL_SHADER_VALIDATION");
+    const bool validation = sv && std::strcmp(sv, "1") == 0;
+    std::cout << name.UTF8String << " static_tg_bytes=" << pipeline.staticThreadgroupMemoryLength
+              << " shader_validation=" << validation << std::endl;
+    // Shader validation injects its own threadgroup instrumentation into
+    // the baseline too. The production-memory gate uses SV-off pipelines.
+    if (!validation) require(pipeline.staticThreadgroupMemoryLength <= 9216, "expert stage exceeds 9216 bytes");
+  }
+  unsetenv("SPLASH_EXPERT_TILE");
+  Buffers b;
+  b.moe.input = bfloatBuffer(backend, activations(32 * kHidden), "input");
+  b.moe.residual = bfloatBuffer(backend, activations(32 * kHidden), "residual");
+  b.moe.output = zeros(backend, 32 * kHidden * 2, "output");
+  const MoeShape shape{kHidden, kExperts, kTopK, kIntermediate};
+  // Reuse the largest workspace just as successive decode steps do. Apart
+  // from avoiding allocation cost in the exhaustive matrix, this exposes
+  // stale scratch reads that fresh zero-filled allocations would conceal.
+  allocate(backend, b, MoE::prefillPlan(shape, 32, MoeConfig{}));
+  size_t cases = 0;
+  for (Fmt f : tileFormats(MoeGgufTile::Staged)) {
+    const Model m = makeModel(backend, f, true);
+    const auto compare = [&](const MoePlan &plan, uint32_t first, const std::vector<uint32_t> &last) {
+      std::vector<uint8_t> expected;
+      std::string bounds;
+      for (uint32_t end : last) bounds += (bounds.empty() ? "" : ",") + std::to_string(end);
+      for (uint32_t mode : {0u, 1u, 2u}) {
+        setenv("SPLASH_MOE_GATHER_FOLD", std::to_string(mode).c_str(), 1);
+        std::memset(b.moe.output.contents(), 0xa5, b.moe.output.sizeBytes());
+        CommandGraph graph;
+        MoE::add(graph, b.moe, m.weights, plan, first, last);
+        const bool fold = mode == 2 || (mode == 1 && !plan.rowsInPlace());
+        const auto count = [&](std::string_view name) {
+          return std::count_if(graph.dispatches().begin(), graph.dispatches().end(),
+                              [&](const auto &d) { return d.pipelineName == name; });
+        };
+        require(count("moe_expert_gguf_m8_gather_gate_up") == (fold ? 1 : 0), "gather fold dispatch");
+        require(count("moe_gather_rows") == (!fold && !plan.rowsInPlace() ? 1 : 0), "gather dispatch removed");
+        static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+        std::vector<uint8_t> bytes;
+        const auto append = [&](const void *data, size_t n) {
+          const auto *p = static_cast<const uint8_t *>(data);
+          bytes.insert(bytes.end(), p, p + n);
+        };
+        append(b.moe.output.contents(), b.moe.output.sizeBytes());
+        const auto &scratch = b.moe.scratch;
+        append(scratch.selectedExperts.contents(), plan.rows() * kRoutes * 4);
+        append(scratch.routingWeights.contents(), plan.rows() * kRoutes * 4);
+        append(scratch.tileCount.contents(), sizeof(MoeTileCount));
+        const auto *map = static_cast<const uint32_t *>(scratch.routeRows.contents());
+        // Atomic grouping may choose a different within-expert row order.
+        // Compare each route's values through its own mapping, not map bytes.
+        const uint32_t live = *static_cast<const uint32_t *>(scratch.tileCount.contents());
+        for (uint32_t route = 0; route < plan.rows() * kRoutes; ++route) {
+          require(map[route] < live * plan.tileRows(), "gather route mapping bounds");
+          append(static_cast<const uint16_t *>(scratch.expertIntermediate.contents()) +
+                 uint64_t{map[route]} * kIntermediate, kIntermediate * 2);
+          append(static_cast<const uint16_t *>(scratch.expertOutput.contents()) +
+                 uint64_t{map[route]} * kHidden, kHidden * 2);
+        }
+        if (!mode) expected = std::move(bytes);
+        else require(expected == bytes, "gather fold memcmp format=" + std::to_string(f) +
+                     " rows=" + std::to_string(plan.rows()) + " first=" + std::to_string(first) + " last=" + bounds + " mode=" + std::to_string(mode));
+      }
+      ++cases;
+    };
+    for (uint32_t rows = 1; rows <= 32; ++rows)
+      compare(MoE::prefillPlan(shape, rows, MoeConfig{MoeExpertTile::M8}), 0, {});
+    for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
+      const auto plan = MoE::decodePlan(shape, lanes, MoeConfig{});
+      for (uint32_t first = 0; first < 8; ++first) {
+        std::vector<uint32_t> last(lanes, 8);
+        if (exhaustive) {
+          // Cartesian product of all legal per-lane lastRows, including
+          // empty lanes and every combination of differently sized lanes.
+          const auto walk = [&](auto &&self, uint32_t lane) -> void {
+            if (lane == lanes) { compare(plan, first, last); return; }
+            for (uint32_t end = first; end <= 8; ++end) {
+              last[lane] = end;
+              self(self, lane + 1);
+            }
+          };
+          walk(walk, 0);
+        } else {
+          for (uint32_t end = first; end <= 8; ++end) {
+            std::fill(last.begin(), last.end(), end);
+            compare(plan, first, last);
+            for (uint32_t lane = 0; lane < lanes; ++lane) last[lane] = first + (end - first + lane) % (9 - first);
+            compare(plan, first, last);
+          }
+        }
+      }
+    }
+    std::cout << "gather-fold " << fmtName(f) << " PASS cumulative_cases=" << cases << std::endl;
+  }
+  unsetenv("SPLASH_MOE_GATHER_FOLD");
+  std::cout << "gather-fold: PASS exhaustive=" << exhaustive << " cases=" << cases << '\n';
+  return 0;
+}
+
 int main(int argc, const char *argv[]) {
   @autoreleasepool {
-    if (argc != 2 && !(argc == 3 && std::string_view(argv[2]) == "--prefill-m64")) {
+    if (argc != 2 && !(argc == 3 && (std::string_view(argv[2]) == "--prefill-m64" ||
+        std::string_view(argv[2]) == "--gather-fold" || std::string_view(argv[2]) == "--gather-fold-exhaustive"))) {
       std::cerr << "usage: gguf_moe_test <metallib>\n";
       return 2;
     }
     try {
       MetalBackend backend(argv[1]);
-      if (argc == 3) return prefillM64(backend);
+      if (argc == 3) {
+        if (std::string_view(argv[2]) == "--prefill-m64") return prefillM64(backend);
+        return gatherFoldIdentity(backend, std::string_view(argv[2]) == "--gather-fold-exhaustive", argv[1]);
+      }
       splash::test::moeHyperIdentity(backend);
       bufferExtents(backend);
       const int failures = floatProjection(backend) + floatSegments(backend, 64) + floatSegments(backend, 96) +

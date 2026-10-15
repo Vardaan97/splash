@@ -55,7 +55,8 @@ PREFILL_CANDIDATE_SOURCES := $(wildcard runtime/metal/kernels/decode/paged_atten
 	runtime/metal/kernels/prefill/paged_attention_prob2.metal \
 	runtime/metal/kernels/prefill/paged_attention_rows4.metal \
 	runtime/metal/kernels/prefill/paged_attention_compact.metal \
-	runtime/metal/kernels/shared/dispatch_floor.metal)
+	runtime/metal/kernels/shared/dispatch_floor.metal \
+	runtime/metal/kernels/shared/moe_gguf_gather.metal)
 PRODUCTION_KERNEL_SOURCES := $(filter-out $(PREFILL_CANDIDATE_SOURCES),$(PRODUCTION_KERNEL_SOURCES)) $(PREFILL_CANDIDATE_SOURCES)
 PRODUCTION_KERNEL_NAMES := \
 	$(patsubst runtime/metal/kernels/%.metal,%,$(PRODUCTION_KERNEL_SOURCES))

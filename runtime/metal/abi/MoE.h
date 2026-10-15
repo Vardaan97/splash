@@ -115,3 +115,11 @@ struct MoeCombineParams {
 
 static_assert(sizeof(MoeCombineParams) == 12,
               "MoE combine parameters are 12 bytes on both sides");
+
+// Parameters of the grouped-input M8 gather-fold candidate.
+struct MoeGatherExpertParams {
+  MoeGgufExpertParams expert;
+  uint32_t routes_per_row;
+  uint32_t input_ahead;
+};
+static_assert(sizeof(MoeGatherExpertParams) == 32, "gather expert ABI");
