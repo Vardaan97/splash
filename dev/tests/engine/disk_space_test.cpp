@@ -51,6 +51,8 @@ void testConfiguredFloor() {
   require(budget->limitBytes() == 4 * kGiB, "shrinking free space did not shrink tier");
   space.measure(localVolume(31 * kGiB));
   require(!budget->limitBytes(), "tier admits writes below configured floor");
+  space.measure(std::nullopt);
+  require(!budget->limitBytes(), "configured floor failed open when volume was unreadable");
   space.measure(localVolume(96 * kGiB));
   require(budget->limitBytes() == 16 * kGiB, "tier did not recover after free space returned");
   require(automaticDiskRefusal(localVolume(33 * kGiB), 0, kGiB, 32 * kGiB).has_value(),

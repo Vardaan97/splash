@@ -81,6 +81,25 @@ void testShortPrefillCobatch() {
   require(scheduler.next({})->kind == WorkKind::Decode && scheduler.next({})->width() == 4,
           "co-batched lanes did not become ready for decode together");
 
+  Scheduler priority(0.0);
+  priority.setPrefillCobatch(true);
+  priority.submit(request(1, 64, false, RequestPriority::Foreground));
+  priority.submit(request(2, 64));
+  priority.resourcesReady(1,0);
+  priority.resourcesReady(2,0);
+  require(priority.next({})->width()==1 && priority.next({})->items[0].requestId==1,
+          "co-batch crossed request priorities");
+
+  Scheduler busy(0.0);
+  busy.setPrefillCobatch(true);
+  busy.submit(request(1,2048));
+  busy.resourcesReady(1,0);
+  completePrefill(busy,*busy.next({}),10000.0);
+  completeDecode(busy);
+  for (uint64_t id=2; id<=5; ++id) busy.submit(request(id,32));
+  require(busy.prefillAdmissionOrder(candidates)==std::vector<uint64_t>({2,3}),
+          "co-batch exceeded the measured adaptive budget beside decode");
+
   Scheduler isolated(0.0);
   isolated.setPrefillCobatch(true);
   isolated.submit(request(1, 100));

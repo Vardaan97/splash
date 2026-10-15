@@ -118,7 +118,7 @@ void DiskSpace::measure(std::optional<DiskVolume> volume) {
       logLine("SSD cache: a second write found ", seen, "; the cache keeps within the ",
               gibibytes(heldCapBytes_), " it holds while this server runs.");
   }
-  const uint64_t rootLimit = followed() ? diskLimitBytes(budget_->capacityBytes(),
+  const uint64_t rootLimit = minimumFloorBytes_ && !followed() ? 0 : followed() ? diskLimitBytes(budget_->capacityBytes(),
                                                          volume_->availableBytes, heldBytes_, floor)
                                         : budget_->capacityBytes();
   // The root holds more than its limit: another model's cache nobody holds

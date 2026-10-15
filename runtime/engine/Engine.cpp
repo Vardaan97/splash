@@ -778,7 +778,14 @@ bool Engine::admit(Request &active, double now) {
   }
   // Queue file reads before lane allocation and asynchronous state/KV restore.
   // SparseRowStore bounds the hint; stage remains the authoritative read.
-  model_.prefetchPrompt(modelRequest, lookup.resumeBoundary());
+  const auto prefetch = [&] {
+    const uint32_t from = lookup.resumeBoundary();
+    if (active.prefetchedFrom != from) {
+      model_.prefetchPrompt(modelRequest, from);
+      active.prefetchedFrom = from;
+    }
+  };
+  prefetch();
   // A prefix wait is not an attempt: a refusal stands until the next one.
   active.refusedMemory = false;
   // A request is in service when no other lane is resident
@@ -827,8 +834,10 @@ bool Engine::admit(Request &active, double now) {
   cache_.beginRequest(active.request.id);
   active.lane = *state.admission.lane;
   active.admission = ++admissions_;
-  if (droppedLease)
+  if (droppedLease) {
     lookup = cache_.lookup(modelRequest.prompt, promptIdentity(active.request));
+    prefetch();
+  }
   const uint32_t resumeBoundary = lookup.resumeBoundary();
   const uint64_t requestId = active.request.id;
   // The matched chain first, then the first work's pages for a lane that
@@ -897,6 +906,7 @@ void Engine::completeAdmission(Request &active, CacheLookup &lookup,
   const bool resuming = scheduler_.suspended(active.request.id);
   active.skipCache = false;
   active.admissionProbe.reset();
+  active.prefetchedFrom.reset();
   const uint32_t resumeBoundary = lookup.resumeBoundary();
   // The blocks a resume restores past those the request published are blocks
   // another request computed, which its replay reads; the chain a start

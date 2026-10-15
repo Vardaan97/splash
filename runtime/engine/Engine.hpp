@@ -355,6 +355,8 @@ private:
     // change while the request waits; refreshed each pass and dropped once it starts or
     // skips the cache.
     std::optional<CacheProbe> admissionProbe;
+    // Avoid queueing duplicate first-chunk hints while memory admission retries.
+    std::optional<uint32_t> prefetchedFrom;
     std::vector<StateBoundary> stateBoundaries;
     size_t stateBoundaryCursor = 0;
     StateCheckpoint latestCheckpoint;
