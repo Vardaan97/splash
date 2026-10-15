@@ -1,6 +1,6 @@
 # WP5 — expert GEMV
 
-2026-10-15. Base `e8c386d6`, branch `flashnext-expert-gemv`, source worktree
+Session stopped within the three-hour timebox on 2026-10-15. Base `e8c386d6`, branch `flashnext-expert-gemv`, source worktree
 `~/src/splash-expert-gemv`. Deadline 03:33 UTC / 09:03 IST; exhaustive runner
 stops at 03:28 UTC. M4 builds/tests use slot 5 and nice 19. No M5 jobs,
 sub-agents, pushes or posts. No performance gain or M5 bitwise claim.
@@ -78,9 +78,10 @@ test volume; its smaller volume floor avoids that host-space assumption.
 The full retry PASSED, exit 0, in 1,474.3 s under slot 5
 (`whole-check-retry.log/.json`); Python 1,287 tests, 27 skipped. Both existing
 MoE suites passed with SV. Whole-expert Cartesian SV-off PASSED all 761,788
-cases, exit 0, in 963.1 s (`whole-exhaustive-off.log/.json`). The exhaustive
-SV-on run started at about 03:25 UTC and is subject to the 03:28 UTC cutoff;
-its full pass remains pending.
+cases, exit 0, in 963.1 s (`whole-exhaustive-off.log/.json`). Exhaustive
+SV-on hit the 03:28 UTC deadline during pipeline creation, before numerical
+coverage began: exit 124 after 149.1 s (`whole-exhaustive-sv.log/.json`).
+Its full pass remains pending; the separate 16,512-case SV-on pass stands.
 
 This is an explicit experiment, not an automatic selection rule. Serial column
 work needs enough live expert tiles for occupancy. Main-session SLOT-2/replay
@@ -120,3 +121,28 @@ Final direct AIR check against the fresh e8c386d6 library PASSED: all 1,847
 original kernels identical; four additions only (G lane + gate/up, gather,
 whole). Receipt: `final-air-fresh.log`. Runtime/build/test source hashes
 match the M4 final checkout; `source.sha256` records them.
+
+
+## Stop state and next session
+
+All owned M4 runners stopped at the cutoff. Slot 5 released; the temporary
+APFS volume detached and its sparse image removed. No other owner's lock,
+runner or files were changed. No M5 GPU job, build, server, model read, or
+large transfer ran. Only the approximately 44 MiB candidate artifacts were
+staged for the main-session queue. No push, public post or deployment.
+
+1. Finish whole-expert exhaustive SV-on on M4 under an owned slot 5:
+   `MTL_SHADER_VALIDATION=1 build/engine-tests/gguf-moe-e512 build/splash.metallib --whole-expert-exhaustive`.
+   Final M4 build is `~/src/splash-expert-gemv-whole`; the original
+   `~/src/splash-expert-gemv` build is the frozen gather-only validation tree.
+   The committed runner's `whole-exhaustive` mode acquires/releases the slot
+   but repeats the already-passing SV-off sweep before SV-on.
+2. Main session: SLOT-2 first, then production-width M5 identity and replay
+   for all staged formats at 1/4/8 live rows. Compare gather modes and the
+   whole-expert force flag independently; determine any live-tile selection
+   rule from measurements. No automatic whole-expert policy is implemented.
+3. Require the original ≥15% layer gate at 8 rows, then d4 512/2K ABBA64
+   ≥2% outside 2× spread and 14/14 greedy bytes. **No performance GO yet.**
+
+Code commits: G `d7447588`, gather/input-prefetch `37a6df2e`, whole-expert
+`c44ff546`, decode replay fixture `1901dcf4`. Later commits record validation.
