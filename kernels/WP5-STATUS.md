@@ -18,6 +18,10 @@ Receipts on M4: `~/wp5-logs/G-check.log`, `G-check.exit`, `G-air-fresh.log`.
 
 Implementation commit: `37a6df2e`.
 
+Identity matrices use the existing `gguf-moe-e512` test target: H=256, I=640,
+E=512, top-10. Production replay is H=2560, I=640, E=512, top-10; that
+production-width M5 gate remains pending.
+
 `SPLASH_MOE_GATHER_FOLD=1`: gather each K32 input slice inside gate/up.
 Mode `2`: additionally prefetch the next input slice into registers while the
 current matmul runs; applies to in-place B1 plans too. Eligible: staged M8,
@@ -94,4 +98,6 @@ prefetches input slices.
 3. Only on GO: d4 512/2K `decode-profile --cycles 64` ABBA, ≥2% outside twice
    spread, and 14/14 greedy bytes. Follow the standing thermal/burn-in protocol.
 
+Completed receipts are also saved locally at
+`~/Developer/kernels/wp5-results-20261015/`.
 No M5 run or artifact promotion was performed by this session.
