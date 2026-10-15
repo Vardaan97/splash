@@ -84,7 +84,10 @@ prefetches input slices.
 2. Run device memcmp with SV off/on. Then fresh-process 0/2/2/0 replay:
    `SPLASH_MOE_GATHER_FOLD=<mode> build/engine-tests/gguf-moe-benchmark-e512
    build/splash.metallib 40 iq4xs iq4nl q80` (repeat per format).
-   Harness reports layer medians plus replay at 1/4/8/16/32 rows. Synthetic
+   Harness uses decode plans with eight storage rows per lane and lastRows
+   for 1/4 live rows; it runs the eight-live-row case first for capture. It
+   reports layer medians plus replay at 1/4/8/16/32 live rows. This fixture
+   correction was M4-built (benchmark-decode-build.log), not timed. Synthetic
    reuse is not a DRAM-bandwidth measurement. Repeat with
    `SPLASH_MOE_WHOLE_EXPERT=1` to evaluate the single-grid path by live-tile
    count. GO: ≥15% at 8 rows and bitwise.

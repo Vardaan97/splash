@@ -22,7 +22,8 @@ the Cartesian product of every legal per-lane lastRows for each firstRow.
 
 The M4-built `gguf-moe-benchmark-e512 <metallib> [rounds] [gate/up format]
 [down format] [shared format]` defaults to decode replay at H=2560, I=640,
-E=512, top-10, with 1/4/8/16/32 rows. It reports full-layer medians and separate
+E=512, top-10, with 1/4/8/16/32 live rows and eight storage rows per lane. The eight-live-row
+case runs first for capture. It reports full-layer medians and separate
 dispatch replays. Synthetic cache reuse means replay is not a DRAM-bandwidth
 measurement. M5 runs belong only to the main-session queue, after SLOT-2.
 Qualification receipts and remaining gates are in `kernels/WP5-STATUS.md`.

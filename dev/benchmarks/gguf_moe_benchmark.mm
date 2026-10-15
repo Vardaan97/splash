@@ -25,6 +25,7 @@
 #include <map>
 #include <numeric>
 #include <random>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -145,10 +146,11 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
   b.residual = zeros(backend, uint64_t{kRowsMax} * H * 2, "residual");
   b.output = zeros(backend, uint64_t{kRowsMax} * H * 2, "output");
   const splash::ops::ExecutionPlans plans(backend.capabilities());
-  const auto time = [&](const BlockMoeWeights &weights, const MoePlan &plan) {
+  const auto time = [&](const BlockMoeWeights &weights, const MoePlan &plan,
+                        std::span<const uint32_t> lastRows = {}) {
     allocate(backend, b, plan);
     CommandGraph graph;
-    MoE::add(graph, b, weights, plan);
+    MoE::add(graph, b, weights, plan, 0, lastRows);
     std::vector<double> samples;
     for (uint32_t i = 0; i < rounds + 1; ++i) {
       const double seconds = backend.submitCommandAsync(graph.dispatches()).wait().gpuSeconds;
@@ -164,17 +166,22 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
          backend.capabilities().deviceName.c_str(), backend.capabilities().appleGpuFamily,
          backend.capabilities().gpuCoreCount, rounds);
   if (tile == "decode") {
-    for (uint32_t rows : {1u, 4u, 8u, 16u, 32u}) {
-      b.input = bfloatBuffer(backend, input(rows, 24), "input");
-      const auto plan = MoE::prefillPlan(ggufShape, rows, MoeConfig{});
-      const double layer = time(gguf, plan);
+    // Capture the primary decode width first. Decode always stores eight
+    // rows per lane; lastRows controls live routing at widths one and four.
+    for (uint32_t rows : {8u, 1u, 4u, 16u, 32u}) {
+      const uint32_t lanes = (rows + 7) / 8, storageRows = lanes * 8;
+      std::vector<uint32_t> lastRows(lanes, 8);
+      lastRows.back() = rows - (lanes - 1) * 8;
+      b.input = bfloatBuffer(backend, input(storageRows, 24), "input");
+      const auto plan = MoE::decodePlan(ggufShape, lanes, MoeConfig{});
+      const double layer = time(gguf, plan, lastRows);
       CommandGraph graph;
-      MoE::add(graph, b, gguf, plan);
+      MoE::add(graph, b, gguf, plan, 0, lastRows);
       const uint32_t live = *static_cast<const uint32_t *>(b.scratch.tileCount.contents());
       const char *fold = std::getenv("SPLASH_MOE_GATHER_FOLD");
       const char *whole = std::getenv("SPLASH_MOE_WHOLE_EXPERT");
-      printf("WP5 rows=%u gate_up=%s down=%s shared=%s gather_fold=%s whole_expert=%s layer_ms=%.6f live_tiles=%u dispatches=%zu\n",
-             rows, fmtName(gateUpFormat), fmtName(downFormat), fmtName(sharedFormat), fold ? fold : "0", whole ? whole : "0",
+      printf("WP5 rows=%u storage_rows=%u lanes=%u gate_up=%s down=%s shared=%s gather_fold=%s whole_expert=%s layer_ms=%.6f live_tiles=%u dispatches=%zu\n",
+             rows, storageRows, lanes, fmtName(gateUpFormat), fmtName(downFormat), fmtName(sharedFormat), fold ? fold : "0", whole ? whole : "0",
              layer, live, graph.dispatches().size());
       for (const auto &[name, seconds] : splash::benchmark::replayDispatches(backend, graph.dispatches()))
         printf("WP5_REPLAY rows=%u kernel=%s ms=%.6f\n", rows, name.c_str(), seconds * 1e3);
