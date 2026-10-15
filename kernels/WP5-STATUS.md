@@ -108,4 +108,14 @@ prefetches input slices.
 
 Completed receipts are also saved locally at
 `~/Developer/kernels/wp5-results-20261015/`.
-No M5 run or artifact promotion was performed by this session.
+The M4-built metallib, `gguf-moe-e512`, `gguf-moe-benchmark-e512`, and
+`decode-profile` are staged in this M5 worktree only (about 44 MiB total),
+SHA-256 verified before atomic placement. Manifest:
+`build/engine-tests/WP5.sha256`, also in the local receipts as
+`artifacts.sha256`. No staged binary was executed on M5, and no production
+artifact was replaced.
+
+Final direct AIR check against the fresh e8c386d6 library PASSED: all 1,847
+original kernels identical; four additions only (G lane + gate/up, gather,
+whole). Receipt: `final-air-fresh.log`. Runtime/build/test source hashes
+match the M4 final checkout; `source.sha256` records them.
