@@ -110,13 +110,13 @@ public:
       const auto &mix = dispatches_[i];
       if (!mix.pipelineName.ends_with("_hcmix") || mix.buffers.size() <= 5) continue;
       const auto &counter = mix.buffers[5].buffer;
-      const uint64_t start = counter.gpuAddress() + mix.buffers[5].offsetBytes;
-      const uint64_t length = counter.sizeBytes() - mix.buffers[5].offsetBytes;
+      const uint64_t start = counter.gpuAddress();
+      const uint64_t length = counter.sizeBytes();
       for (size_t j = begin; j < end; ++j) {
         if (i == j) continue;
         for (const auto &binding : dispatches_[j].buffers) {
-          const uint64_t other = binding.buffer.gpuAddress() + binding.offsetBytes;
-          const uint64_t bytes = binding.buffer.sizeBytes() - binding.offsetBytes;
+          const uint64_t other = binding.buffer.gpuAddress();
+          const uint64_t bytes = binding.buffer.sizeBytes();
           if (length && bytes && start < other + bytes && other < start + length)
             throw std::invalid_argument("independent group shares hyper-mix counters");
         }
