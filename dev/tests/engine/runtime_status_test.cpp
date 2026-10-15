@@ -589,11 +589,14 @@ void testStreamedTableStatus() {
   table.cachedRows = 1200;
   table.uses[1] = {10, 1280, 1000, 750, 250, {10, 12.5, 3.25, 1.024, 2.048, 4.096}};
   table.readBytes = 22500;
+  table.firstPrefillStage = {1, 2.5, 2.5, 4.096, 4.096, 4.096};
   table.prefetchRequestedRows = 32768;
   table.prefetchReadRows = 30000;
   table.poisoned = true;
   table.failure = "injected";
   const std::string json = status(table);
+  require(json.find("\"first_prefill_stage\":{\"count\":1,\"total_ms\":2.5") != std::string::npos,
+          "first-chunk stage latency was not reported");
   require(json.find("\"streamed_table\":{\"tensor\":\"per_layer_token_embd.weight\",\"table_bytes\":28800138240,"
                     "\"cache_bytes\":2147483648,\"cache_capacity_rows\":18000000,\"cached_rows\":1200,"
                     "\"evictions\":0,\"prefill\":{\"stages\":0,") != std::string::npos &&

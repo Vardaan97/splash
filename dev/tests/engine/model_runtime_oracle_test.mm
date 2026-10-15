@@ -2283,6 +2283,66 @@ void warmupEos(model::RuntimeContext context, model::LoadedModel &model) {
 // A scaled agent replay. The old tail is beyond the edited tool result;
 // continuing from the earlier grid state must match a cold edited prompt.
 // Boundaries are command ends, preserving the cold prefill partition exactly.
+void requireShortCobatchBitwise(model::Runtime &executor, kv::PageStorage &pages,
+                                  model::QwenStateStorage &states, uint32_t vocabulary) {
+  constexpr std::array<uint32_t,4> lengths{64,96,128,160};
+  constexpr std::array<uint32_t,16> seed{248045,8678,198,24342,286,4879,369,716,
+                                        310,830,11553,13,5044,1683,15060,1472};
+  std::array<EngineRequest,4> requests;
+  std::array<std::vector<uint32_t>,4> tables;
+  std::array<std::vector<uint8_t>,4> cells;
+  std::array<std::vector<std::byte>,4> kvBytes;
+  std::array<std::vector<float>,4> logits;
+  const auto copyKv = [&](uint32_t lane) {
+    std::vector<std::byte> result;
+    for (const auto page : tables[lane])
+      for (const auto span : pages.spans(page))
+        result.insert(result.end(), span.begin(), span.end());
+    return result;
+  };
+  for (uint32_t lane=0; lane<4; ++lane) {
+    std::vector<uint32_t> prompt(lengths[lane]);
+    for (uint32_t i=0; i<lengths[lane]; ++i) prompt[i]=seed[(i+lane*3)%seed.size()];
+    requests[lane]=makeRequest(970+lane,std::move(prompt),0);
+    requests[lane].scoreTokens.resize(vocabulary);
+    for (uint32_t i=0; i<vocabulary; ++i) requests[lane].scoreTokens[i]=i;
+    tables[lane]=pageRange(lane*8,lengths[lane]/kv::kPageTokens);
+    pages.clearPages(tables[lane]);
+    beginCold(executor,requests[lane],lane);
+    const auto result=prefillChunk(executor,requests[lane].id,0,requests[lane].prompt,tables[lane]);
+    require(result.failure.empty() && result.scoreLogits.size()==vocabulary,
+            "serial co-batch reference failed");
+    cells[lane]=bytesOf(states.current(lane).stateBase);
+    kvBytes[lane]=copyKv(lane);
+    logits[lane]=result.scoreLogits;
+    executor.end(requests[lane].id);
+  }
+  BatchPlan plan{.kind=WorkKind::Prefill};
+  std::array<ModelBatchItem,4> items;
+  for (uint32_t lane=0; lane<4; ++lane) {
+    requests[lane].id+=10;
+    pages.clearPages(tables[lane]);
+    beginCold(executor,requests[lane],lane);
+    executor.prefetchPrompt(requests[lane].modelView(),0);
+    plan.items.push_back({requests[lane].id,lengths[lane],0});
+    items[lane]=withRevision({.requestId=requests[lane].id,.tokenCount=lengths[lane],.pageTable=tables[lane]});
+    items[lane].inputTokens=requests[lane].prompt;
+  }
+  const auto result=executor.prefill(plan,items);
+  require(result.size()==4,"short co-batch did not return four lanes");
+  for (uint32_t lane=0; lane<4; ++lane) {
+    const bool cell=bytesOf(states.current(lane).stateBase)==cells[lane];
+    const bool kv=copyKv(lane)==kvBytes[lane];
+    const bool score=result[lane].scoreLogits==logits[lane];
+    std::cout << "short_cobatch lane=" << lane << " rows=" << lengths[lane]
+              << " cell_bitwise=" << cell << " kv_bitwise=" << kv << " logits_bitwise=" << score << '\n';
+    require(result[lane].failure.empty() && cell && kv && score,
+            "short co-batch differs from standalone prefill");
+    executor.end(requests[lane].id);
+  }
+  std::cout << "short_cobatch=PASS bitwise=1\n";
+}
+
 void requireGridCheckpointEditReplay(model::Runtime &executor,
                                      const metal::MetalBackend &backend,
                                      const model::QwenStateStorage &states,
@@ -2392,8 +2452,8 @@ void requireGridCheckpointEditReplay(model::Runtime &executor,
     const bool bitwise = partitioned.scoreLogits == cold.scoreLogits && replayCell == coldCell;
     const ops::Linear linear(backend.capabilities());
     const uint32_t gateWidth = 2 * layout.recurrentGroups;
-    const auto firstTile = linear.ggufFloatTile(1024, gateWidth);
-    const auto secondTile = linear.ggufFloatTile(2048, gateWidth);
+    const auto firstTile = linear.ggufFloatSegmentTile(1024, gateWidth);
+    const auto secondTile = linear.ggufFloatSegmentTile(2048, gateWidth);
     // On the measured 40-core Apple10, F32 alpha/beta's N=96 switches
     // from SIMD at 1024 rows to the neural accelerator at 2048. These
     // accumulate differently before the register-carried GDN scan starts.
@@ -2501,7 +2561,7 @@ int main(int argc, char **argv) {
       return 0;
     }
     bool imagesOnly = false, warmupEosOnly = false;
-    bool gdnCheckpointsOnly = false;
+    bool gdnCheckpointsOnly = false, shortCobatchOnly = false;
     kv::Format format = kv::Format::Int8;
     ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
     std::optional<double> givenAneFfnShare;
@@ -2530,6 +2590,7 @@ int main(int argc, char **argv) {
         longStride = static_cast<uint32_t>(std::stoul(argv[++i]));
         require(longStride > 0 && longStride <= 2048, "invalid long-score stride");
       } else if (option == "--gdn-checkpoints-only") gdnCheckpointsOnly = true;
+      else if (option == "--short-cobatch-only") shortCobatchOnly = true;
       else if (option == "--images-only") imagesOnly = true;
       else if (option == "--warmup-eos-only") warmupEosOnly = true;
       else if (option == "--kv-format" && i + 1 < argc) {
@@ -2733,6 +2794,10 @@ int main(int argc, char **argv) {
       return 0;
     }
     model::Runtime &executor = *runtime;
+    if (shortCobatchOnly) {
+      requireShortCobatchBitwise(executor,pages,states,model.descriptor.capabilities.vocabularySize);
+      return 0;
+    }
     if (!longPrompt.empty()) {
       require(longPrompt.size() > longWindow && longPrompt.size() <= automaticContext,
               "long prompt is outside the admitted model context");

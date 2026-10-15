@@ -111,10 +111,10 @@ struct Fixture final {
   const uint8_t *row(uint32_t id) const { return bytes.data() + kOffset + uint64_t{id} * kRowBytes; }
   // Stages `ids` and checks every id's staged row against the source.
   SparseRowStageResult stage(const std::vector<uint32_t> &ids, bool adopt = false,
-                             SparseRowUse use = SparseRowUse::Decode) {
+                             SparseRowUse use = SparseRowUse::Decode, bool first = false) {
     std::vector<uint8_t> rows(ids.size() * kRowBytes);
     std::vector<uint32_t> slots(ids.size());
-    const SparseRowStageResult result = store->stage(ids, rows, slots, use, adopt);
+    const SparseRowStageResult result = store->stage(ids, rows, slots, use, adopt, first);
     std::set<uint32_t> distinct(ids.begin(), ids.end());
     require(result.uniqueRows == distinct.size(), "staged rows are not the distinct ids");
     for (size_t i = 0; i < ids.size(); ++i) {
@@ -425,10 +425,21 @@ void readsAnOpenFile(const std::filesystem::path &directory) {
   require(truncated.stats().poisoned, "a truncated file did not poison its store");
 }
 
+void testFirstPrefillStageMetric() {
+  Fixture f(1000, 100);
+  f.store->prefetch(std::vector<uint32_t>{1,2,3});
+  f.stage({1,2,3}, true, SparseRowUse::Prefill, true);
+  f.stage({4,5}, false, SparseRowUse::Prefill);
+  const auto stats = f.store->stats();
+  require(stats.firstPrefillStage.count == 1 && stats.uses[0].stage.count == 2,
+          "first-chunk staging was not recorded separately");
+}
+
 } // namespace
 
 int main() {
   try {
+    testFirstPrefillStageMetric();
     for (const uint32_t width : {90u, 170u}) {
       kRowBytes = width;
       const splash::test::TemporaryDirectory directory("sparse-row-store");

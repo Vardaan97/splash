@@ -334,12 +334,13 @@ uint32_t Scheduler::prefillBudget(
   const uint32_t leaderRemaining =
       leader.request->spec.prefillTokens - leader.promptProcessed;
   const bool leaderFinishing = leaderRemaining <= rows;
-  const bool contended = std::any_of(
+  const bool decoding = std::any_of(
       requests_.begin(), requests_.end(), [&](const auto &entry) {
         const Request &peer = entry.second;
         return (peer.phase == Phase::Decode || peer.phase == Phase::WaitingMask) &&
                peer.spec.priority <= leader.request->spec.priority;
-      }) || std::any_of(ready.begin(), ready.end(), [&](
+      });
+  const bool contended = decoding || std::any_of(ready.begin(), ready.end(), [&](
                            const PrefillRequestView &peer) {
         return peer.request->spec.id != leader.request->spec.id &&
                peer.request->spec.priority <= leader.request->spec.priority &&
@@ -350,16 +351,16 @@ uint32_t Scheduler::prefillBudget(
   // decoders left out of this command (their streams resume once their
   // memory lands), and for peers that can finish prefill within this slice.
   // The first sample and minimum matrix shape remain limits.
-  if (prefillCobatch_ && leaderFinishing) {
+  if (prefillCobatch_ && leaderRemaining <= 512) {
     // Only combine complete short suffixes already ready in this tier.
     // Keep the measured contended budget and never wait for an arrival.
-    const uint32_t cap = contended ? rows : maximum;
+    const uint32_t cap = decoding ? rows : maximum;
     uint32_t total = 0, lanes = 0;
     for (const auto &peer : ready) {
       if (peer.request->spec.priority != leader.request->spec.priority ||
           lanes == model::ExecutionLimits::maximumBatchWidth) break;
       const uint32_t remaining = peer.request->spec.prefillTokens - peer.promptProcessed;
-      if (remaining > cap - total) break;
+      if (remaining > 512 || remaining > cap - total) break;
       total += remaining;
       ++lanes;
     }
