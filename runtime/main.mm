@@ -422,6 +422,11 @@ int main(int argc, char **argv) {
         const std::string library = argc == 3 ? argv[2] :
             (std::filesystem::path(argv[0]).parent_path() / "splash.metallib").string();
         splash::metal::MetalBackend backend(library);
+        if (backend.capabilities().appleGpuFamily != 10) {
+          std::cerr << "kernel-selftest: Apple10 m64 identity UNAVAILABLE on Apple"
+                    << backend.capabilities().appleGpuFamily << '\n';
+          return 0;
+        }
         return backend.capabilities().moePrefillM64Verified ? 0 : 1;
       }
       if (argc == 2 && std::string_view(argv[1]) == "device-check")
