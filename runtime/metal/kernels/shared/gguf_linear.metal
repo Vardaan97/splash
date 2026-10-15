@@ -151,7 +151,6 @@ kernel void gguf_decode_hc(device bfloat *input [[buffer(0)]], device uchar *w0 
   // Preserve the projection's existing branch and auxiliary binding slots.
   (void)branch;
   (void)aux;
-  constant GgufDecodeParams &p = h.linear;
   threadgroup half stage[kStagedStages];
   threadgroup half2 tl[1];
   threadgroup uint arrival;
