@@ -1,3 +1,4 @@
+#include <iostream>
 #include "metal/MoePrefillPolicy.hpp"
 #include "metal/MetalBackend.hpp"
 #include "AwakeClock.hpp"
