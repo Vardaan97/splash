@@ -201,3 +201,101 @@ kernel void moe_expert_gguf_m64_gate_up(device bfloat *input [[buffer(0)]],
   };
   moe_live_rows<GGUF_PREFILL_SIMDGROUP_ROWS>(tile.rows, run);
 }
+
+// Experimental M8 per-lane tile. Each lane owns a column, reuses each
+// half-rounded weight for all live rows, and owns half of K. Only the final
+// partial sums cross simdgroups; no dequantized weight enters threadgroup memory.
+template <class F>
+inline void expert_lane_dot(MoeGgufSegment s, device bfloat *x, uint K,
+                            uint column, uint split, uint rows, thread float *acc) {
+  const uint groups = K / 32, units = groups / F::MetaGroups;
+  const uint plane = column / QUANT_TILE_ROWS, lane = column % QUANT_TILE_ROWS;
+  const uint begin = split * groups / 2, end = (split + 1) * groups / 2;
+  typename F::Meta hdr;
+  for (uint g = begin; g < end; ++g) {
+    const ulong index = (ulong(plane) * groups + g) * QUANT_TILE_ROWS + lane;
+    const auto w = F::load(s.w0 + index * F::P0, s.w1 + index * F::P1);
+    if (g == begin || g % F::MetaGroups == 0)
+      hdr = F::loadMeta(s.meta + ((ulong(plane) * units + g / F::MetaGroups) * QUANT_TILE_ROWS + lane) * F::MetaBytes);
+    const QuantCoef coef = F::coef(hdr, g % F::MetaGroups);
+    // Keep only one half4 live. These are exactly the staged dequantizer's
+    // values, including its single half rounding before multiplication.
+    for (ushort h = 0; h < 2; ++h)
+      for (ushort c = 0; c < 4; ++c) {
+        half4 v;
+        const auto q = F::chunk(w, c);
+        if constexpr (F::Kind == QuantLinear) {
+          const uint4 codes = F::codes(q);
+          v = h ? half4(staged_linear<F>(codes.z, coef.s.y, coef.m.y), staged_linear<F>(codes.w, coef.s.y, coef.m.y))
+                : half4(staged_linear<F>(codes.x, coef.s.x, coef.m.x), staged_linear<F>(codes.y, coef.s.x, coef.m.x));
+        } else {
+          const uint2 values = F::values(q);
+          v = half4(float4(as_type<char4>(h ? values.y : values.x)) * (h ? coef.s.y : coef.s.x));
+        }
+        for (ushort j = 0; j < 4; ++j) {
+          const float weight = float(v[j]);
+          for (uint r = 0; r < rows; ++r)
+            acc[r] = fma(float(x[ulong(r) * K + g * 32 + h * 16 + c * 4 + j]), weight, acc[r]);
+        }
+      }
+  }
+}
+
+kernel void moe_expert_lane_gate_up(device bfloat *input [[buffer(0)]], device const MoeTileDescriptor *tiles [[buffer(1)]],
+                                    device const uint *tile_count [[buffer(2)]], device uchar *gw0 [[buffer(3)]],
+                                    device uchar *gw1 [[buffer(4)]], device uchar *gmeta [[buffer(5)]],
+                                    device uchar *gsw0 [[buffer(6)]], device uchar *gsw1 [[buffer(7)]],
+                                    device uchar *gsmeta [[buffer(8)]], device uchar *uw0 [[buffer(9)]],
+                                    device uchar *uw1 [[buffer(10)]], device uchar *umeta [[buffer(11)]],
+                                    device uchar *usw0 [[buffer(12)]], device uchar *usw1 [[buffer(13)]],
+                                    device uchar *usmeta [[buffer(14)]], device bfloat *output [[buffer(15)]],
+                                    constant MoeGgufExpertParams &p [[buffer(16)]],
+                                    uint2 group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]],
+                                    uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float partial[2][8][32];
+  if (group.y >= *tile_count) return;
+  const auto tile = tiles[group.y];
+  const uint rows = p.in_place ? 8 : tile.rows, column = group.x * 32 + lane;
+  device bfloat *x = p.in_place ? input : input + ulong(group.y) * 8 * p.input_size;
+  const auto gate = moe_gguf_segment(tile.expert, p, gw0, gw1, gmeta, gsw0, gsw1, gsmeta);
+  const auto up = moe_gguf_segment(tile.expert, p, uw0, uw1, umeta, usw0, usw1, usmeta);
+  float g[8] = {}, u[8] = {};
+  if (gate.format == GGUF_FMT_Q5K) expert_lane_dot<FmtQ5K>(gate, x, p.input_size, column, sg, rows, g);
+  else expert_lane_dot<FmtQ80>(gate, x, p.input_size, column, sg, rows, g);
+  if (up.format == GGUF_FMT_Q5K) expert_lane_dot<FmtQ5K>(up, x, p.input_size, column, sg, rows, u);
+  else expert_lane_dot<FmtQ80>(up, x, p.input_size, column, sg, rows, u);
+  if (sg == 1)
+    for (uint r = 0; r < rows; ++r) { partial[0][r][lane] = g[r]; partial[1][r][lane] = u[r]; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sg == 0)
+    for (uint r = 0; r < rows; ++r) {
+      const float gv = float(bfloat(g[r] + partial[0][r][lane]));
+      const float uv = float(bfloat(u[r] + partial[1][r][lane]));
+      output[(ulong(group.y) * 8 + r) * p.output_size + column] = bfloat(uv * splash_silu(gv));
+    }
+}
+
+kernel void moe_expert_lane_a(device bfloat *input [[buffer(0)]], device const MoeTileDescriptor *tiles [[buffer(1)]],
+                            device const uint *tile_count [[buffer(2)]], device uchar *w0 [[buffer(3)]],
+                            device uchar *w1 [[buffer(4)]], device uchar *meta [[buffer(5)]], device uchar *sw0 [[buffer(6)]],
+                            device uchar *sw1 [[buffer(7)]], device uchar *smeta [[buffer(8)]],
+                            device bfloat *output [[buffer(9)]], device bfloat *aux [[buffer(10)]],
+                            constant MoeGgufExpertParams &p [[buffer(11)]], uint2 group [[threadgroup_position_in_grid]],
+                            uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+  (void)aux;
+  threadgroup float partial[2][8][32];
+  if (group.y >= *tile_count) return;
+  const auto tile = tiles[group.y];
+  const uint column = group.x * 64 + (sg / 2) * 32 + lane;
+  device bfloat *x = input + ulong(group.y) * 8 * p.input_size;
+  const auto s = moe_gguf_segment(tile.expert, p, w0, w1, meta, sw0, sw1, smeta);
+  float acc[8] = {};
+  if (s.format == GGUF_FMT_Q51) expert_lane_dot<FmtQ51>(s, x, p.input_size, column, sg % 2, tile.rows, acc);
+  else expert_lane_dot<FmtQ80>(s, x, p.input_size, column, sg % 2, tile.rows, acc);
+  if (sg % 2 == 1)
+    for (uint r = 0; r < tile.rows; ++r) partial[sg / 2][r][lane] = acc[r];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sg % 2 == 0)
+    for (uint r = 0; r < tile.rows; ++r)
+      output[(ulong(group.y) * 8 + r) * p.output_size + column] = bfloat(acc[r] + partial[sg / 2][r][lane]);
+}

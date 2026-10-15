@@ -634,7 +634,7 @@ std::vector<uint16_t> runPlan(MetalBackend &backend, const Model &m, Buffers &b,
     const uint32_t *grid = nullptr;
     if (const MetalBuffer &buffer = dispatch.indirectThreadgroups.buffer)
       grid = static_cast<const uint32_t *>(buffer.contents()) + dispatch.indirectThreadgroups.offsetBytes / 4;
-    require(dispatch.pipelineName.starts_with("moe_expert_gguf") == (grid != nullptr) &&
+    require(dispatch.pipelineName.starts_with("moe_expert_") == (grid != nullptr) &&
                 (!grid || (grid[0] == dispatch.threadgroups.x && grid[1] == tiles && grid[2] == 1 &&
                            dispatch.threadgroups.y == plan.maximumTiles())),
             label + ": " + dispatch.pipelineName + " runs another grid than its live tiles");
@@ -754,6 +754,11 @@ std::vector<uint16_t> runPlan(MetalBackend &backend, const Model &m, Buffers &b,
   }
   std::vector<uint16_t> result(uint64_t{rows} * kHidden);
   std::memcpy(result.data(), output, result.size() * 2);
+  // The experimental split tile changes the reduction tree; it is checked
+  // against the same fp64 interval above, rather than the staged tile bitwise.
+  if (std::any_of(graph.dispatches().begin(), graph.dispatches().end(), [](const auto &d) {
+        return d.pipelineName.starts_with("moe_expert_lane");
+      })) return result;
   // Bitwise the output of every tile's threadgroups and of two gate/up passes.
   const std::vector<ComputeDispatch> reference = fullGridsTwoPasses(graph, b.moe.scratch);
   std::memset(b.moe.output.contents(), 0, b.moe.output.sizeBytes());

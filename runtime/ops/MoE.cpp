@@ -5,6 +5,8 @@
 #include "metal/abi/MoE.h"
 #include "ops/BufferExtent.hpp"
 
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -60,6 +62,21 @@ MoeWorkspace workspaceFor(MoeShape shape, uint32_t rows, uint32_t tileRows, MoeG
           groupedRows * widest * sizeof(uint16_t), sumsBytes};
 }
 
+// Restricted to the measured model shapes and formats; other plans retain
+// their ordinary kernels. Read at graph construction so benchmarks can compare
+// both paths with identical buffers and routing.
+bool laneExpertTile(const BlockMoeWeights &w, const MoePlan &p) noexcept {
+  const char *flag = std::getenv("SPLASH_EXPERT_TILE");
+  const auto down = [](uint32_t f) { return f == GGUF_FMT_Q51 || f == GGUF_FMT_Q80; };
+  return flag && std::strcmp(flag, "1") == 0 && p.tileRows() == 8 &&
+         p.configuration().ggufTile == MoeGgufTile::Staged &&
+         p.shape().hiddenSize == 2560 && p.shape().expertIntermediateSize == 640 &&
+         w.gate.routed.formatId == GGUF_FMT_Q5K &&
+         (w.gate.shared.formatId == GGUF_FMT_Q5K || w.gate.shared.formatId == GGUF_FMT_Q80) &&
+         w.up.routed.formatId == GGUF_FMT_Q5K && w.up.shared.formatId == w.gate.shared.formatId &&
+         down(w.down.routed.formatId) && down(w.down.shared.formatId);
+}
+
 // Whether a plan runs gate and up in one pass
 // (moe_expert_gguf_m<rows>_gate_up): on the staged tile, where gate and up
 // share their routed format and their shared format. The register tile runs
@@ -90,7 +107,10 @@ void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const Blo
         if (!quant_register_format(s->formatId))
           throw std::invalid_argument(std::string("the register expert tile does not take ") + s->name() + " weights");
   const uint32_t threads = table16 ? GGUF_REGISTER_THREADS : GGUF_STAGED_THREADS;
-  const std::string kernel = table16 ? "moe_expert_gguf_sg" : "moe_expert_gguf_m" + std::to_string(plan.tileRows());
+  const bool laneTile = laneExpertTile(weights, plan);
+  const std::string kernel = laneTile ? "moe_expert_lane"
+                             : table16 ? "moe_expert_gguf_sg"
+                                       : "moe_expert_gguf_m" + std::to_string(plan.tileRows());
   const metal::IndirectGrid gateUpGrid{scratch.tileCount, offsetof(MoeTileCount, gate_up_grid)};
   const metal::IndirectGrid downGrid{scratch.tileCount, offsetof(MoeTileCount, down_grid)};
   const auto pass = [&](const BlockExpertProjection &projection, bool up,
@@ -108,7 +128,7 @@ void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const Blo
     graph.add(kernel + (up ? "_g" : "_a"), std::move(bindings),
               MoeGgufExpertParams{k, n, shape.experts, projection.routed.formatId,
                                   projection.shared.formatId, inPlace},
-              {columns, tiles, 1}, grid, {threads, 1, 1});
+              {columns, tiles, 1}, grid, {laneTile ? 128u : threads, 1, 1});
   };
   const uint32_t hidden = shape.hiddenSize;
   const uint32_t intermediate = shape.expertIntermediateSize;
