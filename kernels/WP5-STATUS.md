@@ -10,11 +10,19 @@ Ported the uncommitted G candidate from `~/src/splash-expert-tile`, including
 its native build targets, fp64 interval tests and microbenchmark. Preserved
 perf-all's m64 kernels and other test targets while resolving append conflicts.
 `SPLASH_EXPERT_TILE=1` remains opt-in N-det; no bitwise or performance claim.
-Source diff whitespace check passed. M4 focused SV test and `make check` pending.
+Source diff whitespace check passed. Commit: `d7447588`.
+M4 focused SV test passed (`expert_tile_test: PASS`, fp64 interval policy).
+Full `make check` is running under slot 5; no final verdict yet.
 
 ## Step 1 — bitwise candidates
 
-Not implemented. Required: gather fold, indirect-grid reduction where safe,
+Gather-fold prototype and e512 memcmp/replay harness drafted; M4 build and
+validation queued behind Step 0. Default off (`SPLASH_MOE_GATHER_FOLD=1`).
+It reuses the second weights stage for a gathered K32 input slice and keeps
+the declared 9,216-byte allocation. Only staged M8, rows <=32, fused gate/up,
+non-in-place plans qualify. Exactly 8 total rows already skip gather in base.
+
+Still required: indirect-grid reduction where safe,
 load-ahead variant without exceeding the existing 9,216-byte stage.
 Proof: e512 memcmp rows 1–32 and all valid firstRow/lastRows, 43 staged formats,
 SV off/on; unchanged kernel AIR identity. No bitwise claim before receipts.
