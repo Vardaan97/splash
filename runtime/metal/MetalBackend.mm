@@ -418,12 +418,13 @@ struct BackendAsyncState {
     }
 };
 
-// Pre-encoding has its own queue so held, unsubmitted commands cannot
+// General pre-encoding has its own queue so held, unsubmitted commands cannot
 // exhaust the ordinary submission queue. Reserve its aggregate capacity
 // before asking Metal for any command buffer.
 struct PreencodingPool {
     __strong id<MTLCommandQueue> queue = nil;
     std::atomic<NSUInteger> reserved{0};
+    NSUInteger capacity = kMaximumCommandBuffers;
 };
 
 struct CommandBufferReservation {
@@ -433,7 +434,7 @@ struct CommandBufferReservation {
         : pool(std::move(pool)), count(count) {
         NSUInteger held = this->pool->reserved.load();
         do {
-            if (count > kMaximumCommandBuffers - held)
+            if (count > this->pool->capacity - held)
                 throw MetalBackendError("pre-encoded commands exceed the queue capacity");
         } while (!this->pool->reserved.compare_exchange_weak(held, held + count));
     }
@@ -620,6 +621,7 @@ struct MetalBackend::Impl {
     __strong id<MTLDevice> device = nil;
     __strong id<MTLCommandQueue> queue = nil;
     std::shared_ptr<PreencodingPool> preencodingPool; // created only by encodeCommand
+    std::shared_ptr<PreencodingPool> mainPreencodingPool; // one held verify
     // Runs the notify() callbacks of the backend's shared events, on a
     // serial dispatch queue.
     __strong MTLSharedEventListener *eventListener = nil;
@@ -829,20 +831,25 @@ struct MetalBackend::Impl {
     // `fail`, which throws.
     template <class Fail>
     EncodedBuffers encode(std::span<const PreparedDispatch> dispatches,
-                          std::span<const EventStep> events, Fail &&failBeforeCommit) {
+                          std::span<const EventStep> events, bool onMainQueue, Fail &&failBeforeCommit) {
         EncodedBuffers result;
-        if (!preencodingPool) {
+        auto &selectedPool = onMainQueue ? mainPreencodingPool : preencodingPool;
+        if (!selectedPool) {
             auto pool = std::make_shared<PreencodingPool>();
-            pool->queue = [device newCommandQueueWithMaxCommandBufferCount:kMaximumCommandBuffers];
+            pool->queue = onMainQueue ? queue :
+                [device newCommandQueueWithMaxCommandBufferCount:kMaximumCommandBuffers];
             if (!pool->queue) throw MetalBackendError("unable to create pre-encoding Metal command queue");
-            preencodingPool = std::move(pool);
+            // Leave room for ordinary submission on the main queue. The
+            // streamed ticket submits its draft before holding one verify.
+            if (onMainQueue) pool->capacity = 1;
+            selectedPool = std::move(pool);
         }
         const NSUInteger count = 1 + std::ranges::count_if(events, [](const EventStep &step) {
             return step.kind == EventStep::Kind::Signal;
         });
-        result.reservation = std::make_shared<CommandBufferReservation>(preencodingPool, count);
+        result.reservation = std::make_shared<CommandBufferReservation>(selectedPool, count);
         @autoreleasepool {
-            id<MTLCommandQueue> encodingQueue = preencodingPool->queue;
+            id<MTLCommandQueue> encodingQueue = selectedPool->queue;
             id<MTLCommandBuffer> command = [encodingQueue commandBuffer];
             if (!command) {
                 failBeforeCommit("unable to create Metal command buffer");
@@ -1538,7 +1545,7 @@ EncodedCommand::EncodedCommand(EncodedCommand &&) noexcept = default;
 EncodedCommand &EncodedCommand::operator=(EncodedCommand &&) noexcept = default;
 EncodedCommand::operator bool() const noexcept { return state_ != nullptr; }
 
-EncodedCommand MetalBackend::encodeCommand(const Command &command) {
+EncodedCommand MetalBackend::encodeCommand(const Command &command, bool onMainQueue) {
     checkOperation();
     EncodedCommand encoded;
     encoded.state_ = std::make_unique<EncodedCommand::State>();
@@ -1564,7 +1571,7 @@ EncodedCommand MetalBackend::encodeCommand(const Command &command) {
 #endif
     checkEvents(command.events, command.dispatches.size());
     Impl::PreparedCommand prepared = impl_->prepare(command.dispatches);
-    encoded.state_->buffers = impl_->encode(prepared.dispatches, command.events, [&](std::string message) {
+    encoded.state_->buffers = impl_->encode(prepared.dispatches, command.events, onMainQueue, [&](std::string message) {
         impl_->markUnhealthy(message);
         throw MetalBackendError(std::move(message));
     });

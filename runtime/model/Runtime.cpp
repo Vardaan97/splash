@@ -2360,7 +2360,7 @@ struct Runtime::Impl {
                        const CommandGraph &draft, const CommandGraph &target, std::function<void()> completion)
         : impl_(impl), lanes_(std::move(lanes)), items_(items.begin(), items.end()), wake_(std::move(completion)) {
       command_ = impl_.backend.submitCommandAsync(draft.dispatches(), wake_);
-      target_ = impl_.backend.encodeCommand(target.command());
+      target_ = impl_.backend.encodeCommand(target.command(), true);
     }
 
     std::vector<ModelMaskRequest> takeMaskRequests() override {

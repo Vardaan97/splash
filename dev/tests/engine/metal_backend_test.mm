@@ -1317,7 +1317,7 @@ void eventSteps(const std::string &metallibPath) {
 // submitted, after that one, and reads the Shared buffers it binds as the CPU
 // left them before the submission. Submitting it while another command is in
 // flight is refused, and dropping one unsubmitted is harmless.
-void encodedCommandsRunWhenSubmitted(const std::string &metallibPath) {
+void encodedCommandsRunWhenSubmitted(const std::string &metallibPath, bool onMainQueue = false) {
     MetalBackend backend(metallibPath);
     MetalBuffer held = sharedBuffer(backend, sizeof(uint32_t));
     MetalBuffer source = sharedBuffer(backend, sizeof(uint32_t));
@@ -1336,7 +1336,10 @@ void encodedCommandsRunWhenSubmitted(const std::string &metallibPath) {
     CommandTicket running = backend.submitCommandAsync(Command{first, wait});
     const std::vector<ComputeDispatch> copy{
         {"test_copy_u32", {{0, source}, {1, destination}}, {{2, &count, sizeof(count)}}, {1, 1, 1}, {1, 1, 1}}};
-    EncodedCommand encoded = backend.encodeCommand(Command{copy, {}});
+    EncodedCommand encoded = backend.encodeCommand(Command{copy, {}}, onMainQueue);
+    if (onMainQueue)
+        rejects([&] { (void)backend.encodeCommand(Command{copy, {}}, true); }, "queue capacity",
+                "a second main-queue verify was held");
     EncodedCommand refused = backend.encodeCommand(Command{copy, {}});
     { EncodedCommand dropped = backend.encodeCommand(Command{copy, {}}); }
     *sourceValue = 42;
@@ -1354,7 +1357,12 @@ void encodedCommandsRunWhenSubmitted(const std::string &metallibPath) {
     require(*heldValue == 1 && *destinationValue == 0, "an encoded command ran before it was submitted");
     (void)backend.submitEncoded(std::move(encoded)).wait();
     require(*destinationValue == 42, "an encoded command did not read what the CPU wrote before submitting it");
-    std::cout << "PASS encoded commands run when submitted\n";
+    if (onMainQueue) {
+        auto replacement = backend.encodeCommand(Command{copy, {}}, true);
+        (void)backend.submitEncoded(std::move(replacement)).wait();
+        require(*destinationValue == 42, "the main-queue reservation was not reusable");
+    }
+    std::cout << "PASS encoded commands run when submitted main=" << onMainQueue << '\n';
 }
 
 // Deferred profiling owns graph payloads, even after the graph's heap is
@@ -1952,6 +1960,7 @@ int main(int argc, const char *argv[]) {
             sharedEventNotifies(argv[1]);
             eventSteps(argv[1]);
             encodedCommandsRunWhenSubmitted(argv[1]);
+            encodedCommandsRunWhenSubmitted(argv[1], true);
             fullQueueRejectsAnotherSubmission(argv[1]);
             boundsAggregatePreencoding(argv[1]);
             profiledEncodingOwnsBytesAndMode(argv[1]);

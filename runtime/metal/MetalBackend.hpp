@@ -393,7 +393,9 @@ public:
   // before it submits it. Dropping it unsubmitted discards it. Pre-encoding
   // uses a separate queue, with at most 512 command buffers reserved across
   // held encoded commands and their tickets; exceeding it throws promptly.
-  [[nodiscard]] EncodedCommand encodeCommand(const Command &command);
+  // onMainQueue reserves at most one buffer instead, for the streamed
+  // verify whose draft is already submitted; another reservation throws.
+  [[nodiscard]] EncodedCommand encodeCommand(const Command &command, bool onMainQueue = false);
   // Commits an encoded command as submitCommandAsync commits, with the same
   // one-in-flight rule. It belongs to the backend that encoded it and keeps
   // the encode-time profiling mode and byte bindings. Consumes it.
