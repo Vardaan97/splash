@@ -847,6 +847,7 @@ struct MetalBackend::Impl {
             if (!command) {
                 failBeforeCommit("unable to create Metal command buffer");
             }
+            residency->useFor(command);
             // The buffers before `command`, each ended by an event signal.
             std::vector<id<MTLCommandBuffer>> leading;
             id<MTLComputeCommandEncoder> encoder = nil;
@@ -882,6 +883,7 @@ struct MetalBackend::Impl {
                     if (!command) {
                         failBeforeCommit("unable to create Metal command buffer");
                     }
+                    residency->useFor(command);
                 }
             };
             // Indexed by argument table entry. The ticket and the dispatches
