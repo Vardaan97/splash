@@ -93,11 +93,13 @@ class DiskSpace final {
 public:
   // The files live on one volume; `others` are the root's namespaces nobody
   // holds (CacheDirectory::idle), oldest first, none for temporary files.
-  // Measures the volume.
+  // Measures the volume. Tests can supply the initial snapshot; subsequent
+  // measure() calls still read the real volume.
   DiskSpace(std::shared_ptr<model::DiskBudget> budget,
             std::vector<std::shared_ptr<model::SlotFile>> files,
             std::vector<CacheDirectory::Idle> others = {},
-            uint64_t minimumFloorBytes = 0);
+            uint64_t minimumFloorBytes = 0,
+            std::optional<DiskVolume> initialVolume = std::nullopt);
   DiskSpace(const DiskSpace &) = delete;
   DiskSpace &operator=(const DiskSpace &) = delete;
 

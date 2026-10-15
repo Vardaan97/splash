@@ -248,7 +248,7 @@ void testOtherCachesGoFirst() {
   const std::vector<CacheDirectory::Idle> others = otherCaches(root.path());
   auto budget = std::make_shared<model::DiskBudget>(kQuota);
   auto file = std::make_shared<model::SlotFile>(kHostPageBytes, budget);
-  DiskSpace space(budget, {file}, others);
+  DiskSpace space(budget, {file}, others, 0, localVolume(100 * kGiB));
   require(space.othersBytes() == others[0].bytes + others[1].bytes,
           "the other caches were not counted");
   // A volume that leaves the root a limit of what the others hold less half
@@ -273,7 +273,7 @@ void testOtherCachesGoAsTheTierGrows() {
     const uint64_t quota = others[0].bytes + others[1].bytes + kMiB + kMiB / 2;
     auto budget = std::make_shared<model::DiskBudget>(quota);
     auto file = std::make_shared<model::SlotFile>(kMiB, budget);
-    DiskSpace space(budget, {file}, others);
+    DiskSpace space(budget, {file}, others, 0, localVolume(100 * kGiB));
     const DiskVolume volume{"/Volumes/Test", 500 * kGiB, 1000 * kGiB, local};
     space.measure(volume);
     require(budget->limitBytes() == quota && space.othersBytes() == quota - kMiB - kMiB / 2,
