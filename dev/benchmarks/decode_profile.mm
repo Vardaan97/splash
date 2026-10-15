@@ -90,6 +90,22 @@ void print(const std::string &title, const Table &table, double divisor,
                 entry.dispatches / divisor, entry.gpuSeconds * 1e3 / divisor,
                 entry.gpuSeconds / total * 100.0);
   }
+  // Shape-tagged head entries carry logical plane bytes, not DRAM counters.
+  // Use unrounded counts here (the human-readable table rounds to 0.1).
+  double headBytes = 0.0, headSeconds = 0.0;
+  uint64_t headDispatches = 0;
+  for (const auto &[name, entry] : rows) {
+    if (!name.starts_with("gguf_decode_q6k_") && !name.starts_with("gguf_head_q6k_")) continue;
+    const auto at = name.find(",bytes=");
+    if (at == std::string::npos) continue;
+    headBytes += double(entry.dispatches) * std::stoull(name.substr(at + 7));
+    headSeconds += entry.gpuSeconds;
+    headDispatches += entry.dispatches;
+  }
+  if (headDispatches)
+    std::printf("head-shapes: %.6f dispatches/cycle, %.3f logical weight bytes/cycle, %.6f ms/cycle, %.3f GB/s\n",
+                headDispatches / divisor, headBytes / divisor, headSeconds * 1e3 / divisor,
+                headSeconds > 0 ? headBytes / headSeconds / 1e9 : 0.0);
 }
 
 std::vector<uint32_t> pageRange(uint32_t first, uint32_t count) {

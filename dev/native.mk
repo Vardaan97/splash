@@ -689,3 +689,8 @@ $(ENGINE_TEST_BUILD)/prefill-attention-variants: dev/tests/engine/prefill_attent
 TEST_CONFIG_TARGETS += $(ENGINE_TEST_BUILD)/prefill-qsa-compact
 $(ENGINE_TEST_BUILD)/prefill-qsa-compact: dev/tests/engine/prefill_qsa_compact_test.mm $(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
+
+# Q6_K head candidate identity matrix and cold projection benchmark.
+TEST_CONFIG_TARGETS += $(ENGINE_TEST_BUILD)/head-q6k
+$(ENGINE_TEST_BUILD)/head-q6k: dev/benchmarks/head_q6k_benchmark.mm $(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@

@@ -469,6 +469,22 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
   const std::vector<QuantizedSegment> &segments = p.blocks().segments;
   const uint32_t rows = plan.storageRows(), splits = config.splits;
   const auto [partials, counters] = splitScratch(b, splits);
+  // Keep workspace and tile policy unchanged. The opt-in head preserves the
+  // original 64-column spread seed even with a different dispatch width.
+  const bool headShape = k == 2560 && (n == 32768 || n == 49152 || n == 65536 || n == 248320);
+  if (headQ6kColumns_ && headShape && w.phase == LinearPhase::Decode && w.rows <= 8 &&
+      w.epilogue == LinearEpilogue::None && plan.destination() == FloatOutput::Float32 &&
+      splits == 1 && config.columns == 64 && config.stepInputs == 32 && segments.size() == 1 &&
+      segments.front().formatId == GGUF_FMT_Q6K && segments.front().columnOffset == 0 &&
+      segments.front().outputSize == n) {
+    const auto &s = segments.front();
+    graph.add("gguf_head_q6k_c" + std::to_string(headQ6kColumns_) + "_d" + std::to_string(headQ6kDepth_),
+              {b.input, s.plane0, s.plane1Slot(), s.meta, b.output, partials, counters, b.output},
+              GgufDecodeParams{k, 1, n, 0, config.spread},
+              {n / headQ6kColumns_, 1, 1}, {headQ6kColumns_, 1, 1});
+    return;
+  }
+
   if (w.epilogue == LinearEpilogue::HyperCombine) {
     const auto &s = segments.front();
     graph.add("gguf_decode_q80_m" + std::to_string(rows) + "_hc",

@@ -317,6 +317,7 @@ private:
                        const Projection *gate) const;
   void addGgufFloatSegments(metal::CommandGraph &graph, const LinearBuffers &buffers,
                             const Projection &projection, const LinearPlan &plan) const;
+  uint32_t headQ6kColumns_ = 0, headQ6kDepth_ = 0;
   bool smallProjectionEnabled_ = false;
   uint32_t smallProjectionVariant_ = 0;
   uint32_t smallPrefillRows_ = 0;

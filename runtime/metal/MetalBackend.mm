@@ -6,6 +6,7 @@
 #include "Residency.hpp"
 #ifdef SPLASH_BACKEND_INSTRUMENTATION
 #include "BackendInstrumentation.hpp"
+#include "abi/Gguf.h"
 #endif
 
 #import <Foundation/Foundation.h>
@@ -1276,8 +1277,25 @@ struct MetalBackend::Impl {
         for (const PreparedDispatch &item : command.dispatches) {
             const CommandTiming timing =
                 commit({&item, 1}, {}, command.retainedAllocations, {}).wait();
-            dispatchProfile.push_back(
-                {item.source->pipelineName, timing.gpuSeconds});
+            std::string name = item.source->pipelineName;
+            // Optional head-shape attribution reads only host dispatch metadata.
+            // The default replay table and production backend are unchanged.
+            const char *shapes = std::getenv("SPLASH_PROFILE_HEAD_SHAPES");
+            if (shapes && std::strcmp(shapes, "1") == 0 &&
+                (name.starts_with("gguf_decode_q6k_") || name.starts_with("gguf_head_q6k_"))) {
+                for (const auto &binding : item.source->bytes) {
+                    if (binding.index != 8 || binding.sizeBytes != sizeof(GgufDecodeParams)) continue;
+                    GgufDecodeParams p;
+                    std::memcpy(&p, binding.data, sizeof(p));
+                    uint64_t weightBytes = 0;
+                    for (const auto &b : item.source->buffers)
+                        if (b.index >= 1 && b.index <= 3) weightBytes += b.buffer.sizeBytes();
+                    name += "[N=" + std::to_string(p.out_stride) + ",K=" + std::to_string(p.input_size) +
+                            ",S=" + std::to_string(p.splits) + ",spread=" + std::to_string(p.spread) +
+                            ",offset=" + std::to_string(p.out_offset) + ",bytes=" + std::to_string(weightBytes) + "]";
+                }
+            }
+            dispatchProfile.push_back({std::move(name), timing.gpuSeconds});
             total.gpuSeconds += timing.gpuSeconds;
             total.wallSeconds += timing.wallSeconds;
         }
