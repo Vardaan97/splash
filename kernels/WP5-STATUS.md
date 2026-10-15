@@ -38,7 +38,7 @@ strict AIR identity. No additional threadgroup allocation.
 | All 43 staged formats, rows 1–32, every legal firstRow, uniform/mixed lastRows; routing + live intermediate + output memcmp | PASS, 16,512 cases, both modes vs baseline, SV off and on |
 | Same matrix with reused maximum workspace (stale scratch coverage) | PASS, SV off and on |
 | Strict AIR vs fresh e8c386d6 | PASS, all 1,847 existing kernels identical; only G's two and gather's one added |
-| Every Cartesian lastRows combination, all firstRow, B1–B4, all formats | SV off PASS, 761,788 cases; SV on running |
+| Every Cartesian lastRows combination, all firstRow, B1–B4, all formats | PASS, 761,788 cases per SV mode; both exits 0 |
 | M5 identity / performance / greedy | Not run; main-session queue only |
 
 Receipts: M4 `~/wp5-logs/{gather-off-final,gather-sv-final,gather-off-reuse,
@@ -70,8 +70,9 @@ values and final output for all 43 formats, rows 1–32 and uniform/mixed legal
 bounds. The test also requires exactly one expert dispatch. TG allocation is
 9,216 B uninstrumented; strict AIR preserves all 1,850 Step 1a kernels and adds
 only the whole-expert kernel. Receipts: `~/wp5-logs/whole-{off,sv,air}.log`.
-The full final `make check` and whole-expert Cartesian sweep are queued behind
-the gather sweep, subject to the same session deadline. No exhaustive pass yet.
+The full final `make check` started at about 02:41 UTC under slot 5, after
+the gather sweep completed. Whole-expert Cartesian sweeps follow, subject to
+the same session deadline. No whole-expert exhaustive pass yet.
 
 This is an explicit experiment, not an automatic selection rule. Serial column
 work needs enough live expert tiles for occupancy. Main-session SLOT-2/replay
