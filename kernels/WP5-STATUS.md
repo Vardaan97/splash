@@ -77,9 +77,10 @@ product code was changed. A retry uses TMPDIR on an owned 32 GiB sparse APFS
 test volume; its smaller volume floor avoids that host-space assumption.
 The full retry PASSED, exit 0, in 1,474.3 s under slot 5
 (`whole-check-retry.log/.json`); Python 1,287 tests, 27 skipped. Both existing
-MoE suites passed with SV. Whole-expert Cartesian SV-off started at about
-03:09 UTC, subject to the same session deadline. No whole-expert exhaustive
-pass yet.
+MoE suites passed with SV. Whole-expert Cartesian SV-off PASSED all 761,788
+cases, exit 0, in 963.1 s (`whole-exhaustive-off.log/.json`). The exhaustive
+SV-on run started at about 03:25 UTC and is subject to the 03:28 UTC cutoff;
+its full pass remains pending.
 
 This is an explicit experiment, not an automatic selection rule. Serial column
 work needs enough live expert tiles for occupancy. Main-session SLOT-2/replay
