@@ -34,7 +34,7 @@ without repeating each entire prefill. The normal oracle runs independently too.
 
 * Direct KLD P(bitwise)||P(compact): mean ≤2e-4 nats/token, p95 ≤5e-4, worst ≤2e-3
   at EACH context length. This uses the neutral KLD METHOD.md pattern with a Splash
-  bitwise reference, not AtomicChat BF16 logits from 4096-token llama.cpp runs.
+  bitwise reference, not BF16 logits from external 4096-token reference runs.
   All full logits finite; baseline repeat and candidate repeat KLD ≤1e-8.
 * Model-runtime-oracle class **N / partition tolerance**, never bitwise: every
   existing oracle assertion passes off and on, with its existing partition-state cosine bounds
