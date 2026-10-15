@@ -1480,8 +1480,13 @@ MetalBackend::MetalBackend(std::string metallibPath, double residencyKeepAliveSe
             impl_->newPipeline(Residency::kKickPipeline), residencyKeepAliveSeconds);
     }
     impl_->sampleDeviceMemory();
-    if (moePrefillSelfTestRequested())
-        impl_->capabilities.moePrefillM64Verified = moePrefillSelfTest(*this);
+    if (moePrefillSelfTestRequested()) {
+        if (impl_->capabilities.appleGpuFamily == 10)
+            impl_->capabilities.moePrefillM64Verified = moePrefillSelfTest(*this);
+        else
+            std::fprintf(stderr, "kernel-selftest: moe_m64 UNAVAILABLE on Apple%u\n",
+                         impl_->capabilities.appleGpuFamily);
+    }
     runKernelSelfTests(*this);
 }
 

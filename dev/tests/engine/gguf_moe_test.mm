@@ -1056,6 +1056,10 @@ int routingLoads(MetalBackend &backend) {
 // Compare live routes by their routeRows map: tile padding and descriptor
 // order intentionally differ between M32 and M64.
 int prefillM64(MetalBackend &backend) {
+  if (backend.capabilities().appleGpuFamily != 10) {
+    std::cout << "prefill-m64: UNAVAILABLE on Apple" << backend.capabilities().appleGpuFamily << " (Apple10 device gate)\n";
+    return 0;
+  }
   constexpr uint32_t maximum = 2048;
   uint32_t mismatches = 0;
   const bool apple10 = backend.capabilities().appleGpuFamily == 10;
