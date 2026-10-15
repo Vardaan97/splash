@@ -117,6 +117,24 @@ void cachedDispatches(const char *library) {
     unsetenv("SPLASH_GRAPH_CACHE");
 }
 
+void hyperCounterSharing(const char *library) {
+    MetalBackend backend(library);
+    auto data = backend.allocateBuffer(256, BufferStorage::Shared, "counter-input");
+    auto arena = backend.allocateBuffer(256, BufferStorage::Private, "counter-arena");
+    for (uint32_t offset : {0u, 32u, 128u}) {
+        splash::metal::CommandGraph graph;
+        auto first = backend.view(arena, 0, 64), second = backend.view(arena, offset, 64);
+        graph.add("gguf_decode_q80_m8_hcmix", {data, data, data, data, data, first}, {1,1,1});
+        graph.add("gguf_decode_q80_m8_a", {data, data, data, data, data, data, second}, {1,1,1});
+        bool rejected = false;
+        try { graph.independent(0, 2); }
+        catch (const std::invalid_argument &) { rejected = true; }
+        require(rejected == (offset < 64), "U6 failed to distinguish aliased/disjoint counter words");
+        require(rejected || graph.dispatches()[1].independentOfPrevious, "U6 safe group was not marked");
+    }
+    std::cout << "PASS U6 hyper-mix counters cannot alias an independent group (including private views)\n";
+}
+
 void independentDispatches(const char *library) {
     MetalBackend backend(library);
     constexpr uint32_t count = 1024;
@@ -2027,6 +2045,7 @@ int main(int argc, const char *argv[]) {
         }
         try {
             cachedDispatches(argv[1]);
+            hyperCounterSharing(argv[1]);
             independentDispatches(argv[1]);
             completionDoesNotWaitForMemoryTelemetry(argv[1]);
             terminalCommandRecovers(argv[1], false);

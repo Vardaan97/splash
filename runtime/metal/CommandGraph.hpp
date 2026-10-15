@@ -104,6 +104,24 @@ public:
         throw std::invalid_argument("independent dispatch range overlaps a group or indirect grid");
     if (end < dispatches_.size() && dispatches_[end].independentOfPrevious)
       throw std::invalid_argument("independent dispatch range cuts a group");
+    // Hyper-mix uses the same counter arena as split-K projections. A
+    // concurrent group must not share those words through any bound view.
+    for (size_t i = begin; i < end; ++i) {
+      const auto &mix = dispatches_[i];
+      if (!mix.pipelineName.ends_with("_hcmix") || mix.buffers.size() <= 5) continue;
+      const auto &counter = mix.buffers[5].buffer;
+      const uint64_t start = counter.gpuAddress() + mix.buffers[5].offsetBytes;
+      const uint64_t length = counter.sizeBytes() - mix.buffers[5].offsetBytes;
+      for (size_t j = begin; j < end; ++j) {
+        if (i == j) continue;
+        for (const auto &binding : dispatches_[j].buffers) {
+          const uint64_t other = binding.buffer.gpuAddress() + binding.offsetBytes;
+          const uint64_t bytes = binding.buffer.sizeBytes() - binding.offsetBytes;
+          if (length && bytes && start < other + bytes && other < start + length)
+            throw std::invalid_argument("independent group shares hyper-mix counters");
+        }
+      }
+    }
     for (size_t i = begin + 1; i < end; ++i)
       dispatches_[i].independentOfPrevious = true;
   }
