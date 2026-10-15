@@ -12,14 +12,20 @@ perf-all's m64 kernels and other test targets while resolving append conflicts.
 `SPLASH_EXPERT_TILE=1` remains opt-in N-det; no bitwise or performance claim.
 Source diff whitespace check passed. Commit: `d7447588`.
 M4 focused SV test passed (`expert_tile_test: PASS`, fp64 interval policy).
-Full `make check` is running under slot 5; no final verdict yet.
+Full M4 `make check` exited 0 under slot 5, including both MoE suites with SV.
+Python: 1,287 tests, 27 skipped. Remote receipt: `~/wp5-logs/G-check.log`.
+The first AIR baseline (reused perf-all library) differed in six unrelated
+hyper kernels and is unsuitable as an exact e8c386d6 oracle. A clean baseline
+worktree/build is queued; no AIR pass claimed yet.
 
 ## Step 1 — bitwise candidates
 
-Gather-fold prototype and e512 memcmp/replay harness drafted; M4 build and
-validation queued behind Step 0. Default off (`SPLASH_MOE_GATHER_FOLD=1`).
+Gather-fold prototype and e512 memcmp/replay harness built on M4; validation
+is running. Default off (`SPLASH_MOE_GATHER_FOLD=1|2`). Mode 2 prefetches
+the next input slice in registers and also covers in-place B1 plans.
 It reuses the second weights stage for a gathered K32 input slice and keeps
-the declared 9,216-byte allocation. Only staged M8, rows <=32, fused gate/up,
+the compiled 9,216-byte allocation (both baseline and candidate measured
+through `staticThreadgroupMemoryLength`). Only staged M8, rows <=32, fused gate/up,
 non-in-place plans qualify. Exactly 8 total rows already skip gather in base.
 
 Still required: indirect-grid reduction where safe,
