@@ -123,3 +123,9 @@ struct MoeGatherExpertParams {
   uint32_t input_ahead;
 };
 static_assert(sizeof(MoeGatherExpertParams) == 32, "gather expert ABI");
+
+struct MoeWholeExpertParams {
+  MoeGatherExpertParams gate;
+  MoeGgufExpertParams down;
+};
+static_assert(sizeof(MoeWholeExpertParams) == 56, "whole expert ABI");

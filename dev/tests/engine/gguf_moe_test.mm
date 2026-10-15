@@ -1117,12 +1117,14 @@ int prefillM64(MetalBackend &backend) {
 
 // Baseline and candidate executions of the production graph. Compare routing, the live
 // expert intermediates and the final output, including inactive output rows.
-int gatherFoldIdentity(MetalBackend &backend, bool exhaustive, const char *libraryPath) {
+int gatherFoldIdentity(MetalBackend &backend, bool exhaustive, const char *libraryPath, bool whole = false) {
   id<MTLDevice> device = MTLCreateSystemDefaultDevice();
   NSError *error = nil;
   id<MTLLibrary> library = [device newLibraryWithURL:[NSURL fileURLWithPath:[NSString stringWithUTF8String:libraryPath]] error:&error];
   require(library != nil, "load gather identity library");
-  for (NSString *name in @[@"moe_expert_gguf_m8_gate_up", @"moe_expert_gguf_m8_gather_gate_up"]) {
+  NSArray<NSString *> *names = whole ? @[@"moe_expert_gguf_m8_gate_up", @"moe_expert_gguf_m8_whole"] :
+                                     @[@"moe_expert_gguf_m8_gate_up", @"moe_expert_gguf_m8_gather_gate_up"];
+  for (NSString *name in names) {
     id<MTLFunction> function = [library newFunctionWithName:name];
     require(function != nil, "find gather identity kernel");
     id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:function error:&error];
@@ -1153,16 +1155,24 @@ int gatherFoldIdentity(MetalBackend &backend, bool exhaustive, const char *libra
       std::string bounds;
       for (uint32_t end : last) bounds += (bounds.empty() ? "" : ",") + std::to_string(end);
       for (uint32_t mode : {0u, 1u, 2u}) {
-        setenv("SPLASH_MOE_GATHER_FOLD", std::to_string(mode).c_str(), 1);
+        if (whole && mode == 2) continue;
+        setenv("SPLASH_MOE_WHOLE_EXPERT", whole && mode ? "1" : "0", 1);
+        setenv("SPLASH_MOE_GATHER_FOLD", whole ? "0" : std::to_string(mode).c_str(), 1);
         std::memset(b.moe.output.contents(), 0xa5, b.moe.output.sizeBytes());
         CommandGraph graph;
         MoE::add(graph, b.moe, m.weights, plan, first, last);
-        const bool fold = mode == 2 || (mode == 1 && !plan.rowsInPlace());
+        const bool fold = whole ? mode != 0 : mode == 2 || (mode == 1 && !plan.rowsInPlace());
         const auto count = [&](std::string_view name) {
           return std::count_if(graph.dispatches().begin(), graph.dispatches().end(),
                               [&](const auto &d) { return d.pipelineName == name; });
         };
-        require(count("moe_expert_gguf_m8_gather_gate_up") == (fold ? 1 : 0), "gather fold dispatch");
+        require(count(whole ? "moe_expert_gguf_m8_whole" : "moe_expert_gguf_m8_gather_gate_up") ==
+                    (fold ? 1 : 0), "candidate dispatch");
+        if (whole && fold) {
+          require(std::count_if(graph.dispatches().begin(), graph.dispatches().end(), [](const auto &d) {
+            return d.pipelineName.starts_with("moe_expert_");
+          }) == 1, "whole expert uses one indirect dispatch");
+        }
         require(count("moe_gather_rows") == (!fold && !plan.rowsInPlace() ? 1 : 0), "gather dispatch removed");
         static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
         std::vector<uint8_t> bytes;
@@ -1174,7 +1184,8 @@ int gatherFoldIdentity(MetalBackend &backend, bool exhaustive, const char *libra
         const auto &scratch = b.moe.scratch;
         append(scratch.selectedExperts.contents(), plan.rows() * kRoutes * 4);
         append(scratch.routingWeights.contents(), plan.rows() * kRoutes * 4);
-        append(scratch.tileCount.contents(), sizeof(MoeTileCount));
+        // Whole-expert mode changes the column grid to one, not the tile count.
+        append(scratch.tileCount.contents(), whole ? sizeof(uint32_t) : sizeof(MoeTileCount));
         const auto *map = static_cast<const uint32_t *>(scratch.routeRows.contents());
         // Atomic grouping may choose a different within-expert row order.
         // Compare each route's values through its own mapping, not map bytes.
@@ -1219,17 +1230,19 @@ int gatherFoldIdentity(MetalBackend &backend, bool exhaustive, const char *libra
         }
       }
     }
-    std::cout << "gather-fold " << fmtName(f) << " PASS cumulative_cases=" << cases << std::endl;
+    std::cout << (whole ? "whole-expert " : "gather-fold ") << fmtName(f) << " PASS cumulative_cases=" << cases << std::endl;
   }
   unsetenv("SPLASH_MOE_GATHER_FOLD");
-  std::cout << "gather-fold: PASS exhaustive=" << exhaustive << " cases=" << cases << '\n';
+  unsetenv("SPLASH_MOE_WHOLE_EXPERT");
+  std::cout << (whole ? "whole-expert: PASS exhaustive=" : "gather-fold: PASS exhaustive=") << exhaustive << " cases=" << cases << '\n';
   return 0;
 }
 
 int main(int argc, const char *argv[]) {
   @autoreleasepool {
     if (argc != 2 && !(argc == 3 && (std::string_view(argv[2]) == "--prefill-m64" ||
-        std::string_view(argv[2]) == "--gather-fold" || std::string_view(argv[2]) == "--gather-fold-exhaustive"))) {
+        std::string_view(argv[2]) == "--gather-fold" || std::string_view(argv[2]) == "--gather-fold-exhaustive" ||
+        std::string_view(argv[2]) == "--whole-expert" || std::string_view(argv[2]) == "--whole-expert-exhaustive"))) {
       std::cerr << "usage: gguf_moe_test <metallib>\n";
       return 2;
     }
@@ -1237,7 +1250,8 @@ int main(int argc, const char *argv[]) {
       MetalBackend backend(argv[1]);
       if (argc == 3) {
         if (std::string_view(argv[2]) == "--prefill-m64") return prefillM64(backend);
-        return gatherFoldIdentity(backend, std::string_view(argv[2]) == "--gather-fold-exhaustive", argv[1]);
+        const std::string_view option(argv[2]);
+        return gatherFoldIdentity(backend, option.ends_with("-exhaustive"), argv[1], option.starts_with("--whole-expert"));
       }
       splash::test::moeHyperIdentity(backend);
       bufferExtents(backend);

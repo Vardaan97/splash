@@ -6,7 +6,7 @@ case "$(sysctl -n machdep.cpu.brand_string)" in
   *) echo 'WP5 builds/tests must run on the M4' >&2; exit 2 ;;
 esac
 mode=${1:-gather}
-case "$mode" in g|gather|exhaustive|check|air) ;; *) echo 'mode: g|gather|exhaustive|check|air' >&2; exit 2 ;; esac
+case "$mode" in g|gather|exhaustive|whole|whole-exhaustive|check|air) ;; *) echo 'mode: g|gather|exhaustive|whole|whole-exhaustive|check|air' >&2; exit 2 ;; esac
 lock="$HOME/.flashnext-build.lock-slot5"
 mkdir "$lock" || { echo "slot occupied: $lock" >&2; exit 73; }
 owner="wp5-$$"
@@ -21,16 +21,20 @@ trap release EXIT
 cd "$(dirname "$0")/.."
 export PATH="$HOME/src/metal-toolchain/bin:$HOME/src/metal-toolchain/Metal.xctoolchain/usr/bin:$HOME/.local/bin:$PATH"
 export XCRUN="$HOME/src/metal-toolchain/bin/xcrun"
-unset SPLASH_EXPERT_TILE SPLASH_MOE_GATHER_FOLD
+unset SPLASH_EXPERT_TILE SPLASH_MOE_GATHER_FOLD SPLASH_MOE_WHOLE_EXPERT
 case "$mode" in
   g)
     nice -n 19 make -j4 build/engine-tests/expert-tile-test build/engine-tests/expert-tile-benchmark
     nice -n 19 env MTL_SHADER_VALIDATION=1 build/engine-tests/expert-tile-test build/splash.metallib
     ;;
-  gather|exhaustive)
+  gather|exhaustive|whole|whole-exhaustive)
     nice -n 19 make -j4 build/engine-tests/gguf-moe-e512 build/engine-tests/gguf-moe-benchmark-e512
     option=--gather-fold
-    [[ "$mode" != exhaustive ]] || option=--gather-fold-exhaustive
+    case "$mode" in
+      exhaustive) option=--gather-fold-exhaustive ;;
+      whole) option=--whole-expert ;;
+      whole-exhaustive) option=--whole-expert-exhaustive ;;
+    esac
     nice -n 19 env -u MTL_SHADER_VALIDATION build/engine-tests/gguf-moe-e512 build/splash.metallib "$option"
     nice -n 19 env MTL_SHADER_VALIDATION=1 build/engine-tests/gguf-moe-e512 build/splash.metallib "$option"
     ;;

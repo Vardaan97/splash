@@ -87,6 +87,12 @@ bool oneGateUpPass(const BlockMoeWeights &weights, const MoePlan &plan) noexcept
          weights.gate.shared.formatId == weights.up.shared.formatId;
 }
 
+bool wholeExpertTile(const BlockMoeWeights &weights, const MoePlan &plan) noexcept {
+  const char *flag = std::getenv("SPLASH_MOE_WHOLE_EXPERT");
+  return flag && std::strcmp(flag, "1") == 0 && !laneExpertTile(weights, plan) &&
+         plan.rows() <= 32 && plan.tileRows() == 8 && oneGateUpPass(weights, plan);
+}
+
 uint32_t foldExpertGather(const BlockMoeWeights &weights, const MoePlan &plan) noexcept {
   const char *flag = std::getenv("SPLASH_MOE_GATHER_FOLD");
   const uint32_t mode = flag && std::strcmp(flag, "2") == 0 ? 2u :
@@ -108,7 +114,7 @@ uint32_t foldExpertGather(const BlockMoeWeights &weights, const MoePlan &plan) n
 // a prepare dispatch the down input's. The gate/up passes read `input`: the
 // grouped rows, or with plan.rowsInPlace() the plan's rows in place.
 void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const BlockMoeWeights &weights,
-                const MoePlan &plan, const MoeGroupParams &group, const metal::MetalBuffer &input, uint32_t fold) {
+                const MoePlan &plan, const MoeGroupParams &group, const metal::MetalBuffer &input, uint32_t fold, bool whole) {
   const MoeShape shape = plan.shape();
   const uint32_t tiles = plan.maximumTiles();
   const bool table16 = plan.configuration().ggufTile == MoeGgufTile::Register;
@@ -154,6 +160,17 @@ void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const Blo
     if (fold) bindings.push_back(scratch.groupedRoutes);
     const MoeGgufExpertParams params{hidden, intermediate, shape.experts, gate.routed.formatId,
                                      gate.shared.formatId, group.in_place};
+    if (whole) {
+      const auto &down = weights.down;
+      bindings.insert(bindings.end(), {down.routed.plane0, down.routed.plane1Slot(), down.routed.meta,
+                                      down.shared.plane0, down.shared.plane1Slot(), down.shared.meta,
+                                      scratch.expertOutput});
+      graph.add("moe_expert_gguf_m8_whole", std::move(bindings),
+                MoeWholeExpertParams{{params, shape.routesPerToken(), 1},
+                    {intermediate, hidden, shape.experts, down.routed.formatId, down.shared.formatId, 0}},
+                {1, tiles, 1}, gateUpGrid, {threads, 1, 1});
+      return;
+    }
     if (fold)
       graph.add("moe_expert_gguf_m8_gather_gate_up", std::move(bindings),
                 MoeGatherExpertParams{params, shape.routesPerToken(), fold == 2},
@@ -244,15 +261,16 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
   // 30 live ones; the rest return at once yet cost a 40-core M5 Max 0.8-4.1%
   // of a decode cycle, a 12-core M6 0.1-1.0% and a 40-core M3 Max up to 4.8%.
   const bool oneGateUp = oneGateUpPass(weights, plan);
+  const bool whole = wholeExpertTile(weights, plan);
   const MoeGroupParams group{rows, shape.expertsPerToken, tileRows, shape.experts,
-                             shape.expertIntermediateSize / (oneGateUp && tileRows != GGUF_MOE_PREFILL_ROWS ? GGUF_STAGED_COLUMNS : GGUF_TILE_COLUMNS),
+                             whole ? 1u : shape.expertIntermediateSize / (oneGateUp && tileRows != GGUF_MOE_PREFILL_ROWS ? GGUF_STAGED_COLUMNS : GGUF_TILE_COLUMNS),
                              shape.hiddenSize / GGUF_TILE_COLUMNS, plan.rowsInPlace(),
                              (firstRow || dropsLast) ? SPLASH_TARGET_VERIFY_ROWS : 0, firstRow, lastRowBytes};
   graph.add(wide ? "moe_group_routes_e512" : "moe_group_routes",
             {scratch.selectedExperts, scratch.tileDescriptors,
              scratch.tileCount, scratch.groupedRoutes, scratch.routeRows},
             group, {1, 1, 1}, {width, 1, 1});
-  const uint32_t fold = foldExpertGather(weights, plan);
+  const uint32_t fold = whole ? 2u : foldExpertGather(weights, plan);
   const MoeGatherParams gather{tileRows, shape.hiddenSize, shape.routesPerToken()};
   if (plan.configuration().ggufTile == MoeGgufTile::Register)
     graph.add("moe_gather_table16",
@@ -265,7 +283,7 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
                scratch.tileCount, scratch.groupedInput},
               gather, {tiles, shape.hiddenSize / 256, 1});
   addExperts(graph, scratch, weights, plan, group,
-             (group.in_place || fold) ? buffers.input : scratch.groupedInput, fold);
+             (group.in_place || fold) ? buffers.input : scratch.groupedInput, fold, whole);
   if (hyper) {
     requireBytes(hyper.streams, uint64_t{rows} * shape.hiddenSize * 4 * sizeof(float), "MoE hyper streams");
     requireBytes(hyper.weights, uint64_t{rows} * 4 * sizeof(float), "MoE hyper weights");

@@ -42,20 +42,36 @@ incorrect memory assertion on the instrumented baseline, before numerics;
 the cap is now applied to uninstrumented pipelines, with SV sizes reported.
 
 Reproduce on M4: `kernels/check-wp5-m4.sh g|gather|exhaustive|check|air`.
-The air mode needs `WP5_BASELINE_METALLIB` from a fresh exact baseline build.
+Use `whole` / `whole-exhaustive` for Step 1b. The air mode needs `WP5_BASELINE_METALLIB` from a fresh exact baseline build.
 The initial reused perf-all library was not that oracle: six untouched
 `gguf_decode_q80_m{8,16,32}_{hc,hcmix}` kernels had a different hyper parameter
 ABI. Fresh baseline lives at `~/src/splash-expert-gemv-base` on M4; old failed
 comparisons are retained, not normalized away.
 
-## Remaining work
+## Step 1b — single indirect expert grid, default off
 
-Single gate/up+down indirect dispatch is not implemented. Down depends on all
-intermediate columns. A whole-expert threadgroup can avoid a global barrier,
-but serializes column tiles and needs enough live expert tiles for occupancy;
-SLOT-2/live-tile measurements must qualify any selection rule. Do not add a
-spinning grid barrier. Prior weight pf2/pf4 variants were slower (DESIGN §3.2);
-mode 2 here prefetches input slices instead.
+`SPLASH_MOE_WHOLE_EXPERT=1` runs gate/up and down in one threadgroup per live
+expert tile, on a single indirect grid. Each threadgroup walks column tiles
+serially, publishes gate/up output with a threadgroup device barrier, then
+computes down in the baseline K32 order. There is no cross-threadgroup
+synchronization, counter, extra workspace or extra TG allocation. The kernel
+is isolated in `moe_gguf_whole.metal`, linked after prior kernels.
+
+M4: 16,512 cases PASS with SV off and on, comparing routing, live intermediate
+values and final output for all 43 formats, rows 1–32 and uniform/mixed legal
+bounds. The test also requires exactly one expert dispatch. TG allocation is
+9,216 B uninstrumented; strict AIR preserves all 1,850 Step 1a kernels and adds
+only the whole-expert kernel. Receipts: `~/wp5-logs/whole-{off,sv,air}.log`.
+The full final `make check` and whole-expert Cartesian sweep are queued behind
+the gather sweep, subject to the same session deadline. No exhaustive pass yet.
+
+This is an explicit experiment, not an automatic selection rule. Serial column
+work needs enough live expert tiles for occupancy. Main-session SLOT-2/replay
+must determine the profitable live-tile range before any automatic policy.
+An eligible G plan takes precedence; otherwise whole-expert mode takes
+precedence over the gather modes. All three switches remain off by default.
+Prior weight pf2/pf4 variants were slower (DESIGN §3.2); gather mode 2 instead
+prefetches input slices.
 
 ## Main-session M5 queue
 
@@ -65,7 +81,9 @@ mode 2 here prefetches input slices instead.
    `SPLASH_MOE_GATHER_FOLD=<mode> build/engine-tests/gguf-moe-benchmark-e512
    build/splash.metallib 40 iq4xs iq4nl q80` (repeat per format).
    Harness reports layer medians plus replay at 1/4/8/16/32 rows. Synthetic
-   reuse is not a DRAM-bandwidth measurement. GO: ≥15% at 8 rows and bitwise.
+   reuse is not a DRAM-bandwidth measurement. Repeat with
+   `SPLASH_MOE_WHOLE_EXPERT=1` to evaluate the single-grid path by live-tile
+   count. GO: ≥15% at 8 rows and bitwise.
 3. Only on GO: d4 512/2K `decode-profile --cycles 64` ABBA, ≥2% outside twice
    spread, and 14/14 greedy bytes. Follow the standing thermal/burn-in protocol.
 

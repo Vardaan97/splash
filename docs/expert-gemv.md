@@ -26,3 +26,17 @@ E=512, top-10, with 1/4/8/16/32 rows. It reports full-layer medians and separate
 dispatch replays. Synthetic cache reuse means replay is not a DRAM-bandwidth
 measurement. M5 runs belong only to the main-session queue, after SLOT-2.
 Qualification receipts and remaining gates are in `kernels/WP5-STATUS.md`.
+
+`SPLASH_MOE_WHOLE_EXPERT=1` is a separate, default-off single-grid experiment.
+One threadgroup owns one expert tile, walks every gate/up column tile, then
+walks every down column tile. Threadgroup device barriers publish the
+intermediate values; there is no cross-threadgroup dependency or spinning
+barrier. The same stage is reused throughout. It takes precedence over gather
+modes, but an eligible N-det G plan still takes precedence over it. Eligibility
+matches staged M8 plans up to 32 rows with fused gate/up formats.
+
+This deliberately trades column parallelism for fewer dispatches/threadgroups.
+Enough live expert tiles are necessary for occupancy; no automatic selection
+rule or performance benefit is established. The benchmark prints live-tile
+count and the selected flag. `check-wp5-m4.sh whole` / `whole-exhaustive` compare
+it with the baseline; see WP5-STATUS for actual qualification coverage.

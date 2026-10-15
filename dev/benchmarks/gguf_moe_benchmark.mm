@@ -172,8 +172,9 @@ int timing(MetalBackend &backend, uint32_t rounds, Fmt gateUpFormat, Fmt downFor
       MoE::add(graph, b, gguf, plan);
       const uint32_t live = *static_cast<const uint32_t *>(b.scratch.tileCount.contents());
       const char *fold = std::getenv("SPLASH_MOE_GATHER_FOLD");
-      printf("WP5 rows=%u gate_up=%s down=%s shared=%s gather_fold=%s layer_ms=%.6f live_tiles=%u dispatches=%zu\n",
-             rows, fmtName(gateUpFormat), fmtName(downFormat), fmtName(sharedFormat), fold ? fold : "0",
+      const char *whole = std::getenv("SPLASH_MOE_WHOLE_EXPERT");
+      printf("WP5 rows=%u gate_up=%s down=%s shared=%s gather_fold=%s whole_expert=%s layer_ms=%.6f live_tiles=%u dispatches=%zu\n",
+             rows, fmtName(gateUpFormat), fmtName(downFormat), fmtName(sharedFormat), fold ? fold : "0", whole ? whole : "0",
              layer, live, graph.dispatches().size());
       for (const auto &[name, seconds] : splash::benchmark::replayDispatches(backend, graph.dispatches()))
         printf("WP5_REPLAY rows=%u kernel=%s ms=%.6f\n", rows, name.c_str(), seconds * 1e3);
