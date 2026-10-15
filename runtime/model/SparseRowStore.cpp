@@ -251,6 +251,7 @@ struct SparseRowStore::Impl {
   std::atomic<uint64_t> readBytes{0}, readRetries{0}, readErrors{0};
   std::atomic<uint64_t> prefetchRequested{0}, prefetchRead{0}, prefetchDropped{0};
   LatencyHistogram readLatency;
+  LatencyHistogram firstPrefillLatency;
 
   Impl(SparseRowTable table, std::unique_ptr<RowReader> reader, SparseRowStoreOptions options)
       : table(std::move(table)), reader(std::move(reader)), options(options) {}
@@ -538,7 +539,7 @@ uint64_t SparseRowStore::committedBytes() const noexcept {
 }
 
 SparseRowStageResult SparseRowStore::stage(std::span<const uint32_t> ids, std::span<uint8_t> rows,
-                                           std::span<uint32_t> slots, SparseRowUse use, bool adoptPrefetch) {
+                                           std::span<uint32_t> slots, SparseRowUse use, bool adoptPrefetch, bool firstChunk) {
   Impl &s = *impl_;
   const std::lock_guard stageLock(s.stageMutex);
   const auto started = Clock::now();
@@ -636,6 +637,8 @@ SparseRowStageResult SparseRowStore::stage(std::span<const uint32_t> ids, std::s
   counters.hits.fetch_add(result.hitRows, std::memory_order_relaxed);
   counters.read.fetch_add(result.readRows, std::memory_order_relaxed);
   counters.latency.add(result.nanoseconds);
+  if (use == SparseRowUse::Prefill && firstChunk)
+    s.firstPrefillLatency.add(result.nanoseconds);
   return result;
 }
 
@@ -732,6 +735,7 @@ SparseRowStats SparseRowStore::stats() const {
   result.prefetchReadRows = s.prefetchRead.load();
   result.prefetchDroppedRows = s.prefetchDropped.load();
   result.read = s.readLatency.snapshot();
+  result.firstPrefillStage = s.firstPrefillLatency.snapshot();
   result.poisoned = s.poisoned.load();
   {
     const std::lock_guard lock(s.failureMutex);

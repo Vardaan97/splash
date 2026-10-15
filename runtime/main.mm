@@ -200,6 +200,19 @@ bootstrapConfig(const engine::NativeArguments &arguments) {
   config.resources.buildId = SPLASH_BUILD_ID;
   config.resources.maximumMemoryBytes = arguments.maxMemoryBytes;
   config.resources.cacheDisk = arguments.maxCacheDisk;
+  if (const char *floor = std::getenv("SPLASH_CACHE_DISK_FREE_FLOOR_GIB")) {
+    const std::string text(floor);
+    if (text.empty() || text.find_first_not_of("0123456789") != std::string::npos)
+      throw std::invalid_argument("SPLASH_CACHE_DISK_FREE_FLOOR_GIB requires integer GiB");
+    const uint64_t gib = std::stoull(text);
+    if (gib > (std::numeric_limits<uint64_t>::max() >> 30))
+      throw std::invalid_argument("SPLASH_CACHE_DISK_FREE_FLOOR_GIB is too large");
+    config.resources.cacheDiskMinimumFreeBytes = gib << 30;
+  }
+  config.nativeLoop.engine.prefillCobatch = [] {
+    const char *value = std::getenv("SPLASH_PREFILL_COBATCH");
+    return value && std::string_view(value) == "1";
+  }();
   config.resources.cacheDiskWritesPerDay = arguments.maxCacheDiskWritesBytes;
   config.resources.persistentCache = arguments.persistentCache;
   config.resources.cacheRoot = arguments.cacheRoot;

@@ -62,6 +62,7 @@ Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
     : config_(config), cache_(cache), writeBehind_(cache), model_(model),
       events_(events), scheduler_(config_.decodeShare) {
   scheduler_.setPrefillSlices(model_.prefillSliceCount());
+  scheduler_.setPrefillCobatch(config_.prefillCobatch);
   if (!config_.maxContext || !config_.vocabularySize) {
     throw std::invalid_argument("context and vocabulary sizes must be positive");
   }
@@ -775,6 +776,9 @@ bool Engine::admit(Request &active, double now) {
     scheduler_.waitForPrefix(active.request.id);
     return false;
   }
+  // Queue file reads before lane allocation and asynchronous state/KV restore.
+  // SparseRowStore bounds the hint; stage remains the authoritative read.
+  model_.prefetchPrompt(modelRequest, lookup.resumeBoundary());
   // A prefix wait is not an attempt: a refusal stands until the next one.
   active.refusedMemory = false;
   // A request is in service when no other lane is resident

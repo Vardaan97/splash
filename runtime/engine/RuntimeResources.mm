@@ -171,7 +171,7 @@ void reportDiskTier(const DiskSpace &space, const model::DiskBudget &budget, boo
   if (!space.followed()) {
     line << "its quota, on a volume whose free space it does not follow";
   } else {
-    const uint64_t floor = diskFloorBytes(volume->sizeBytes);
+    const uint64_t floor = space.floorBytes();
     if (budget.limitBytes() < budget.capacityBytes())
       line << "a quarter of the "
            << gibibytes(diskRoomBytes(volume->availableBytes, space.heldBytes(), floor))
@@ -649,13 +649,13 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         const uint64_t minimumBytes = 2 * stateSlotBytes + (uint64_t{1} << 30);
         std::error_code ignored;
         temporaryRefusal = automaticDiskRefusal(
-            config.diskVolume(std::filesystem::temp_directory_path(ignored)), 0, minimumBytes);
+            config.diskVolume(std::filesystem::temp_directory_path(ignored)), 0, minimumBytes, config.cacheDiskMinimumFreeBytes);
         if (config.persistentCache && !config.cacheRoot.empty()) {
           uint64_t heldBytes = 0;
           for (const CacheDirectory::Idle &cache : rootCaches)
             heldBytes += cache.bytes;
           rootRefusal =
-              automaticDiskRefusal(config.diskVolume(config.cacheRoot), heldBytes, minimumBytes);
+              automaticDiskRefusal(config.diskVolume(config.cacheRoot), heldBytes, minimumBytes, config.cacheDiskMinimumFreeBytes);
         }
       }
       if (config.persistentCache && !rootRefusal) {
@@ -720,7 +720,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         files.push_back(kvFile);
       diskSpace = std::make_unique<DiskSpace>(
           diskBudget, std::move(files),
-          persistentCache.directory ? std::move(otherCaches) : std::vector<CacheDirectory::Idle>{});
+          persistentCache.directory ? std::move(otherCaches) : std::vector<CacheDirectory::Idle>{},
+          config.cacheDiskMinimumFreeBytes);
       reportDiskTier(*diskSpace, *diskBudget, automaticDisk, config.cacheDiskWritesPerDay,
                      persistentCache.directory
                          ? "persistent files in " + persistentCache.directory->path().string()

@@ -55,12 +55,12 @@ uint64_t diskLimitBytes(uint64_t quotaBytes, uint64_t availableBytes, uint64_t h
 }
 
 std::optional<std::string> automaticDiskRefusal(const std::optional<DiskVolume> &volume,
-                                                uint64_t heldBytes, uint64_t minimumBytes) {
+                                                uint64_t heldBytes, uint64_t minimumBytes, uint64_t minimumFloorBytes) {
   if (!volume)
     return "its volume cannot be measured";
   if (!volume->local)
     return volume->mountPoint + " is not a local volume";
-  const uint64_t floor = diskFloorBytes(volume->sizeBytes);
+  const uint64_t floor = std::max(minimumFloorBytes, diskFloorBytes(volume->sizeBytes));
   if (diskLimitBytes(kAutomaticCacheDiskBytes, volume->availableBytes, heldBytes, floor) <
       minimumBytes)
     return gibibytes(volume->availableBytes) + " available on " + volume->mountPoint +
@@ -76,8 +76,8 @@ std::string gibibytes(uint64_t bytes) {
 
 DiskSpace::DiskSpace(std::shared_ptr<model::DiskBudget> budget,
                      std::vector<std::shared_ptr<model::SlotFile>> files,
-                     std::vector<CacheDirectory::Idle> others)
-    : budget_(std::move(budget)), files_(std::move(files)),
+                     std::vector<CacheDirectory::Idle> others, uint64_t minimumFloorBytes)
+    : minimumFloorBytes_(minimumFloorBytes), budget_(std::move(budget)), files_(std::move(files)),
       others_(std::make_move_iterator(others.begin()), std::make_move_iterator(others.end())) {
   if (!budget_ || files_.empty())
     throw std::invalid_argument("a disk tier's space needs its budget and a file");
@@ -100,7 +100,7 @@ void DiskSpace::measure(std::optional<DiskVolume> volume) {
   heldBytes_ = own + othersBytes_;
   if (volume_)
     budget_->setVolumeAvailableBytes(volume_->availableBytes);
-  const uint64_t floor = volume_ ? diskFloorBytes(volume_->sizeBytes) : 0;
+  const uint64_t floor = floorBytes();
   // A write found the volume full while it shows room above the floor, or on
   // a volume the tier does not follow. The first such write may have met a
   // volume that filled and freed again before this measure; from the second

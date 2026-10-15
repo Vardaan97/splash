@@ -646,7 +646,7 @@ void Linear::addGgufFloatSegments(metal::CommandGraph &graph, const LinearBuffer
   for (const QuantizedSegment &s : p.blocks().segments)
     if (s.isFloat())
       addGgufFloat(graph, b.input, s, b.output, w.rows, w.matrix.outputSize, s.columnOffset, plan.destination(),
-                   ggufFloatTile(w.rows, s.outputSize));
+                   ggufFloatSegmentTile(w.rows, s.outputSize));
 }
 
 // The neural accelerator tile needs one (Apple9's matrix operations share the
@@ -656,6 +656,13 @@ void Linear::addGgufFloatSegments(metal::CommandGraph &graph, const LinearBuffer
 // over 8-column tiles with 16 K partitions each and finishes first below that
 // grid: at the 35B's K = 2048 the two take the same time at 1.4-1.6 tiles per
 // core for both of its float projections on the 16- and 20-core M5 Pro.
+// Port of 05e83701 attribution switch; default and routers stay unchanged.
+FloatTile Linear::ggufFloatSegmentTile(uint32_t rows, uint32_t outputSize) const noexcept {
+  const char *value = std::getenv("SPLASH_FLOAT_SEGMENT_TILE");
+  return value && std::strcmp(value, "simd") == 0
+             ? FloatTile::Simdgroup : ggufFloatTile(rows, outputSize);
+}
+
 FloatTile Linear::ggufFloatTile(uint32_t rows, uint32_t outputSize) const noexcept {
   const uint64_t tiles = uint64_t{(rows + 63) / 64} * ((outputSize + 31) / 32);
   return family_ == GpuFamilyClass::Apple10 && rows >= 16 && 2 * tiles >= uint64_t{3} * gpuCores_

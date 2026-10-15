@@ -40,6 +40,23 @@ DiskVolume localVolume(uint64_t availableBytes, uint64_t sizeBytes = 1000 * kGiB
 // The floor is 10 GiB, or 5% of a volume smaller than 200 GiB; the limit is
 // a quarter of what the volume has beyond it, the tier's own blocks counted,
 // at most the quota and never below zero.
+void testConfiguredFloor() {
+  auto budget = std::make_shared<model::DiskBudget>(16 * kGiB);
+  auto file = std::make_shared<model::SlotFile>(kHostPageBytes, budget);
+  DiskSpace space(budget, {file}, {}, 32 * kGiB);
+  space.measure(localVolume(96 * kGiB));
+  require(space.floorBytes() == 32 * kGiB && budget->limitBytes() == 16 * kGiB,
+          "configured floor or quota was ignored");
+  space.measure(localVolume(48 * kGiB));
+  require(budget->limitBytes() == 4 * kGiB, "shrinking free space did not shrink tier");
+  space.measure(localVolume(31 * kGiB));
+  require(!budget->limitBytes(), "tier admits writes below configured floor");
+  space.measure(localVolume(96 * kGiB));
+  require(budget->limitBytes() == 16 * kGiB, "tier did not recover after free space returned");
+  require(automaticDiskRefusal(localVolume(33 * kGiB), 0, kGiB, 32 * kGiB).has_value(),
+          "automatic start ignored configured floor");
+}
+
 void testTheRule() {
   require(diskFloorBytes(1000 * kGiB) == 10 * kGiB && diskFloorBytes(100 * kGiB) == 5 * kGiB &&
               diskFloorBytes(12 * kGiB) == 12 * kGiB / 20,
@@ -285,6 +302,7 @@ void testOtherCachesGoAsTheTierGrows() {
 int main() {
   try {
     testTheRule();
+    testConfiguredFloor();
     testTiersOnOneVolumeConverge();
     testSnapshotCostsAtMostAThird();
     testAutomaticStart();

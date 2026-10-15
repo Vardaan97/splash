@@ -267,6 +267,7 @@ public:
   // The tile of a float projection of `rows` rows into `outputSize` columns
   // on this device (LinearGguf.cpp).
   [[nodiscard]] FloatTile ggufFloatTile(uint32_t rows, uint32_t outputSize) const noexcept;
+  [[nodiscard]] FloatTile ggufFloatSegmentTile(uint32_t rows, uint32_t outputSize) const noexcept;
   // The plan of `config` for `workload`, whether or not the device's policy
   // picks it.
   [[nodiscard]] static LinearPlan plan(LinearWorkload workload, LinearConfig config,

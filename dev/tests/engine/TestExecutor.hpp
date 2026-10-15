@@ -251,6 +251,11 @@ public:
       healthCheck();
   }
 
+  std::vector<std::pair<uint64_t, uint32_t>> promptPrefetches;
+  void prefetchPrompt(const ModelRequest &request, uint32_t from) override {
+    promptPrefetches.emplace_back(request.id, from);
+  }
+
   StateAdmission begin(const ModelRequest &request) override {
     ++beginAttempts;
     lastBeginId = request.id;

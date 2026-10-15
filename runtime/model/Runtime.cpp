@@ -801,6 +801,10 @@ struct Runtime::Impl {
     return !value || std::string_view(value) != "0";
   }
   bool pleReadAhead = pleReadAheadFromEnvironment();
+  bool pleAdmissionPrefetch = [] {
+    const char *value = std::getenv("SPLASH_PLE_ADMISSION_PREFETCH");
+    return value && std::string_view(value) == "1";
+  }();
   std::vector<uint32_t> pleAhead;
   explicit Impl(RuntimeContext value)
       : backend(value.backend),
@@ -1820,7 +1824,10 @@ struct Runtime::Impl {
       // The whole command's rows at once, so that lanes share their rows.
       const uint32_t count = batch.rows * geometry.target.pleHeads();
       stagePleRows(prefillArena->get(PrefillTensor::PleIndices), prefillArena->get(PrefillTensor::PleSlots),
-                   prefillArena->get(PrefillTensor::PleStaging), count, SparseRowUse::Prefill, true);
+                   prefillArena->get(PrefillTensor::PleStaging), count, SparseRowUse::Prefill, true,
+                   std::ranges::any_of(batch.sequences, [](const auto &sequence) {
+                     return sequence.item->logicalPosition == sequence.entry->restoredTokens;
+                   }));
       if (pleReadAhead) prefetchNextPrefillRows(batch);
     }
     return batch;
@@ -2094,14 +2101,14 @@ struct Runtime::Impl {
   // a ticket keeps its arena until it completes. A row that cannot be read
   // throws before anything is submitted, which stops the engine.
   void stagePleRows(const MetalBuffer &indices, const MetalBuffer &slots, const MetalBuffer &staging,
-                    uint32_t count, SparseRowUse use, bool adoptPrefetch) {
+                    uint32_t count, SparseRowUse use, bool adoptPrefetch, bool firstChunk = false) {
     const uint64_t rowBytes = geometry.target.pleStreamRowBytes;
     if (indices.sizeBytes() < bytesFor<uint32_t>(count) || slots.sizeBytes() < bytesFor<uint32_t>(count) ||
         staging.sizeBytes() < count * rowBytes)
       throw std::logic_error("PLE staging is smaller than its step");
     pleStore->stage({contents<const uint32_t>(indices, "PLE rows"), count},
                     {contents<uint8_t>(staging, "PLE staging"), count * rowBytes},
-                    {contents<uint32_t>(slots, "PLE slots"), count}, use, adoptPrefetch);
+                    {contents<uint32_t>(slots, "PLE slots"), count}, use, adoptPrefetch, firstChunk);
   }
 
   // Reads ahead the PLE rows of the prompt tokens that follow a prefill
@@ -3131,6 +3138,20 @@ std::vector<uint8_t> Runtime::pendingGdnRows(uint64_t requestId) const {
       rows.insert(rows.end(), tape + offset, tape + offset + metadata.pendingRows * rowBytes);
   }
   return rows;
+}
+
+void Runtime::prefetchPrompt(const ModelRequest &request, uint32_t from) {
+  if (!impl_->pleStore || !impl_->pleAdmissionPrefetch || !request.images.empty() ||
+      from >= request.prompt.size()) return;
+  const uint32_t count = std::min<uint64_t>(ExecutionLimits::prefillTokenBudget,
+                                          request.prompt.size() - from);
+  const uint32_t heads = impl_->geometry.target.pleHeads();
+  std::vector<uint32_t> rows(uint64_t{count} * heads);
+  for (uint32_t i = 0; i < count; ++i)
+    impl_->pleRows(uint64_t{from} + i, request.prompt[from + i],
+                   [&](uint64_t at) -> std::optional<uint32_t> { return request.prompt[at]; },
+                   rows.data() + uint64_t{i} * heads);
+  impl_->pleStore->prefetch(rows);
 }
 
 StateAdmission Runtime::begin(const ModelRequest &request) {

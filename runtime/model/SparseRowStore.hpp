@@ -135,6 +135,7 @@ struct SparseRowStats final {
   uint64_t prefetchRequestedRows = 0;
   uint64_t prefetchReadRows = 0;
   uint64_t prefetchDroppedRows = 0;
+  SparseRowLatency firstPrefillStage; // first chunk commands, including adopted read wait
   SparseRowLatency read; // one row's read, any thread
   bool poisoned = false;
   std::string failure;
@@ -179,7 +180,7 @@ public:
   // id is past the table (a defect of the caller), std::invalid_argument
   // when rows or slots are too small. Stages are serialized.
   SparseRowStageResult stage(std::span<const uint32_t> ids, std::span<uint8_t> rows, std::span<uint32_t> slots,
-                             SparseRowUse use, bool adoptPrefetch = false);
+                             SparseRowUse use, bool adoptPrefetch = false, bool firstChunk = false);
 
   // Starts reading the rows of `ids` that are not cached into the cache, on
   // the readers, below any stage's reads. Returns at once. Rows beyond the

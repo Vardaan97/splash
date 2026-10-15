@@ -49,6 +49,7 @@ struct EngineConfig final {
   // its solo rate through a long prefill, which meanwhile takes 1.5x as long;
   // zero alternates one command of each kind.
   double decodeShare = 0.5;
+  bool prefillCobatch = false;
   // The prefill checkpoint interval and the resource wait limit.
   uint32_t prefillCheckpointTokens = kPrefillCheckpointTokens;
   // Opt-in retained grid. These are ordinary composite states, so rolling

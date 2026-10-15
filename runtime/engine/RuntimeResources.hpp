@@ -105,6 +105,8 @@ struct RuntimeResourcesConfig {
   // (--max-cache-disk-writes, model::DiskBudget::setWriteBudget); zero for
   // none, when every write passes.
   uint64_t cacheDiskWritesPerDay = 0;
+  // Additional free-space floor, applied at each disk measure.
+  uint64_t cacheDiskMinimumFreeBytes = 0;
   // Where persistent caches live, one directory per persistentCacheNamespace():
   // every start removes those nobody used for two weeks. Empty for none.
   std::filesystem::path cacheRoot;

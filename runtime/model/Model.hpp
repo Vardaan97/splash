@@ -580,6 +580,9 @@ public:
   virtual ~Model() = default;
   virtual void checkHealth() {}
   [[nodiscard]] virtual uint32_t prefillSliceCount() const noexcept { return 0; }
+  // Optional bounded host read-ahead for the first uncached prompt chunk.
+  // Does not require a resident lane or retain request-owned spans.
+  virtual void prefetchPrompt(const ModelRequest &, uint32_t) {}
   [[nodiscard]] virtual StateAdmission begin(const ModelRequest &request) = 0;
   // Safe-point preemption returns the request's state buffers, retaining
   // only its host-side sampling/constraint continuation. Resume replays the

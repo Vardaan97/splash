@@ -3337,6 +3337,29 @@ void testQueuedLongPrefillsLeaveRoomForShortWork() {
           "admission lost work, introduced replay, or stranded queued requests");
 }
 
+void testAdmissionPrefetchesMatchedSuffixBeforeBegin() {
+  test::TestKvStorage storage(1024, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, nullptr, nullptr);
+  Executor executor;
+  Events events;
+  engine::Engine engine(test::engineConfig(), resources, executor, events);
+  guardReleases(storage, engine);
+  executor.beginObserver = [&] {
+    require(!executor.promptPrefetches.empty() &&
+                executor.promptPrefetches.back().first == executor.lastBeginId,
+            "begin preceded first-chunk prefetch");
+  };
+  const std::vector<uint32_t> warm(4097, 47);
+  engine.submit(request(1, warm));
+  runUntilIdle(engine);
+  engine.submit(request(2, warm));
+  runUntilIdle(engine);
+  require(executor.promptPrefetches.front() == std::pair<uint64_t, uint32_t>{1, 0} &&
+              executor.promptPrefetches.back() == std::pair<uint64_t, uint32_t>{2, 4096},
+          "admission prefetch ignored matched prefix");
+}
+
 void testAdmissionUsesCachedRemainingWork() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
@@ -10604,6 +10627,7 @@ int main() {
     testSingletonCapacityFailureTerminatesCleanly();
     testQueuedLongPrefillsLeaveRoomForShortWork();
     testAdmissionUsesCachedRemainingWork();
+    testAdmissionPrefetchesMatchedSuffixBeforeBegin();
     testUnselectableCandidatesAreNotProbed();
     testWaitingCandidateProbeIsRefreshedNotRepeated();
     testMemoryWaitHoldsBackLaterArrivals();

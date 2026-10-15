@@ -5,6 +5,7 @@
 
 #include <sys/mount.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <deque>
 #include <filesystem>
@@ -66,7 +67,7 @@ inline constexpr uint64_t kAutomaticCacheDiskBytes = uint64_t{32} << 30;
 // Empty when the tier turns on.
 [[nodiscard]] std::optional<std::string>
 automaticDiskRefusal(const std::optional<DiskVolume> &volume, uint64_t heldBytes,
-                     uint64_t minimumBytes);
+                     uint64_t minimumBytes, uint64_t minimumFloorBytes = 0);
 
 // "12.3 GiB".
 [[nodiscard]] std::string gibibytes(uint64_t bytes);
@@ -95,7 +96,8 @@ public:
   // Measures the volume.
   DiskSpace(std::shared_ptr<model::DiskBudget> budget,
             std::vector<std::shared_ptr<model::SlotFile>> files,
-            std::vector<CacheDirectory::Idle> others = {});
+            std::vector<CacheDirectory::Idle> others = {},
+            uint64_t minimumFloorBytes = 0);
   DiskSpace(const DiskSpace &) = delete;
   DiskSpace &operator=(const DiskSpace &) = delete;
 
@@ -113,7 +115,12 @@ public:
   // The volume's free space sets the limit: it is measured and local.
   [[nodiscard]] bool followed() const noexcept { return volume_ && volume_->local; }
 
+  [[nodiscard]] uint64_t floorBytes() const noexcept {
+    return std::max(minimumFloorBytes_, volume_ ? diskFloorBytes(volume_->sizeBytes) : uint64_t{0});
+  }
+
 private:
+  uint64_t minimumFloorBytes_ = 0;
   std::shared_ptr<model::DiskBudget> budget_;
   std::vector<std::shared_ptr<model::SlotFile>> files_;
   std::deque<CacheDirectory::Idle> others_;

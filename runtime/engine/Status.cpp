@@ -116,6 +116,8 @@ void appendStreamedTable(std::ostringstream &out, const std::optional<model::Spa
     appendLatency(out, counters.stage);
     out << '}';
   }
+  out << ",\"first_prefill_stage\":";
+  appendLatency(out, table->firstPrefillStage);
   out << ",\"read_bytes\":" << table->readBytes << ",\"read_retries\":" << table->readRetries
       << ",\"read_errors\":" << table->readErrors << ",\"read\":";
   appendLatency(out, table->read);

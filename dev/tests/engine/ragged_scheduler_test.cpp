@@ -61,6 +61,33 @@ void awaitFirstMask(engine::Scheduler &scheduler, uint64_t id) {
           "a constrained prompt did not wait for its first mask");
 }
 
+void testShortPrefillCobatch() {
+  Scheduler scheduler(0.0);
+  scheduler.setPrefillCobatch(true);
+  // Give the scheduler an isolated throughput sample first.
+  scheduler.submit(request(1, 2048));
+  scheduler.resourcesReady(1, 0);
+  completePrefill(scheduler, *scheduler.next({}), 100.0);
+  completeDecode(scheduler, true);
+  for (uint64_t id = 2; id <= 5; ++id) scheduler.submit(request(id, 100));
+  const std::array candidates{PrefillAdmission{2, 0}, PrefillAdmission{3, 0},
+                              PrefillAdmission{4, 0}, PrefillAdmission{5, 0}};
+  require(scheduler.prefillAdmissionOrder(candidates) == std::vector<uint64_t>({2,3,4,5}),
+          "ready burst was not admitted together");
+  for (uint64_t id = 2; id <= 5; ++id) scheduler.resourcesReady(id, 0);
+  const auto plan = *scheduler.next({});
+  require(plan.width() == 4 && std::all_of(plan.items.begin(), plan.items.end(), [](const auto &item) { return item.tokenCount == 100; }), "short burst was not co-batched");
+  completePrefill(scheduler, plan, 40.0);
+  require(scheduler.next({})->kind == WorkKind::Decode && scheduler.next({})->width() == 4,
+          "co-batched lanes did not become ready for decode together");
+
+  Scheduler isolated(0.0);
+  isolated.setPrefillCobatch(true);
+  isolated.submit(request(1, 100));
+  isolated.resourcesReady(1, 0);
+  require(isolated.next({})->items[0].tokenCount == 100, "co-batch padded or waited for an absent lane");
+}
+
 void testAdmissionSharesDispatchOrderAndBudget() {
   Scheduler scheduler(0.0);
   scheduler.submit(request(1, 8193));
@@ -1080,6 +1107,7 @@ void testReplayKeepsHeldInitialMask() {
 int main() {
   try {
     testAdmissionSharesDispatchOrderAndBudget();
+    testShortPrefillCobatch();
     testAdmissionRespectsContendedBudgetAndDecodePriority();
     testHighestRunnablePriority();
     testQueuedPrefillCannotBeOvertakenIndefinitely();
