@@ -89,6 +89,14 @@ struct GgufDecodeParams {
 };
 static_assert(sizeof(GgufDecodeParams) == 20, "GGUF decode parameters are 20 bytes on both sides");
 
+// Hyper-only stores keep real rows and stream geometry out of the base ABI.
+struct GgufHyperDecodeParams {
+  GgufDecodeParams linear;
+  uint32_t rows;
+  uint32_t streams;
+};
+static_assert(sizeof(GgufHyperDecodeParams) == 28, "hyper decode parameters are 28 bytes");
+
 // Decode of a fused projection: up to three column segments of any formats in
 // one dispatch, tiles in segment order.
 struct GgufDecodeFusedParams {

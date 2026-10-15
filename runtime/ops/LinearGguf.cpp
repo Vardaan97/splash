@@ -5,6 +5,7 @@
 
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Gguf.h"
+#include "metal/abi/Qwen4.h"
 #include "ops/BufferExtent.hpp"
 
 #include <algorithm>
@@ -474,7 +475,7 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
     graph.add("gguf_decode_q80_m" + std::to_string(rows) + "_hc",
               {b.input, s.plane0, s.plane1Slot(), s.meta, b.output, partials, counters, b.output,
                b.hyperCombine.streams, b.hyperCombine.weights},
-              GgufDecodeParams{k, splits, n, 0, config.spread},
+              GgufHyperDecodeParams{{k, splits, n, 0, config.spread}, w.rows, QWEN4_MAXIMUM_STREAMS},
               {n / GGUF_TILE_COLUMNS, splits, 1}, {GGUF_STAGED_THREADS, 1, 1});
     return;
   }
@@ -483,7 +484,7 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
     graph.add("gguf_decode_q80_m" + std::to_string(rows) + "_hcmix",
               {b.input, s.plane0, s.plane1Slot(), s.meta, b.output, b.scratch.counters,
                b.hyperNormalized, b.hyperMixed},
-              GgufDecodeParams{k, 1, n, 0, config.spread},
+              GgufHyperDecodeParams{{k, 1, n, 0, config.spread}, w.rows, QWEN4_MAXIMUM_STREAMS},
               {n / GGUF_TILE_COLUMNS, 1, 1}, {GGUF_STAGED_THREADS, 1, 1});
     return;
   }

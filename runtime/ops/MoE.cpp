@@ -2,6 +2,7 @@
 
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Gguf.h"
+#include "metal/abi/Qwen4.h"
 #include "metal/abi/MoE.h"
 #include "ops/BufferExtent.hpp"
 
@@ -228,8 +229,8 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
               gather, {tiles, shape.hiddenSize / 256, 1});
   addExperts(graph, scratch, weights, plan, group, group.in_place ? buffers.input : scratch.groupedInput);
   if (hyper) {
-    requireBytes(hyper.streams, uint64_t{rows} * shape.hiddenSize * 4 * sizeof(float), "MoE hyper streams");
-    requireBytes(hyper.weights, uint64_t{rows} * 4 * sizeof(float), "MoE hyper weights");
+    requireBytes(hyper.streams, uint64_t{rows} * shape.hiddenSize * QWEN4_MAXIMUM_STREAMS * sizeof(float), "MoE hyper streams");
+    requireBytes(hyper.weights, uint64_t{rows} * QWEN4_MAXIMUM_STREAMS * sizeof(float), "MoE hyper weights");
     graph.add("moe_combine_hyper",
               {scratch.expertOutput, scratch.routeRows, scratch.routingWeights,
                buffers.residual, hyper.streams, hyper.weights},

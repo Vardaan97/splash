@@ -78,6 +78,8 @@ inline void hyperFusionIdentity(metal::MetalBackend &backend) {
         auto input = upload(x), normalized = upload(norm);
         auto gateRef = buffer(storage * 10240 * 2), gateGot = buffer(storage * 10240 * 2);
         auto mixedRef = buffer(storage * 2560 * 2), mixedGot = buffer(storage * 2560 * 2);
+        std::memset(gateGot.contents(), 0xA5, gateGot.sizeBytes());
+        std::memset(mixedGot.contents(), 0xA5, mixedGot.sizeBytes());
         auto counters = buffer(fused.scratchSize().counters);
         std::memset(counters.contents(), 0, counters.sizeBytes());
         std::vector<float> stream(storage * 10240), norms(10240, 1.0f), injection(4 * 10240, 0.01f);
@@ -88,15 +90,20 @@ inline void hyperFusionIdentity(metal::MetalBackend &backend) {
         Qwen4::addNorm(graph, streams, {normWeights, true}, inject ? injectWeights : metal::MetalBuffer{},
                       normalized, weights, {2560, 4, 320}, storage);
         linear.add(graph, {.input = input, .output = gateRef}, up, plain);
-        Qwen4::addMix(graph, normalized, gateRef, mixedRef, {2560, 4, 320}, storage);
+        Qwen4::addMix(graph, normalized, gateRef, mixedRef, {2560, 4, 320}, rows);
         linear.add(graph, {.input = input, .output = gateGot, .scratch = {.counters = counters},
                           .hyperNormalized = normalized, .hyperMixed = mixedGot}, up, fused);
         // Reuse the arrival counters in the same command, testing reset.
         linear.add(graph, {.input = input, .output = gateGot, .scratch = {.counters = counters},
                           .hyperNormalized = normalized, .hyperMixed = mixedGot}, up, fused);
         static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
-        same(gateRef, gateGot, uint64_t(storage) * 10240 * 2, "hyper gate differs bitwise");
-        same(mixedRef, mixedGot, uint64_t(storage) * 2560 * 2, "hyper mixed differs bitwise");
+        same(gateRef, gateGot, uint64_t(rows) * 10240 * 2, "hyper gate differs bitwise");
+        same(mixedRef, mixedGot, uint64_t(rows) * 2560 * 2, "hyper mixed differs bitwise");
+        for (const auto &[output, columns] : {std::pair{gateGot, 10240u}, std::pair{mixedGot, 2560u}}) {
+          const auto *bytes = static_cast<const uint8_t *>(output.contents());
+          for (uint64_t i = uint64_t(rows) * columns * 2; i < output.sizeBytes(); ++i)
+            if (bytes[i] != 0xA5) throw std::runtime_error("hyper mix writes a padding row");
+        }
         const auto *counts = static_cast<const uint32_t *>(counters.contents());
         for (uint64_t i = 0; i < counters.sizeBytes() / 4; ++i)
           if (counts[i]) throw std::runtime_error("hyper mix leaves counters nonzero");
@@ -126,7 +133,7 @@ inline void hyperFusionIdentity(metal::MetalBackend &backend) {
           std::memset(scratch.counters.contents(), 0, scratch.counters.sizeBytes());
           metal::CommandGraph graph;
           linear.add(graph, {.input = input, .output = branch, .scratch = scratch}, out, plain);
-          Qwen4::addCombine(graph, ref, branch, weights, {2560, 4, 320}, storage);
+          Qwen4::addCombine(graph, ref, branch, weights, {2560, 4, 320}, rows);
           linear.add(graph, {.input = input, .output = unused, .scratch = scratch,
                             .hyperCombine = {got, weights}}, out, fused);
           static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());

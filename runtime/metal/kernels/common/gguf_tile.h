@@ -1,3 +1,4 @@
+#include "metal/abi/Qwen4.h"
 #pragma once
 #include "metal/kernels/common/activation.h"
 
@@ -11,7 +12,7 @@ template <GgufEpilogue Ep, class Out = bfloat> inline Out gguf_epilogue(float v,
   if constexpr (Ep == EpResidual) v += float(aux[at]);
   if constexpr (Ep == EpUpWithGate) v = float(bfloat(v)) * splash_silu(float(aux[at]));
   if constexpr (Ep == EpHyperLow) {
-    const float x = float(bfloat(v)) / 4u;
+    const float x = float(bfloat(v)) / QWEN4_MAXIMUM_STREAMS;
     v = x * (1.0f / (1.0f + exp(-x)));
   }
   return Out(v);

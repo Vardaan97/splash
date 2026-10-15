@@ -1,3 +1,4 @@
+#include "metal/abi/Qwen4.h"
 #include "metal/abi/KernelABI.h"
 #include "metal/kernels/common/activation.h"
 #include "metal/kernels/common/gguf_sgmatrix.h"
@@ -418,6 +419,6 @@ kernel void moe_combine_hyper(
              float(expert_output[ulong(route_rows[route + slot]) * params.hidden_size + dimension]);
   }
   const float b = float(bfloat(value));
-  device float *x = streams + ulong(row) * 4 * params.hidden_size + dimension;
-  for (uint s = 0; s < 4; ++s) x[s * params.hidden_size] += b * weights[row * 4 + s];
+  device float *x = streams + ulong(row) * QWEN4_MAXIMUM_STREAMS * params.hidden_size + dimension;
+  for (uint s = 0; s < QWEN4_MAXIMUM_STREAMS; ++s) x[s * params.hidden_size] += b * weights[row * QWEN4_MAXIMUM_STREAMS + s];
 }

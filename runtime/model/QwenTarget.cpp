@@ -965,7 +965,7 @@ ops::PreparedInput QwenTarget::addQwen4VerifyMix(VerifyStep &step, const Qwen4Hy
   ops::PreparedInput prepared = ops::Qwen4::addNorm(step.graph, std::move(streams), hyper.norm, hyper.inject,
                                                     h.normalized, h.weights, hs, step.rows, scratch,
                                                     layout(hyper.down));
-  const bool fuseLow = (ops::hyperFusionBits() & 1) && hs.streams == 4 &&
+  const bool fuseLow = (ops::hyperFusionBits() & 1) && hs.streams == QWEN4_MAXIMUM_STREAMS &&
       linear.supportsHyperEpilogue(hyper.down, step.lanes, ops::LinearEpilogue::HyperLow) &&
       layout(hyper.up) == ops::LinearInput::Plain;
   if (fuseLow) {
@@ -977,7 +977,7 @@ ops::PreparedInput QwenTarget::addQwen4VerifyMix(VerifyStep &step, const Qwen4Hy
     project(h.normalized, hyper.down, h.low, std::move(prepared));
     prepared = ops::Qwen4::addLow(step.graph, h.low, hs, step.rows, scratch, layout(hyper.up));
   }
-  const bool fuseMix = (ops::hyperFusionBits() & 2) && hs.streams == 4 && hs.hidden % 64 == 0 &&
+  const bool fuseMix = (ops::hyperFusionBits() & 2) && hs.streams == QWEN4_MAXIMUM_STREAMS && hs.hidden % 64 == 0 &&
       linear.supportsHyperEpilogue(hyper.up, step.lanes, ops::LinearEpilogue::HyperMix) &&
       (!next || layout(*next) == ops::LinearInput::Plain);
   if (fuseMix) {
@@ -1123,17 +1123,17 @@ void QwenTarget::addQwen4Verify(VerifyStep &step, const Qwen4ExpWeights &weights
                 mixer.outputHeadOrder, linear.decodePlan(mixer.outputProjection, step.lanes).input());
             mixerCombined = addDecodeHyperProjection(step.graph, linear, b.gdnHidden, mixer.outputProjection,
                 h.branch, step.lanes, b.linearScratch, hidden,
-                hs.streams == 4 ? ops::HyperCombine{h.streams, h.weights} : ops::HyperCombine{});
+                hs.streams == QWEN4_MAXIMUM_STREAMS ? ops::HyperCombine{h.streams, h.weights} : ops::HyperCombine{});
           } else {
             mixerCombined = addQwen4VerifyAttention(step, layer, mixer, step.attentionLayer++,
-                                                    std::move(input), hs.streams == 4 ? ops::HyperCombine{h.streams, h.weights}
+                                                    std::move(input), hs.streams == QWEN4_MAXIMUM_STREAMS ? ops::HyperCombine{h.streams, h.weights}
                                                                                   : ops::HyperCombine{});
           }
         },
         layer.mixer);
     if (!mixerCombined) ops::Qwen4::addCombine(step.graph, h.streams, h.branch, h.weights, hs, rows);
     addQwen4VerifyMix(step, layer.ffnHyper, h.streams, b.normalized);
-    const bool moeCombined = (ops::hyperFusionBits() & 4) && hs.streams == 4;
+    const bool moeCombined = (ops::hyperFusionBits() & 4) && hs.streams == QWEN4_MAXIMUM_STREAMS;
     ops::MoE::add(step.graph, {b.normalized, h.zeros, h.branch, b.moe}, layer.ffn, *step.moe, 0,
                   std::span(step.lastRows).first(step.lastRowLanes),
                   moeCombined ? ops::HyperCombine{h.streams, h.weights} : ops::HyperCombine{});
@@ -1192,12 +1192,12 @@ void QwenTarget::addQwen4MtpVerify(VerifyStep &step, const Qwen4ExpWeights &weig
   const bool mixerCombined = addQwen4VerifyAttention(
       step, mtp.block, attention, attentionLayer,
       addQwen4VerifyMix(step, mtp.block.mixerHyper, h.mtpStreams, b.normalized, &attention.inputProjection),
-      full && hs.streams == 4 ? ops::HyperCombine{h.mtpStreams, h.weights} : ops::HyperCombine{},
+      full && hs.streams == QWEN4_MAXIMUM_STREAMS ? ops::HyperCombine{h.mtpStreams, h.weights} : ops::HyperCombine{},
       full || !(mtpHeadTrim() & kTrimKv));
   if (!full) return;
   if (!mixerCombined) ops::Qwen4::addCombine(step.graph, h.mtpStreams, h.branch, h.weights, hs, rows);
   addQwen4VerifyMix(step, mtp.block.ffnHyper, h.mtpStreams, b.normalized);
-  const bool moeCombined = (ops::hyperFusionBits() & 4) && hs.streams == 4;
+  const bool moeCombined = (ops::hyperFusionBits() & 4) && hs.streams == QWEN4_MAXIMUM_STREAMS;
   ops::MoE::add(step.graph, {b.normalized, h.zeros, h.branch, b.moe}, mtp.block.ffn, *step.moe, firstRow,
                 std::span(step.lastRows).first(step.lastRowLanes),
                 moeCombined ? ops::HyperCombine{h.mtpStreams, h.weights} : ops::HyperCombine{});

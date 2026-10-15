@@ -145,11 +145,13 @@ kernel void gguf_decode_hc(device bfloat *input [[buffer(0)]], device uchar *w0 
     device uchar *w1 [[buffer(2)]], device uchar *meta [[buffer(3)]], device bfloat *branch [[buffer(4)]],
     device coherent(device) float *partials [[buffer(5)]], device atomic_uint *counters [[buffer(6)]],
     device bfloat *aux [[buffer(7)]], device float *streams [[buffer(8)]],
-    device const float *weights [[buffer(9)]], constant GgufDecodeParams &p [[buffer(10)]], uint2 group [[threadgroup_position_in_grid]],
+    device const float *weights [[buffer(9)]], constant GgufHyperDecodeParams &h [[buffer(10)]], uint2 group [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+  constant GgufDecodeParams &p = h.linear;
   // Preserve the projection's existing branch and auxiliary binding slots.
   (void)branch;
   (void)aux;
+  constant GgufDecodeParams &p = h.linear;
   threadgroup half stage[kStagedStages];
   threadgroup half2 tl[1];
   threadgroup uint arrival;
@@ -163,16 +165,17 @@ kernel void gguf_decode_hc(device bfloat *input [[buffer(0)]], device uchar *w0 
       staged_first_step(group.x, sb, se, p.spread), acc);
   gguf_store_sums<Rows>(acc, p.splits, group.y, partials, counters + group.x, p.out_stride, origin,
       sg * 32 + lane, &arrival, [&](uint r, uint c, float v) {
+    if (r >= h.rows) return;
     const float b = float(bfloat(v));
-    device float *x = streams + ulong(r) * 4 * p.out_stride + origin + c;
-    for (uint s = 0; s < 4; ++s) x[s * p.out_stride] += b * weights[r * 4 + s];
+    device float *x = streams + ulong(r) * h.streams * p.out_stride + origin + c;
+    for (uint s = 0; s < h.streams; ++s) x[s * p.out_stride] += b * weights[r * h.streams + s];
   });
 }
 #define GGUF_HC(R) \
   template [[host_name("gguf_decode_q80_m" #R "_hc")]] kernel void gguf_decode_hc<R, EpHyperCombine>( \
       device bfloat *, device uchar *, device uchar *, device uchar *, device bfloat *, \
       device coherent(device) float *, device atomic_uint *, device bfloat *, device float *, device const float *, \
-      constant GgufDecodeParams &, uint2, uint, uint);
+      constant GgufHyperDecodeParams &, uint2, uint, uint);
 GGUF_HC(8) GGUF_HC(16) GGUF_HC(32)
 #undef GGUF_HC
 
@@ -184,8 +187,9 @@ kernel void gguf_decode_hcmix(device bfloat *input [[buffer(0)]], device uchar *
     device uchar *w1 [[buffer(2)]], device uchar *meta [[buffer(3)]],
     device coherent(device) bfloat *gate [[buffer(4)]], device atomic_uint *counters [[buffer(5)]],
     device const bfloat *normalized [[buffer(6)]], device bfloat *mixed [[buffer(7)]],
-    constant GgufDecodeParams &p [[buffer(8)]], uint2 group [[threadgroup_position_in_grid]],
+    constant GgufHyperDecodeParams &h [[buffer(8)]], uint2 group [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+  constant GgufDecodeParams &p = h.linear;
   threadgroup half stage[kStagedStages];
   threadgroup half2 tl[1];
   threadgroup uint arrival;
@@ -196,23 +200,23 @@ kernel void gguf_decode_hcmix(device bfloat *input [[buffer(0)]], device uchar *
   staged_accumulate<FmtQ80, Rows, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(input, w0, w1, meta, p.input_size,
       origin, stage + sg * kStagedSimdgroupStage, tl, lane, 0, p.input_size / GGUF_STAGED_STEP,
       staged_first_step(group.x, 0, p.input_size / GGUF_STAGED_STEP, p.spread), acc);
-  gguf_elements(acc, [&](uint r, uint c, float v) { gate[ulong(r) * p.out_stride + origin + c] = bfloat(v); });
-  const uint hidden = p.out_stride / 4, slice = group.x % (hidden / GGUF_TILE_COLUMNS), tid = sg * 32 + lane;
-  if (!split_arrive_last(counters + slice, 4, tid, &arrival)) return;
-  for (uint r = 0; r < Rows; ++r) {
+  gguf_elements(acc, [&](uint r, uint c, float v) { if (r < h.rows) gate[ulong(r) * p.out_stride + origin + c] = bfloat(v); });
+  const uint hidden = p.out_stride / h.streams, slice = group.x % (hidden / GGUF_TILE_COLUMNS), tid = sg * 32 + lane;
+  if (!split_arrive_last(counters + slice, h.streams, tid, &arrival)) return;
+  for (uint r = 0; r < min(uint(Rows), h.rows); ++r) {
     const uint d = slice * GGUF_TILE_COLUMNS + tid;
     const ulong base = ulong(r) * p.out_stride + d;
     float sum = 0.0f;
-    for (uint s = 0; s < 4; ++s)
+    for (uint s = 0; s < h.streams; ++s)
       sum += float(normalized[base + s * hidden]) * (1.0f / (1.0f + exp(-float(gate[base + s * hidden]))));
-    mixed[ulong(r) * hidden + d] = bfloat(sum / 4u);
+    mixed[ulong(r) * hidden + d] = bfloat(sum / h.streams);
   }
   split_release(counters + slice, tid);
 }
 #define GGUF_HCMIX(R) \
   template [[host_name("gguf_decode_q80_m" #R "_hcmix")]] kernel void gguf_decode_hcmix<R>( \
       device bfloat *, device uchar *, device uchar *, device uchar *, device coherent(device) bfloat *, \
-      device atomic_uint *, device const bfloat *, device bfloat *, constant GgufDecodeParams &, uint2, uint, uint);
+      device atomic_uint *, device const bfloat *, device bfloat *, constant GgufHyperDecodeParams &, uint2, uint, uint);
 GGUF_HCMIX(8) GGUF_HCMIX(16) GGUF_HCMIX(32)
 #undef GGUF_HCMIX
 // Q8_0 experimental small projections: preserve the original 64-column
