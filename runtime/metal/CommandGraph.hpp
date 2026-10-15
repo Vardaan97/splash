@@ -89,6 +89,14 @@ public:
     step(std::move(event), value, EventStep::Kind::Wait);
   }
 
+  // Record the last dispatch's arrival-counter view. Concurrent users must
+  // own disjoint words, including when their bindings are aliased subviews.
+  void usesCounters(const MetalBuffer &buffer) {
+    if (dispatches_.empty() || !buffer)
+      throw std::invalid_argument("arrival counters require a dispatch and buffer");
+    counters_.back() = buffer;
+  }
+
   // The caller proves that [begin, end) has no RAW, WAR or WAW dependency,
   // including aliased views, scratch and buffers reached through pointers.
   // All earlier work completes before the group; all its work completes
@@ -120,6 +128,15 @@ public:
           if (length && bytes && start < other + bytes && other < start + length)
             throw std::invalid_argument("independent group shares hyper-mix counters");
         }
+      }
+    }
+    for (size_t i = begin; i < end; ++i) {
+      if (!counters_[i]) continue;
+      for (size_t j = begin; j < i; ++j) {
+        if (!counters_[j]) continue;
+        const uint64_t a = counters_[i].gpuAddress(), b = counters_[j].gpuAddress();
+        if (a < b + counters_[j].sizeBytes() && b < a + counters_[i].sizeBytes())
+          throw std::invalid_argument("independent dispatches share arrival counters");
       }
     }
     for (size_t i = begin + 1; i < end; ++i)
@@ -168,6 +185,7 @@ private:
       dispatch.buffers.push_back({index, std::move(buffers[index])});
     }
     dispatches_.push_back(std::move(dispatch));
+    counters_.emplace_back();
     return dispatches_.back();
   }
 
@@ -177,6 +195,7 @@ private:
 
   std::deque<std::vector<std::byte>> payloads_;
   std::vector<ComputeDispatch> dispatches_;
+  std::vector<MetalBuffer> counters_;
   std::vector<EventStep> events_;
   std::vector<size_t> layers_;
 };

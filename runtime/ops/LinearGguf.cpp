@@ -477,6 +477,7 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
                b.hyperCombine.streams, b.hyperCombine.weights},
               GgufHyperDecodeParams{{k, splits, n, 0, config.spread}, w.rows, QWEN4_MAXIMUM_STREAMS},
               {n / GGUF_TILE_COLUMNS, splits, 1}, {GGUF_STAGED_THREADS, 1, 1});
+    if (splits > 1) graph.usesCounters(counters);
     return;
   }
   if (w.epilogue == LinearEpilogue::HyperMix) {
@@ -486,6 +487,7 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
                b.hyperNormalized, b.hyperMixed},
               GgufHyperDecodeParams{{k, 1, n, 0, config.spread}, w.rows, QWEN4_MAXIMUM_STREAMS},
               {n / GGUF_TILE_COLUMNS, 1, 1}, {GGUF_STAGED_THREADS, 1, 1});
+    graph.usesCounters(b.scratch.counters);
     return;
   }
   const auto tensor = [&](const QuantizedSegment &s, char epilogue, const metal::MetalBuffer &output,
@@ -502,6 +504,7 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
               {b.input, s.plane0, s.plane1Slot(), s.meta, output, partials, counters, aux},
               GgufDecodeParams{k, splits, n, s.columnOffset, config.spread},
               {s.outputSize / config.columns, splits, 1}, {config.columns, 1, 1});
+    if (splits > 1) graph.usesCounters(counters);
   };
   if (w.phase == LinearPhase::Prefill) {
     for (const QuantizedSegment &s : segments)
@@ -518,6 +521,7 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
                counters},
               GgufDecodeParams{k, splits, n, u.columnOffset, config.spread},
               {u.outputSize / GGUF_STAGED_COLUMNS, splits, 1}, {GGUF_GATE_UP_THREADS, 1, 1});
+    if (splits > 1) graph.usesCounters(counters);
     return;
   }
   if (segments.size() == 1) {
@@ -542,6 +546,7 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
   bindings.insert(bindings.end(), {b.output, partials, counters});
   graph.add("gguf_decode_fused_m" + std::to_string(rows), std::move(bindings), params,
             {segmentColumns(p) / GGUF_TILE_COLUMNS, splits, 1}, {GGUF_STAGED_THREADS, 1, 1});
+  if (splits > 1) graph.usesCounters(counters);
 }
 
 // The prefill tile, which runs prefill chunks of more than
@@ -627,6 +632,7 @@ void Linear::addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &b,
     const GgufDecodeFusedParams params = fusedSegments(plan, order, bindings);
     bindings.insert(bindings.end(), {b.output, partials, counters});
     graph.add("gguf_decode_sg_fused" + suffix, std::move(bindings), params, grid, {GGUF_REGISTER_THREADS, 1, 1});
+    if (config.splits > 1) graph.usesCounters(counters);
     return;
   }
   const auto tensor = [&](const QuantizedSegment &s, char epilogue, const metal::MetalBuffer &output,
@@ -634,6 +640,7 @@ void Linear::addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &b,
     graph.add(kernelInstance(std::string("gguf_decode_sg_") + s.name() + suffix + "_" + epilogue, plan.destination()),
               {b.scratch.input, b.scratch.sums, s.plane0, s.plane1Slot(), s.meta, output, partials, counters, aux},
               GgufDecodeParams{k, config.splits, n, s.columnOffset, 0}, grid, {GGUF_REGISTER_THREADS, 1, 1});
+    if (config.splits > 1) graph.usesCounters(counters);
   };
   addDecodeTensor(b, w.epilogue, segments.front(), gate, tensor);
 }

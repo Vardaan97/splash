@@ -135,6 +135,38 @@ void hyperCounterSharing(const char *library) {
     std::cout << "PASS U6 hyper-mix counters cannot alias an independent group (including private views)\n";
 }
 
+// U6: arrival counters are exclusive within a concurrent group. Test exact
+// aliases, partially overlapping views, disjoint views and serial reuse.
+void independentCounters(const char *library) {
+    MetalBackend backend(library);
+    auto allocation = backend.allocateBuffer(64, BufferStorage::Shared, "arrival-counter-test");
+    auto first = allocation.subview(0, 32), overlap = allocation.subview(16, 32);
+    auto second = allocation.subview(32, 32);
+    for (const auto &other : {first, overlap, second}) {
+        splash::metal::CommandGraph graph;
+        graph.add("counter-user", {first}, {1, 1, 1});
+        graph.usesCounters(first);
+        graph.add("counter-user", {other}, {1, 1, 1});
+        graph.usesCounters(other);
+        bool rejected = false;
+        try { graph.independent(0, 2); }
+        catch (const std::invalid_argument &) { rejected = true; }
+        require(rejected == !other.sameView(second), "independent arrival-counter alias check");
+    }
+    splash::metal::CommandGraph serial;
+    for (uint32_t i = 0; i < 2; ++i) {
+        serial.add("counter-user", {first}, {1, 1, 1});
+        serial.usesCounters(first);
+    }
+    // Different allocations and counter-free users can be independent.
+    auto separate = backend.allocateBuffer(32, BufferStorage::Shared, "separate-counter-test");
+    serial.add("counter-user", {separate}, {1, 1, 1});
+    serial.usesCounters(separate);
+    serial.add("ordinary-user", {first}, {1, 1, 1});
+    serial.independent(1, 4);
+    std::cout << "PASS independent groups own disjoint arrival counters\n";
+}
+
 void independentDispatches(const char *library) {
     MetalBackend backend(library);
     constexpr uint32_t count = 1024;
@@ -2046,6 +2078,7 @@ int main(int argc, const char *argv[]) {
         try {
             cachedDispatches(argv[1]);
             hyperCounterSharing(argv[1]);
+            independentCounters(argv[1]);
             independentDispatches(argv[1]);
             completionDoesNotWaitForMemoryTelemetry(argv[1]);
             terminalCommandRecovers(argv[1], false);
