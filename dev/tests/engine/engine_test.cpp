@@ -1,4 +1,5 @@
 #include "TestCache.hpp"
+#include "model/MtpTuning.hpp"
 #include "TestChecks.hpp"
 #include "TestEngine.hpp"
 #include "TestExecutor.hpp"
@@ -9,6 +10,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cmath>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -10398,6 +10400,17 @@ void testImpossibleSpeculativeCountsFailOnlyTheirOwnLane() {
 
 int main() {
   try {
+    using model::mtpLiveRows;
+    const std::array<float, 3> confidence{0.8F, 0.5F, 0.25F};
+    require(mtpLiveRows(confidence, 4, 0) == 4, "threshold zero keeps the draft bound");
+    require(mtpLiveRows(confidence, 4, 0.3F) == 3, "cumulative confidence keeps a leading prefix");
+    require(mtpLiveRows(confidence, 4, 0.9F) == 1, "confidence can retain only the anchor");
+    require(mtpLiveRows(confidence, 2, 0.1F) == 2, "confidence never exceeds the drafted bound");
+    require(mtpLiveRows(std::array<float, 2>{0.5F, 0.5F}, 3, 0.25F) == 3, "threshold equality stays live");
+    require(mtpLiveRows(std::array<float, 3>{0.1F, 0.2F, NAN}, 4, 0.3F) == 4,
+            "invalid confidence past the cut keeps every drafted row");
+    require(mtpLiveRows(std::array<float, 2>{INFINITY, 0.2F}, 3, 0.3F) == 3,
+            "infinite confidence keeps every drafted row");
     testSpeculativeCountsStayWithEachConcurrentRequest();
     testImpossibleSpeculativeCountsFailOnlyTheirOwnLane();
     testUnusableThinkingBudgetIsRefused();

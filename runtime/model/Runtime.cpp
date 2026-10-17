@@ -44,6 +44,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -327,6 +328,7 @@ struct Runtime::Impl {
     // of those it judged (a cycle judges its proposals up to the first it
     // rejects). The prior is a rate of 0.8 worth five proposals.
     uint32_t mtpDrafted = 0;
+    uint32_t mtpLiveRows = 0;
     float mtpAccepted = 4.0F;
     float mtpJudged = 5.0F;
     // With the head's draft vocabulary: the request's context tokens beside
@@ -407,6 +409,8 @@ struct Runtime::Impl {
   // 7, default 7), fewer while a lane's proposals are rejected
   // (mtpStepsFor); SPLASH_MTP_ADAPTIVE=0 always drafts SPLASH_MTP_DRAFTS
   // (default 3). The later proposals repeat the last.
+  float mtpLiveThreshold = mtpThresholdFromEnvironment();
+  uint64_t mtpLiveTotal = 0, mtpLiveSamples = 0, mtpLiveCycles = 0;
   bool mtpDraftOneRow = mtpSwitchFromEnvironment("SPLASH_MTP_DRAFT_ONE_ROW");
   bool mtpDraftLog = mtpSwitchFromEnvironment("SPLASH_MTP_DRAFT_LOG");
   MetalBuffer mtpDraftTileCounts;
@@ -460,24 +464,37 @@ struct Runtime::Impl {
   // rows past them only repeat the last proposal, so they route to no expert
   // (QwenTarget::addVerify liveRows) and no token is kept from them. 0 when
   // every row routes: a lane without drafted proposals, or a full verify.
-  uint32_t verifyLiveRows(std::span<Request *const> entries) const {
-    if (!targetModel->hasMtp()) return 0;
-    uint32_t rows = 0;
-    for (const Request *entry : entries) {
-      if (!entry->mtpDrafted) return 0;
-      rows = std::max(rows, entry->mtpDrafted + 1);
+  std::array<uint32_t, kLaneCount> verifyLiveRows(std::span<Request *const> entries) const {
+    std::array<uint32_t, kLaneCount> result{};
+    if (!targetModel->hasMtp()) return result;
+    if (!(mtpLiveThreshold > 0)) {
+      uint32_t rows = 0;
+      for (const Request *entry : entries) {
+        if (!entry->mtpDrafted) return result;
+        rows = std::max(rows, entry->mtpDrafted + 1);
+      }
+      result.fill(rows < kDecodeRows ? rows : 0);
+      return result;
     }
-    return rows < kDecodeRows ? rows : 0;
+    for (uint32_t lane = 0; lane < entries.size(); ++lane) {
+      const Request &entry = *entries[lane];
+      if (!entry.mtpDrafted) continue;
+      const uint32_t rows = entry.mtpLiveRows ? std::min(entry.mtpLiveRows, entry.mtpDrafted + 1) : entry.mtpDrafted + 1;
+      result[lane] = rows < kDecodeRows ? rows : 0;
+    }
+    return result;
   }
   // The outcome of the proposals a lane's cycle drafted: `accepted`
   // proposals in a row, counted past the drafted ones when a repeat of the
   // last was accepted too.
   static void countMtpOutcome(Request &entry, uint32_t accepted) {
     if (!entry.mtpDrafted) return;
-    const uint32_t kept = std::min(accepted, entry.mtpDrafted);
+    const uint32_t judged = entry.mtpLiveRows ? std::min(entry.mtpDrafted, entry.mtpLiveRows - 1) : entry.mtpDrafted;
+    const uint32_t kept = std::min(accepted, judged);
     entry.mtpAccepted = kMtpDecay * entry.mtpAccepted + static_cast<float>(kept);
-    entry.mtpJudged = kMtpDecay * entry.mtpJudged + static_cast<float>(kept < entry.mtpDrafted ? kept + 1 : kept);
+    entry.mtpJudged = kMtpDecay * entry.mtpJudged + static_cast<float>(kept < judged ? kept + 1 : kept);
     entry.mtpDrafted = 0;
+    entry.mtpLiveRows = 0;
   }
   // With a draft vocabulary (Qwen4DraftVocabulary.hpp), each step of the
   // MTP head reads a quarter of the vocabulary projection at most, but a
@@ -2133,11 +2150,15 @@ struct Runtime::Impl {
       buffers.anchors = d(DecodeTensor::DraftInputTokens);
       buffers.proposals = d(DecodeTensor::ProposedTokens);
       buffers.candidates = d(DecodeTensor::Candidates);
+      buffers.draftConfidence = d(DecodeTensor::DraftConfidence);
       buffers.proposalsPerLane = kDraftProposalTokens;
       buffers.candidatesPerProposal = SPLASH_DRAFT_CANDIDATES;
       uint32_t steps = 1;
       for (uint32_t lane = 0; lane < lanes; ++lane) steps = std::max(steps, mtpStepsFor(*entries[lane]));
-      for (uint32_t lane = 0; lane < lanes; ++lane) entries[lane]->mtpDrafted = steps;
+      for (uint32_t lane = 0; lane < lanes; ++lane) {
+        entries[lane]->mtpDrafted = steps;
+        entries[lane]->mtpLiveRows = 0;
+      }
       // From the draft vocabulary and each lane's context while every lane
       // does.
       if (targetModel->hasMtpDraftVocabulary())
@@ -2172,9 +2193,10 @@ struct Runtime::Impl {
                       std::span<DecodeLaneResult> lanes, std::span<uint32_t> maximumRetained) {
     if (draftModel || !targetModel->hasMtp()) throw std::logic_error("the target has no MTP head to draft with");
     encodeTargetVerifyBatchForward(graph, entries, items, true);
-    if (const uint32_t liveRows = verifyLiveRows(entries))
-      for (uint32_t lane = 0; lane < entries.size(); ++lane) {
-        lanes[lane].maximumRetained = std::min(lanes[lane].maximumRetained, liveRows);
+    const auto liveRows = verifyLiveRows(entries);
+    for (uint32_t lane = 0; lane < entries.size(); ++lane)
+      if (liveRows[lane]) {
+        lanes[lane].maximumRetained = std::min(lanes[lane].maximumRetained, liveRows[lane]);
         maximumRetained[lane] = lanes[lane].maximumRetained;
       }
     encodeThinkingDrafts(graph, entries);
@@ -2326,6 +2348,14 @@ struct Runtime::Impl {
   std::vector<ModelStepResult> finalizeDecode(
       std::span<DecodeLaneResult> lanes, std::span<const ModelBatchItem> items,
       CommandTiming timing) {
+    if (mtpLiveThreshold > 0 && targetModel->hasMtp()) {
+      for (const auto &lane : lanes) {
+        mtpLiveTotal += lane.request->mtpLiveRows ? lane.request->mtpLiveRows : lane.request->mtpDrafted + 1;
+        ++mtpLiveSamples;
+      }
+      if (++mtpLiveCycles % 128 == 0)
+        std::fprintf(stderr, "MTP verify live rows: %.2f\n", double(mtpLiveTotal) / mtpLiveSamples);
+    }
     if (!lanes.empty()) logMtpDraft(lanes.front().request->mtpDrafted, static_cast<uint32_t>(lanes.size()));
     for (uint32_t lane = 0; lane < items.size(); ++lane) {
       DecodeLaneResult &laneResult = lanes[lane];
@@ -2442,10 +2472,19 @@ struct Runtime::Impl {
               impl_.decodeArena->get(lane, DecodeTensor::ProposedTokens),
               "constrained draft proposals");
           entry.maskWords.clear();
-          entry.verifyMaskInFlight = true;
+          const bool constrained = entry.constraint == ConstraintMode::TokenMask;
+          if (impl_.mtpLiveThreshold > 0 && entry.mtpDrafted && !constrained && !laneResult.endDrafts &&
+              samplingPolicy(entry).temperature == 0) {
+            const auto *confidence = contents<float>(impl_.decodeArena->get(lane, DecodeTensor::DraftConfidence),
+                                                       "MTP draft confidence");
+            entry.mtpLiveRows = model::mtpLiveRows({confidence, entry.mtpDrafted}, entry.mtpDrafted + 1,
+                                                   impl_.mtpLiveThreshold);
+            laneResult.maximumRetained = std::min(laneResult.maximumRetained, entry.mtpLiveRows);
+          }
+          entry.verifyMaskInFlight = constrained;
           entries[lane] = &entry;
 
-          if (!abandoned_[lane]) {
+          if (constrained && !abandoned_[lane]) {
             ModelMaskRequest request;
             request.requestId = entry.id;
             request.simulationTokens.reserve(kDecodeRows);
@@ -2464,8 +2503,16 @@ struct Runtime::Impl {
                                    DecodeTensor::Hidden0, width);
         impl_.encodeTargetVerifyBatchForward(
             target, {entries.data(), lanes_.size()}, items_);
-        submit(target);
-        stage_ = Stage::TargetForward;
+        if (lanes_.front().request->constraint != ConstraintMode::TokenMask) {
+          std::array<uint32_t, kLaneCount> retained{};
+          for (uint32_t lane = 0; lane < lanes_.size(); ++lane) retained[lane] = lanes_[lane].maximumRetained;
+          impl_.encodeVerifyCommit(target, {entries.data(), lanes_.size()}, items_, {retained.data(), lanes_.size()});
+          submit(target);
+          stage_ = Stage::Commit;
+        } else {
+          submit(target);
+          stage_ = Stage::TargetForward;
+        }
       }
 
       if (stage_ == Stage::TargetForward && command_.ready()) {
@@ -2511,7 +2558,8 @@ struct Runtime::Impl {
     }
 
     bool ownsMaskWait(uint64_t requestId) const noexcept override {
-      if (stage_ == Stage::Draft || stage_ == Stage::Done)
+      if (lanes_.front().request->constraint != ConstraintMode::TokenMask ||
+          stage_ == Stage::Draft || stage_ == Stage::Done)
         return false;
       return std::any_of(lanes_.begin(), lanes_.end(),
                          [requestId](const DecodeLaneResult &lane) {
@@ -2536,19 +2584,28 @@ struct Runtime::Impl {
     }
 
     std::vector<ModelStepResult> wait() override {
+      // Native callers and startup warmup wait synchronously. A confidence
+      // handoff needs the same progress the engine makes by polling masks.
+      if (lanes_.front().request->constraint != ConstraintMode::TokenMask && stage_ != Stage::Done)
+        while (!ready()) {
+          static_cast<void>(takeMaskRequests());
+          if (!ready()) std::this_thread::yield();
+        }
       if (!ready())
         throw std::logic_error("constrained decode ticket is not complete");
       addTiming(command_.wait());
       stage_ = Stage::Done;
-      ModelTelemetry &counters = impl_.counters;
-      ++counters.constrainedMaskOverlapBatches;
-      counters.constrainedMaskOverlapRequests += lanes_.size();
-      counters.lastConstrainedTargetForwardGpuSeconds =
-          targetForwardGpuSeconds_;
-      counters.totalConstrainedTargetForwardGpuSeconds +=
-          targetForwardGpuSeconds_;
-      counters.lastConstrainedMaskWaitSeconds = maskWaitSeconds_;
-      counters.totalConstrainedMaskWaitSeconds += maskWaitSeconds_;
+      if (lanes_.front().request->constraint == ConstraintMode::TokenMask) {
+        ModelTelemetry &counters = impl_.counters;
+        ++counters.constrainedMaskOverlapBatches;
+        counters.constrainedMaskOverlapRequests += lanes_.size();
+        counters.lastConstrainedTargetForwardGpuSeconds =
+            targetForwardGpuSeconds_;
+        counters.totalConstrainedTargetForwardGpuSeconds +=
+            targetForwardGpuSeconds_;
+        counters.lastConstrainedMaskWaitSeconds = maskWaitSeconds_;
+        counters.totalConstrainedMaskWaitSeconds += maskWaitSeconds_;
+      }
       return impl_.finalizeDecode(lanes_, items_, timing_);
     }
 
@@ -3114,7 +3171,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
   } else {
     impl_->encodeMtpDraft(commandGraph, entries, items, lanes, {maximumRetained.data(), width});
   }
-  if (constrained) {
+  if (constrained || (!impl_->draftModel && impl_->mtpLiveThreshold > 0)) {
     return std::make_unique<Impl::ConstrainedDecodeTicket>(
         *impl_, std::move(lanes), items, commandGraph, std::move(completion));
   }

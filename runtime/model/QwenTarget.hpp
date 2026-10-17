@@ -333,6 +333,7 @@ struct QwenTargetVerifyBuffers final {
   metal::MetalBuffer anchors;
   metal::MetalBuffer proposals;
   metal::MetalBuffer candidates;
+  metal::MetalBuffer draftConfidence;
   uint32_t proposalsPerLane = 0;
   uint32_t candidatesPerProposal = 0;
   // With the draft vocabulary, each lane's context rows beside it
@@ -489,6 +490,9 @@ public:
       const kv::PageStorage &kv,
       std::span<const kv::ChunkedPrefillParams> chunks,
       uint32_t lanes, uint32_t liveRows = 0) const = 0;
+  virtual void addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
+                         const kv::PageStorage &kv, std::span<const kv::ChunkedPrefillParams> chunks,
+                         uint32_t lanes, std::array<uint32_t, ExecutionLimits::maximumBatchWidth> liveRows) const;
   // The head over `lanes` lanes of targetVerifyRows rows of the last layer's
   // output, as verify ends: one sweep of the vocabulary projection for every
   // lane.

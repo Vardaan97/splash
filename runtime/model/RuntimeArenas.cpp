@@ -202,6 +202,7 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
         bytesFor<float>(uint64_t{operators.linear().decodeStorageRows(kDecodeRows, {rows, hidden})} * rows));
     put(DecodeTensor::DraftContextInfo, bytesFor<uint32_t>(4));
   }
+  if (geometry.target.mtpLayers) put(DecodeTensor::DraftConfidence, bytesFor<float>(kDraftProposalTokens));
   put(DecodeTensor::Hidden0,
       bytesFor<uint16_t>(r * geometry.target.hiddenSize));
   put(DecodeTensor::Hidden1,

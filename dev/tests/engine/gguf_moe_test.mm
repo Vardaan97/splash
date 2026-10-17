@@ -710,16 +710,19 @@ MoeRun runPlan(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan 
 // live row's output is `full`'s where its routes ran the same tile kinds (a
 // dropped row's absence can move an expert's live rows between tiles).
 void checkLiveRows(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan &plan, uint32_t firstRow,
-                   uint32_t lastRow, const MoeRun &full, const std::string &label) {
+                   uint32_t lastRow, const MoeRun &full, const std::string &label,
+                   std::span<const uint32_t> lastRows = {}) {
   const uint32_t rows = plan.rows(), tileRows = plan.tileRows();
   const auto live = [&](uint32_t row) {
     const uint32_t r = row % SPLASH_TARGET_VERIFY_ROWS;
-    return r >= firstRow && (!lastRow || r < lastRow);
+    const uint32_t end = lastRows.empty() ? lastRow : lastRows[row / SPLASH_TARGET_VERIFY_ROWS];
+    return r >= firstRow && (!end || r < end);
   };
   allocate(backend, b, plan);
   std::memset(b.moe.output.contents(), 0, b.moe.output.sizeBytes());
   CommandGraph graph;
-  MoE::add(graph, b.moe, m.weights, plan, firstRow, lastRow);
+  if (lastRows.empty()) MoE::add(graph, b.moe, m.weights, plan, firstRow, lastRow);
+  else MoE::add(graph, b.moe, m.weights, plan, std::span<const uint32_t, 4>(lastRows.data(), 4));
   static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
   const auto *routeRows = static_cast<const uint32_t *>(b.moe.scratch.routeRows.contents());
   const auto *groupedRoutes = static_cast<const uint32_t *>(b.moe.scratch.groupedRoutes.contents());
@@ -893,6 +896,16 @@ int moe(MetalBackend &backend) {
           for (uint32_t row = 0; row < SPLASH_TARGET_VERIFY_ROWS - 1; ++row)
             checkLiveRows(backend, m, b, plan, row, row + 1, run,
                           label + " draft row " + std::to_string(row));
+          if (lanes == 4) {
+            const std::array<uint32_t, 4> cuts{1, 3, 6, 0};
+            checkLiveRows(backend, m, b, plan, 0, 0, run, label + " per-lane bounds", cuts);
+            const std::array<uint32_t, 4> invalid{1, 3, 9, 0};
+            CommandGraph rejected;
+            bool refused = false;
+            try { MoE::addRouting(rejected, b.moe, m.weights, plan, std::span<const uint32_t, 4>(invalid)); }
+            catch (const std::invalid_argument &) { refused = true; }
+            require(refused, label + ": an invalid lane bound was accepted");
+          }
           if (widest.output.empty()) widest = run;
           else compareWidest(run, label);
         }

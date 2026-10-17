@@ -312,7 +312,16 @@ ops::AttentionBlocks Qwen4ExpTarget::addVerifyQsa(VerifyStep &step, const Qwen4I
 void Qwen4ExpTarget::addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
                                const kv::PageStorage &kv, std::span<const kv::ChunkedPrefillParams> chunks,
                                uint32_t lanes, uint32_t liveRows) const {
-  if (liveRows && (!hasMtp() || liveRows >= kVerifyRows)) throw std::invalid_argument("invalid Qwen verify live rows");
+  std::array<uint32_t, ExecutionLimits::maximumBatchWidth> rows{};
+  rows.fill(liveRows);
+  addVerify(graph, std::move(buffers), kv, chunks, lanes, rows);
+}
+
+void Qwen4ExpTarget::addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
+                                const kv::PageStorage &kv, std::span<const kv::ChunkedPrefillParams> chunks,
+                                uint32_t lanes, std::array<uint32_t, ExecutionLimits::maximumBatchWidth> liveRows) const {
+  for (uint32_t rows : liveRows)
+    if (rows && (!hasMtp() || rows >= kVerifyRows)) throw std::invalid_argument("invalid Qwen verify live rows");
   VerifyStep step{verifyStep(graph, buffers, kv, chunks, lanes)};
   const std::vector<uint32_t> offsets = indexOffsets(kv, geometry_.kvLayout.attentionLayers);
   step.scratch = steps_.verifyScratch(decodeStorageLanes(lanes) * kVerifyRows);
@@ -355,7 +364,11 @@ void Qwen4ExpTarget::addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffe
         layer.mixer);
     ops::HyperConnection::addCombine(step.graph, h.streams, h.branch, h.weights, hs, rows);
     addVerifyMix(step, layer.ffnHyper, b.normalized);
-    ops::MoE::add(step.graph, {b.normalized, h.zeros, h.branch, b.moe}, layer.ffn, *step.moe, 0, liveRows);
+    if (std::all_of(liveRows.begin(), liveRows.end(), [&](uint32_t r) { return r == liveRows[0]; }))
+      ops::MoE::add(step.graph, {b.normalized, h.zeros, h.branch, b.moe}, layer.ffn, *step.moe, 0, liveRows[0]);
+    else
+      ops::MoE::add(step.graph, {b.normalized, h.zeros, h.branch, b.moe}, layer.ffn, *step.moe,
+                    std::span<const uint32_t, 4>(liveRows));
     ops::HyperConnection::addCombine(step.graph, h.streams, h.branch, h.weights, hs, rows);
     if (const auto slot = geometry_.captureSlot(index))
       addStreamCapture(step.graph, geometry_, *slot, h.streams, b.capturedTargetHidden, 0, rows);
@@ -605,14 +618,14 @@ void Qwen4ExpTarget::addMtpDraft(metal::CommandGraph &graph, QwenTargetVerifyBuf
                                               uint64_t{buffers.draftContextLogitsSlot} * sizeof(float)),
                                 1, buffers.linearScratch);
           }
-        ops::Qwen4::addMtpArgmaxContext(graph, buffers.logits, buffers.proposals, buffers.candidates,
+        ops::Qwen4::addMtpArgmaxContext(graph, buffers.logits, buffers.proposals, buffers.candidates, buffers.draftConfidence,
                                         draftHead->tokens, buffers.draftContextLogits, buffers.draftContextTokens,
                                         buffers.draftContextInfo, lanes, laneRows, vocabulary,
                                         kQwen4DraftContextTokens, buffers.draftContextLogitsSlot,
                                         buffers.proposalsPerLane, buffers.candidatesPerProposal, j - 1,
                                         j == draft.steps);
       } else {
-        ops::Qwen4::addMtpArgmax(graph, buffers.logits, buffers.proposals, buffers.candidates, lanes, laneRows,
+        ops::Qwen4::addMtpArgmax(graph, buffers.logits, buffers.proposals, buffers.candidates, buffers.draftConfidence, lanes, laneRows,
                                  vocabulary, buffers.proposalsPerLane, buffers.candidatesPerProposal, j - 1,
                                  j == draft.steps, draftHead ? draftHead->tokens : metal::MetalBuffer{});
       }

@@ -517,4 +517,12 @@ void QwenTarget::addMtpDraft(metal::CommandGraph &, QwenTargetVerifyBuffers,
   throw std::logic_error("the target has no MTP head");
 }
 
+void QwenTarget::addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
+                             const kv::PageStorage &kv, std::span<const kv::ChunkedPrefillParams> chunks,
+                             uint32_t lanes, std::array<uint32_t, ExecutionLimits::maximumBatchWidth> liveRows) const {
+  if (!std::all_of(liveRows.begin(), liveRows.end(), [&](uint32_t rows) { return rows == liveRows[0]; }))
+    throw std::invalid_argument("the target does not support per-lane verify bounds");
+  addVerify(graph, std::move(buffers), kv, chunks, lanes, liveRows[0]);
+}
+
 } // namespace splash::model

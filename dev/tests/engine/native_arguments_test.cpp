@@ -352,6 +352,23 @@ int main(int argc, char **argv) {
       if (saved) setenv(name, saved->c_str(), 1);
       else unsetenv(name);
     }
+    {
+      constexpr const char *name = "SPLASH_LIVE_VERIFY_THRESHOLD";
+      const char *old = std::getenv(name);
+      const std::optional<std::string> saved = old ? std::optional<std::string>(old) : std::nullopt;
+      unsetenv(name);
+      require(model::mtpThresholdFromEnvironment() == 0, "MTP threshold defaults off");
+      for (const char *value : {"", "-0.1", "1.1", "nan", "inf", "0.2junk"}) {
+        setenv(name, value, 1);
+        require(model::mtpThresholdFromEnvironment() == 0, "invalid MTP threshold stays off");
+      }
+      for (const char *value : {"0", "0.1", "0.3", "1"}) {
+        setenv(name, value, 1);
+        require(model::mtpThresholdFromEnvironment() == std::strtof(value, nullptr), "MTP threshold parse");
+      }
+      if (saved) setenv(name, saved->c_str(), 1);
+      else unsetenv(name);
+    }
     testRefusals();
     testModelDirectoryRoles();
     std::cout << "native arguments tests passed\n";

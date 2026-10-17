@@ -951,10 +951,30 @@ void mtpTest(MetalBackend &backend) {
   logits[(1 * laneRows + 4) * uint64_t{vocabulary} + 3] = 50.0f; // tie: the lower id
   std::vector<uint32_t> cand(lanes * proposals * candidates, 7);
   MetalBuffer candidateBuffer = upload(backend, cand);
+  MetalBuffer confidence = scratch(backend, lanes * proposals * sizeof(float));
   CommandGraph argmax;
-  ops::Qwen4::addMtpArgmax(argmax, upload(backend, logits), proposedBuffer, candidateBuffer, lanes, laneRows,
+  ops::Qwen4::addMtpArgmax(argmax, upload(backend, logits), proposedBuffer, candidateBuffer, confidence, lanes, laneRows,
                            vocabulary, proposals, candidates, 4, true);
   run(backend, argmax);
+  const auto softmaxMax = [](const std::vector<float> &values) {
+    const double maximum = *std::max_element(values.begin(), values.end());
+    double mass = 0;
+    for (float value : values) {
+      if (!std::isfinite(value)) return std::numeric_limits<double>::quiet_NaN();
+      mass += std::exp(double(value) - maximum);
+    }
+    return 1 / mass;
+  };
+  const auto checkConfidence = [&](const std::vector<float> &values, uint32_t lane, uint32_t row) {
+    const float got = download<float>(confidence, lanes * proposals)[lane * proposals + row];
+    const double want = softmaxMax(values);
+    check(std::isfinite(want) ? std::abs(got - want) <= 1e-6 : !std::isfinite(got),
+          "MTP confidence: CPU softmax maximum within 1e-6 (or invalid)");
+  };
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    const auto begin = logits.begin() + (lane * laneRows + 4) * uint64_t{vocabulary};
+    checkConfidence({begin, begin + vocabulary}, lane, 4);
+  }
   const auto p = download<uint32_t>(proposedBuffer, lanes * proposals);
   const auto c = download<uint32_t>(candidateBuffer, lanes * proposals * candidates);
   bool okArgmax = true;
@@ -981,11 +1001,16 @@ void mtpTest(MetalBackend &backend) {
   MetalBuffer mappedProposed = upload(backend, mappedProposals), mappedCandidate = upload(backend, mappedCandidates);
   MetalBuffer draftLogitBuffer = upload(backend, draftLogits);
   CommandGraph mapped;
-  ops::Qwen4::addMtpArgmax(mapped, draftLogitBuffer, mappedProposed, mappedCandidate, lanes, laneRows, drafted,
+  ops::Qwen4::addMtpArgmax(mapped, draftLogitBuffer, mappedProposed, mappedCandidate, confidence, lanes, laneRows, drafted,
                            proposals, candidates, 2, false, upload(backend, draftTokens));
-  ops::Qwen4::addMtpArgmax(mapped, draftLogitBuffer, mappedProposed, mappedCandidate, lanes, laneRows, drafted,
+  ops::Qwen4::addMtpArgmax(mapped, draftLogitBuffer, mappedProposed, mappedCandidate, confidence, lanes, laneRows, drafted,
                            proposals, candidates, 3, true, upload(backend, draftTokens));
   run(backend, mapped);
+  for (uint32_t lane = 0; lane < lanes; ++lane)
+    for (uint32_t row : {2u, 3u}) {
+      const auto begin = draftLogits.begin() + (lane * laneRows + row) * uint64_t{drafted};
+      checkConfidence({begin, begin + drafted}, lane, row);
+    }
   const auto mp = download<uint32_t>(mappedProposed, lanes * proposals);
   const auto mc = download<uint32_t>(mappedCandidate, lanes * proposals * candidates);
   // Lane 0's row 3: its own argmax over the random logits.
@@ -1020,11 +1045,18 @@ void mtpTest(MetalBackend &backend) {
   std::vector<uint32_t> contextProposals(lanes * proposals, 5), contextCandidates(lanes * proposals * candidates, 7);
   MetalBuffer contextProposed = upload(backend, contextProposals), contextCandidate = upload(backend, contextCandidates);
   CommandGraph withContext;
-  ops::Qwen4::addMtpArgmaxContext(withContext, upload(backend, vocabularyLogits), contextProposed, contextCandidate,
+  ops::Qwen4::addMtpArgmaxContext(withContext, upload(backend, vocabularyLogits), contextProposed, contextCandidate, confidence,
                                   upload(backend, draftTokens), upload(backend, contextLogits),
                                   upload(backend, contextTokens), upload(backend, info), lanes, laneRows, drafted,
                                   capacity, slot, proposals, candidates, 1, true);
   run(backend, withContext);
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    const auto begin = vocabularyLogits.begin() + (lane * laneRows + 1) * uint64_t{drafted};
+    std::vector<float> values(begin, begin + drafted);
+    const auto contextBegin = contextLogits.begin() + lane * slot + capacity;
+    values.insert(values.end(), contextBegin, contextBegin + info[lane * 4]);
+    checkConfidence(values, lane, 1);
+  }
   const auto cp = download<uint32_t>(contextProposed, lanes * proposals);
   bool okContext = true;
   for (uint32_t i = 1; i < proposals; ++i) {

@@ -278,10 +278,18 @@ struct MoE final {
   // first_row, last_row); those rows' outputs are not theirs.
   static void add(metal::CommandGraph &graph, const MoeBuffers &buffers,
                   const BlockMoeWeights &weights, const MoePlan &plan, uint32_t firstRow = 0,
-                  uint32_t lastRow = 0);
+                  uint32_t lastRow = 0, std::span<const uint32_t> lastRows = {});
   static void addRouting(metal::CommandGraph &graph, const MoeBuffers &buffers,
                          const BlockMoeWeights &weights, const MoePlan &plan, uint32_t firstRow = 0,
-                         uint32_t lastRow = 0);
+                         uint32_t lastRow = 0, std::span<const uint32_t> lastRows = {});
+  static void add(metal::CommandGraph &graph, const MoeBuffers &buffers,
+                  const BlockMoeWeights &weights, const MoePlan &plan, std::span<const uint32_t, 4> lastRows) {
+    add(graph, buffers, weights, plan, 0, 0, lastRows);
+  }
+  static void addRouting(metal::CommandGraph &graph, const MoeBuffers &buffers,
+                         const BlockMoeWeights &weights, const MoePlan &plan, std::span<const uint32_t, 4> lastRows) {
+    addRouting(graph, buffers, weights, plan, 0, 0, lastRows);
+  }
   static void addRouted(metal::CommandGraph &graph, const MoeBuffers &buffers,
                         const BlockMoeWeights &weights, const MoePlan &plan);
   // The routing of `rows` rows of `input` by a block's `router` and

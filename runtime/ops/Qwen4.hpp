@@ -115,7 +115,7 @@ struct Qwen4 final {
   // logits are a draft vocabulary's, ascending token ids of which `tokens`
   // holds (uint32 each), and the proposal is the argmax's token.
   static void addMtpArgmax(metal::CommandGraph &graph, metal::MetalBuffer logits, metal::MetalBuffer proposals,
-                           metal::MetalBuffer candidates, uint32_t lanes, uint32_t laneRows, uint32_t vocabulary,
+                           metal::MetalBuffer candidates, metal::MetalBuffer confidence, uint32_t lanes, uint32_t laneRows, uint32_t vocabulary,
                            uint32_t proposalsPerLane, uint32_t candidatesPerProposal, uint32_t row, bool last,
                            metal::MetalBuffer tokens = {});
   // The same over the draft vocabulary (`tokens`, `vocabulary` logits) and,
@@ -124,7 +124,7 @@ struct Qwen4 final {
   // (`capacity` each) and each lane's Qwen4MtpContextLane in `lanesInfo`.
   // Ties go toward the lower token.
   static void addMtpArgmaxContext(metal::CommandGraph &graph, metal::MetalBuffer logits, metal::MetalBuffer proposals,
-                                  metal::MetalBuffer candidates, metal::MetalBuffer tokens,
+                                  metal::MetalBuffer candidates, metal::MetalBuffer confidence, metal::MetalBuffer tokens,
                                   metal::MetalBuffer contextLogits, metal::MetalBuffer contextTokens,
                                   metal::MetalBuffer lanesInfo, uint32_t lanes, uint32_t laneRows,
                                   uint32_t vocabulary, uint32_t capacity, uint32_t logitsSlot,

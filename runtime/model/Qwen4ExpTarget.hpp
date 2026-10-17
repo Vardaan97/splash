@@ -36,6 +36,9 @@ public:
   void prepareVerifyLane(uint32_t lane, uint64_t position, const QwenTargetRequest &request) override;
   void addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers, const kv::PageStorage &kv,
                  std::span<const kv::ChunkedPrefillParams> chunks, uint32_t lanes, uint32_t liveRows = 0) const override;
+  void addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers, const kv::PageStorage &kv,
+                   std::span<const kv::ChunkedPrefillParams> chunks, uint32_t lanes,
+                   std::array<uint32_t, ExecutionLimits::maximumBatchWidth> liveRows) const override;
   // The hidden rows are the final mix, which the head reads as they are.
   void addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden, metal::MetalBuffer finalHidden,
                     metal::MetalBuffer logits, uint32_t lanes, ops::LinearScratch scratch) const override;

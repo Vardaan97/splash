@@ -357,6 +357,8 @@ enum class DecodeTensor : uint32_t {
   // rows, and its context (Qwen4MtpContextLane).
   DraftContextLogits,
   DraftContextInfo,
+  // Top-1 probabilities of each lane's MTP proposals, read after the draft.
+  DraftConfidence,
   // A GDN layer's packed input projection rows, which its mixer reads.
   GdnPacked,
   // Indexed by state lane, like PageTable: the lane's two decode tape slots

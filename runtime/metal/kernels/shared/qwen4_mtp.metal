@@ -89,6 +89,43 @@ kernel void qwen4_mtp_widen(device const bfloat *projected [[buffer(0)]],
   streams[index] = float(projected[(ulong(s) * p.lane_rows + row) * p.hidden + d]);
 }
 
+// A stable softmax mass, kept separate from the existing argmax reduction.
+inline void qwen4_mtp_mass(thread float &maximum, thread float &mass, float value) {
+  if (!isfinite(value)) {
+    // NaNs and positive infinity make trimming unsafe. Negative infinity
+    // contributes no mass (and an entirely empty row remains invalid).
+    if (isnan(value) || value == INFINITY) mass = NAN;
+    return;
+  }
+  const float next = max(maximum, value);
+  mass = mass * exp(maximum - next) + exp(value - next);
+  maximum = next;
+}
+
+inline void qwen4_mtp_mass_merge(thread float &maximum, thread float &mass, float other, float other_mass) {
+  if (isnan(mass) || isnan(other_mass)) { mass = NAN; return; }
+  if (other_mass == 0) return;
+  if (mass == 0) { maximum = other; mass = other_mass; return; }
+  const float next = max(maximum, other);
+  mass = mass * exp(maximum - next) + other_mass * exp(other - next);
+  maximum = next;
+}
+
+inline float qwen4_mtp_probability(float maximum, float mass, uint tid, uint lane, uint sg, uint threads,
+                                    threadgroup float *maxima, threadgroup float *masses) {
+  for (uint offset = 16; offset > 0; offset >>= 1) {
+    const float other = simd_shuffle_down(maximum, offset);
+    const float other_mass = simd_shuffle_down(mass, offset);
+    if (lane + offset < 32) qwen4_mtp_mass_merge(maximum, mass, other, other_mass);
+  }
+  if (lane == 0) { maxima[sg] = maximum; masses[sg] = mass; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid != 0) return 0;
+  for (uint g = 1; g < (threads + 31) / 32; ++g)
+    qwen4_mtp_mass_merge(maximum, mass, maxima[g], masses[g]);
+  return mass > 0 && isfinite(mass) ? 1.0f / mass : NAN;
+}
+
 // One threadgroup per lane: the argmax of the lane's logits row p.row, over
 // p.vocabulary logits: the tokens themselves or, Mapped, the logits of a
 // draft vocabulary's tokens, ascending, of which `tokens` names each. Ties
@@ -97,19 +134,22 @@ kernel void qwen4_mtp_widen(device const bfloat *projected [[buffer(0)]],
 // candidate. A row without a finite logit drafts 0.
 template <bool Mapped>
 inline void qwen4_mtp_argmax_row(device const float *logits, device uint *proposals, device uint *candidates,
-                                 device const uint *tokens, constant Qwen4MtpParams &p, uint lane_index, uint tid,
+                                 device const uint *tokens, device float *confidence, constant Qwen4MtpParams &p, uint lane_index, uint tid,
                                  uint threads, uint lane, uint sg, threadgroup float *best_values,
-                                 threadgroup uint *best_ids) {
+                                 threadgroup uint *best_ids, threadgroup float *maxima, threadgroup float *masses) {
   device const float *x = logits + (ulong(lane_index) * p.lane_rows + p.row) * p.vocabulary;
+  float maximum = -INFINITY, mass = 0;
   float best = -INFINITY;
   uint id = 0xffffffffu;
   for (uint v = tid; v < p.vocabulary; v += threads) {
     const float value = x[v];
+    qwen4_mtp_mass(maximum, mass, value);
     if (value > best) {
       best = value;
       id = v;
     }
   }
+  const float probability = qwen4_mtp_probability(maximum, mass, tid, lane, sg, threads, maxima, masses);
   for (uint offset = 16; offset > 0; offset >>= 1) {
     const float other = simd_shuffle_down(best, offset);
     const uint other_id = simd_shuffle_down(id, offset);
@@ -134,6 +174,7 @@ inline void qwen4_mtp_argmax_row(device const float *logits, device uint *propos
   else if (Mapped) id = tokens[id];
   const uint end = p.last ? p.proposals : p.row + 1;
   for (uint slot = p.row; slot < end; ++slot) {
+    confidence[lane_index * p.proposals + slot] = probability;
     proposals[lane_index * p.proposals + slot] = id;
     candidates[(lane_index * p.proposals + slot) * p.candidates] = id;
   }
@@ -142,7 +183,8 @@ inline void qwen4_mtp_argmax_row(device const float *logits, device uint *propos
 kernel void qwen4_mtp_argmax(device const float *logits [[buffer(0)]],
                              device uint *proposals [[buffer(1)]],
                              device uint *candidates [[buffer(2)]],
-                             constant Qwen4MtpParams &p [[buffer(3)]],
+                             device float *confidence [[buffer(3)]],
+                             constant Qwen4MtpParams &p [[buffer(4)]],
                              uint lane_index [[threadgroup_position_in_grid]],
                              uint tid [[thread_index_in_threadgroup]],
                              uint threads [[threads_per_threadgroup]],
@@ -150,15 +192,17 @@ kernel void qwen4_mtp_argmax(device const float *logits [[buffer(0)]],
                              uint sg [[simdgroup_index_in_threadgroup]]) {
   threadgroup float best_values[32];
   threadgroup uint best_ids[32];
-  qwen4_mtp_argmax_row<false>(logits, proposals, candidates, nullptr, p, lane_index, tid, threads, lane, sg,
-                              best_values, best_ids);
+  threadgroup float maxima[32], masses[32];
+  qwen4_mtp_argmax_row<false>(logits, proposals, candidates, nullptr, confidence, p, lane_index, tid, threads, lane, sg,
+                              best_values, best_ids, maxima, masses);
 }
 
 kernel void qwen4_mtp_argmax_mapped(device const float *logits [[buffer(0)]],
                                     device uint *proposals [[buffer(1)]],
                                     device uint *candidates [[buffer(2)]],
                                     device const uint *tokens [[buffer(3)]],
-                                    constant Qwen4MtpParams &p [[buffer(4)]],
+                                    device float *confidence [[buffer(4)]],
+                                    constant Qwen4MtpParams &p [[buffer(5)]],
                                     uint lane_index [[threadgroup_position_in_grid]],
                                     uint tid [[thread_index_in_threadgroup]],
                                     uint threads [[threads_per_threadgroup]],
@@ -166,8 +210,9 @@ kernel void qwen4_mtp_argmax_mapped(device const float *logits [[buffer(0)]],
                                     uint sg [[simdgroup_index_in_threadgroup]]) {
   threadgroup float best_values[32];
   threadgroup uint best_ids[32];
-  qwen4_mtp_argmax_row<true>(logits, proposals, candidates, tokens, p, lane_index, tid, threads, lane, sg,
-                             best_values, best_ids);
+  threadgroup float maxima[32], masses[32];
+  qwen4_mtp_argmax_row<true>(logits, proposals, candidates, tokens, confidence, p, lane_index, tid, threads, lane, sg,
+                             best_values, best_ids, maxima, masses);
 }
 
 // Takes (value, t) as the best so far when it is larger, or as large with a
@@ -195,7 +240,8 @@ kernel void qwen4_mtp_argmax_context(device const float *logits [[buffer(0)]],
                                      device const float *context_logits [[buffer(4)]],
                                      device const uint *context_tokens [[buffer(5)]],
                                      device const Qwen4MtpContextLane *lanes [[buffer(6)]],
-                                     constant Qwen4MtpParams &p [[buffer(7)]],
+                                     device float *confidence [[buffer(7)]],
+                                     constant Qwen4MtpParams &p [[buffer(8)]],
                                      uint lane_index [[threadgroup_position_in_grid]],
                                      uint tid [[thread_index_in_threadgroup]],
                                      uint threads [[threads_per_threadgroup]],
@@ -203,15 +249,24 @@ kernel void qwen4_mtp_argmax_context(device const float *logits [[buffer(0)]],
                                      uint sg [[simdgroup_index_in_threadgroup]]) {
   threadgroup float best_values[32];
   threadgroup uint best_tokens[32];
+  threadgroup float maxima[32], masses[32];
+  float maximum = -INFINITY, mass = 0;
   float best = -INFINITY;
   uint token = 0xffffffffu;
   device const float *x = logits + (ulong(lane_index) * p.lane_rows + p.row) * p.vocabulary;
-  for (uint v = tid; v < p.vocabulary; v += threads) qwen4_consider(best, token, x[v], tokens[v]);
+  for (uint v = tid; v < p.vocabulary; v += threads) {
+    qwen4_mtp_mass(maximum, mass, x[v]);
+    qwen4_consider(best, token, x[v], tokens[v]);
+  }
   const Qwen4MtpContextLane own = lanes[lane_index];
   const uint count = min(own.count, p.context_capacity);
   device const float *y = context_logits + ulong(lane_index) * p.context_slot + ulong(p.row) * p.context_capacity;
   device const uint *named = context_tokens + ulong(own.state_lane) * p.context_capacity;
-  for (uint v = tid; v < count; v += threads) qwen4_consider(best, token, y[v], named[v]);
+  for (uint v = tid; v < count; v += threads) {
+    qwen4_mtp_mass(maximum, mass, y[v]);
+    qwen4_consider(best, token, y[v], named[v]);
+  }
+  const float probability = qwen4_mtp_probability(maximum, mass, tid, lane, sg, threads, maxima, masses);
   for (uint offset = 16; offset > 0; offset >>= 1) {
     const float other = simd_shuffle_down(best, offset);
     const uint other_token = simd_shuffle_down(token, offset);
@@ -229,6 +284,7 @@ kernel void qwen4_mtp_argmax_context(device const float *logits [[buffer(0)]],
   if (token == 0xffffffffu) token = 0;
   const uint end = p.last ? p.proposals : p.row + 1;
   for (uint slot = p.row; slot < end; ++slot) {
+    confidence[lane_index * p.proposals + slot] = probability;
     proposals[lane_index * p.proposals + slot] = token;
     candidates[(lane_index * p.proposals + slot) * p.candidates] = token;
   }

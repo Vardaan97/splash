@@ -205,10 +205,11 @@ void Qwen4::addMtpWiden(metal::CommandGraph &graph, metal::MetalBuffer projected
 }
 
 void Qwen4::addMtpArgmax(metal::CommandGraph &graph, metal::MetalBuffer logits, metal::MetalBuffer proposals,
-                         metal::MetalBuffer candidates, uint32_t lanes, uint32_t laneRows, uint32_t vocabulary,
+                         metal::MetalBuffer candidates, metal::MetalBuffer confidence, uint32_t lanes, uint32_t laneRows, uint32_t vocabulary,
                          uint32_t proposalsPerLane, uint32_t candidatesPerProposal, uint32_t row, bool last,
                          metal::MetalBuffer tokens) {
-  if (!lanes || !vocabulary || !candidatesPerProposal || row >= laneRows || row >= proposalsPerLane)
+  if (!lanes || !vocabulary || !candidatesPerProposal || row >= laneRows || row >= proposalsPerLane ||
+      confidence.sizeBytes() < uint64_t{lanes} * proposalsPerLane * sizeof(float))
     throw std::invalid_argument("invalid MTP argmax");
   if (tokens && tokens.sizeBytes() < uint64_t{vocabulary} * sizeof(uint32_t))
     throw std::invalid_argument("MTP draft vocabulary is shorter than its logits");
@@ -216,15 +217,15 @@ void Qwen4::addMtpArgmax(metal::CommandGraph &graph, metal::MetalBuffer logits, 
                               candidatesPerProposal, row, last ? 1u : 0u, 0, 0, 0, {0, 0, 0}};
   if (tokens)
     graph.add("qwen4_mtp_argmax_mapped",
-              {std::move(logits), std::move(proposals), std::move(candidates), std::move(tokens)}, params,
+              {std::move(logits), std::move(proposals), std::move(candidates), std::move(tokens), std::move(confidence)}, params,
               {lanes, 1, 1}, {1024, 1, 1});
   else
-    graph.add("qwen4_mtp_argmax", {std::move(logits), std::move(proposals), std::move(candidates)}, params,
+    graph.add("qwen4_mtp_argmax", {std::move(logits), std::move(proposals), std::move(candidates), std::move(confidence)}, params,
               {lanes, 1, 1}, {1024, 1, 1});
 }
 
 void Qwen4::addMtpArgmaxContext(metal::CommandGraph &graph, metal::MetalBuffer logits, metal::MetalBuffer proposals,
-                                metal::MetalBuffer candidates, metal::MetalBuffer tokens,
+                                metal::MetalBuffer candidates, metal::MetalBuffer confidence, metal::MetalBuffer tokens,
                                 metal::MetalBuffer contextLogits, metal::MetalBuffer contextTokens,
                                 metal::MetalBuffer lanesInfo, uint32_t lanes, uint32_t laneRows, uint32_t vocabulary,
                                 uint32_t capacity, uint32_t logitsSlot, uint32_t proposalsPerLane,
@@ -232,13 +233,14 @@ void Qwen4::addMtpArgmaxContext(metal::CommandGraph &graph, metal::MetalBuffer l
   if (!lanes || !vocabulary || !capacity || !candidatesPerProposal || row >= laneRows || row >= proposalsPerLane ||
       logitsSlot < uint64_t{laneRows} * capacity || tokens.sizeBytes() < uint64_t{vocabulary} * sizeof(uint32_t) ||
       contextLogits.sizeBytes() < (uint64_t{lanes - 1} * logitsSlot + uint64_t{laneRows} * capacity) * sizeof(float) ||
-      lanesInfo.sizeBytes() < uint64_t{lanes} * sizeof(Qwen4MtpContextLane))
+      lanesInfo.sizeBytes() < uint64_t{lanes} * sizeof(Qwen4MtpContextLane) ||
+      confidence.sizeBytes() < uint64_t{lanes} * proposalsPerLane * sizeof(float))
     throw std::invalid_argument("invalid MTP context argmax");
   const Qwen4MtpParams params{lanes * laneRows, 0, 0, laneRows, 0, vocabulary, proposalsPerLane,
                               candidatesPerProposal, row, last ? 1u : 0u, 0, capacity, logitsSlot, {0, 0, 0}};
   graph.add("qwen4_mtp_argmax_context",
             {std::move(logits), std::move(proposals), std::move(candidates), std::move(tokens),
-             std::move(contextLogits), std::move(contextTokens), std::move(lanesInfo)},
+             std::move(contextLogits), std::move(contextTokens), std::move(lanesInfo), std::move(confidence)},
             params, {lanes, 1, 1}, {1024, 1, 1});
 }
 
