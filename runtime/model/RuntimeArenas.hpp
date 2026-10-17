@@ -49,6 +49,10 @@ inline constexpr uint32_t kMaximumPageTableEntries =
 struct RuntimeGeometry final {
   QwenTargetGeometry target;
   DFlashDraftLayout draft;
+  // Whether a DFlash2 draft runs; without one (a target drafting with its
+  // own head), `draft` is the placeholder whose operator workspaces are
+  // never planned (model::nullDraftLayout).
+  bool hasDraft = true;
   // The chunks of a prefill command: a group's for a target whose experts
   // stream, otherwise one.
   uint32_t prefillChunks = 1;
@@ -65,6 +69,7 @@ struct RuntimeGeometry final {
         model.target);
     result.target.kvLayout = model.targetKvLayout(kvFormat);
     result.target.stateLayout = model.stateLayout(stateFormat).target;
+    result.hasDraft = model.hasDraft();
     if (model.expertStore()) result.prefillChunks = kPrefillGroupChunks;
     result.targetScratch = std::visit(
         [&](const auto &weights) { return qwenTargetScratchBytes(weights, result.target, result.prefillChunks); },

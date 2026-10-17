@@ -159,6 +159,33 @@ def split_gguf(files, variant):
     return [parts[number][1] for number in sorted(parts)]
 
 
+# The MTP head a GGUF repository publishes beside its target, as Unsloth
+# does Qwen3.8-Flash-Next's: MTP/mtp-MODEL-shared-Q8_0.gguf, the head's own
+# block sharing the target's embedding and output, which the native loader
+# reads (GgufTarget.cpp GgufMtpLoader).
+MTP_HEAD_GGUF = re.compile(r"^mtp/mtp-.*-shared-q8_0\.gguf$", re.IGNORECASE)
+
+
+def select_mtp(files):
+    """The MTP head among a repository's files (MTP_HEAD_GGUF): its name, or
+    None without exactly one."""
+    heads = sorted(n for n in files if MTP_HEAD_GGUF.match(n))
+    return heads[0] if len(heads) == 1 else None
+
+
+def drafts_with_mtp(family, selection):
+    """Whether a selection of a family's model drafts with the model's MTP
+    head in place of a DFlash2 draft: when --draft-model names it (mtp), or
+    when no draft is named and none is released for the family. A family
+    without one is refused the name."""
+    if selection.draft_model == models.MTP_HEAD and not family.mtp_head:
+        raise models.ModelError(f"{family.name} has no MTP head to draft with")
+    return family.mtp_head and (
+        selection.draft_model == models.MTP_HEAD
+        or (selection.draft_model is None and family.draft_repo is None)
+    )
+
+
 def select_vision(repo):
     """The name and header of the GGUF repository's vision projector, chosen
     by content among its root GGUF files named mmproj, whatever the publisher
@@ -254,6 +281,10 @@ def _gguf_target(repo, variant, language_only, scratch):
     # The family bounds the layers whose tensors the screening lists.
     family = check_model("gguf", "none", config, gguf_metadata=metadata)
     gguf.require_loadable(header)
+    # The MTP head of a family that drafts with one, in mtp/
+    # (ModelDescriptor.mm, ModelFactory.cpp).
+    if family.mtp_head and (mtp := select_mtp(repo.files)):
+        files["mtp/" + Path(mtp).name] = mtp
     vision_format = "none"
     if not language_only:
         files[assembly.GGUF_VISION], vision_header = select_vision(repo)
@@ -442,7 +473,9 @@ def _start_installed(selection, target, installed):
         )
     recorded = installed["sources"]["target"]
     family = families.named(installed["family"])
-    draft = family and _resolve_draft(family, selection, installed, target)
+    draft = None
+    if family and not drafts_with_mtp(family, selection):
+        draft = _resolve_draft(family, selection, installed, target)
     if draft and draft.unreachable_reason:
         print(
             f"Could not reach the Hub ({draft.unreachable_reason}); "
@@ -535,12 +568,21 @@ def _install(selection, repo, installed, draft=None):
         target = inspect_target(
             repo, selection.variant, selection.language_only, Path(scratch)
         )
-        if draft is None:
-            draft = _resolve_draft(target.family, selection, installed, repo)
-        draft, files = _draft(target, installed, draft)
+        if drafts_with_mtp(target.family, selection):
+            if not any(path.startswith("mtp/") for path in target.files):
+                raise models.ModelError(
+                    f"{repo.name} publishes no MTP head "
+                    "(MTP/mtp-*-shared-Q8_0.gguf) for its target; name a "
+                    "DFlash2 draft with --draft-model"
+                )
+            draft, files = None, {}
+        else:
+            if draft is None:
+                draft = _resolve_draft(target.family, selection, installed, repo)
+            draft, files = _draft(target, installed, draft)
         print(
             f"Installing {selection.model} as {target.family.name} ({target.format}); "
-            f"draft {draft.name}; "
+            f"draft {draft.name if draft else 'the MTP head'}; "
             f"vision {'disabled' if selection.language_only else 'enabled'}.",
             flush=True,
         )
@@ -552,7 +594,8 @@ def _install(selection, repo, installed, draft=None):
         "family": target.family.name,
         "target_format": target.format,
         "vision_format": target.vision_format,
-        "sources": {"target": repo.identity(), "draft": draft.identity()},
+        "sources": {"target": repo.identity()}
+        | ({"draft": draft.identity()} if draft else {}),
     }
     models_root = selection.models_root
     models_root.mkdir(parents=True, exist_ok=True)
@@ -590,8 +633,10 @@ def _changes(installed, family, draft):
     if family is None:
         return [f"no supported family is named {installed['family']}"]
     changes = []
-    recorded = installed["sources"]["draft"]
-    if draft.identity() != recorded:
+    recorded = installed["sources"].get("draft")
+    if (draft is None) != (recorded is None):
+        changes.append("its draft changed")
+    elif draft is not None and draft.identity() != recorded:
         changes.append(
             f"{draft.name} moved from {recorded['revision'][:12]} to {draft.revision[:12]}"
             if draft.name == recorded["repo"]
@@ -618,7 +663,7 @@ def _resolve_draft(family, selection, installed, target):
             f"no DFlash2 draft is released for {family.name}; "
             "name one with --draft-model"
         )
-    recorded = installed and installed["sources"]["draft"]
+    recorded = installed and installed["sources"].get("draft")
     asked = _answered(target)
     if recorded and not asked:
         return hub.Repository(recorded["repo"], recorded["revision"], frozenset())
@@ -649,7 +694,7 @@ def _draft(target, installed, draft):
     the installed one, which is kept too when draft cannot be fetched
     (downloaded and checked for the target)."""
     family = target.family
-    recorded = installed and installed["sources"]["draft"]
+    recorded = installed and installed["sources"].get("draft")
     if draft.identity() != recorded:
         try:
             with hub.as_model_errors(f"cannot fetch the {family.name} draft"):

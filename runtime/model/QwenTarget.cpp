@@ -130,12 +130,12 @@ void QwenTarget::addStateCommit(metal::CommandGraph &, QwenTargetCommitBuffers, 
 }
 
 void QwenTarget::requireLayers(size_t layers, size_t attentionLayers) const {
-  if (layers != geometry_.layers || attentionLayers != geometry_.kvLayout.attentionLayers)
+  if (layers != geometry_.layers || attentionLayers != geometry_.trunkAttentionLayers())
     throw std::invalid_argument("Qwen target weights do not match execution geometry");
 }
 
 void QwenTarget::requireLayerPartition(uint32_t gdnLayers, uint32_t attentionLayers) const {
-  if (gdnLayers != geometry_.stateLayout.layers || attentionLayers != geometry_.kvLayout.attentionLayers)
+  if (gdnLayers != geometry_.stateLayout.layers || attentionLayers != geometry_.trunkAttentionLayers())
     throw std::logic_error("Qwen target layer partition mismatch");
 }
 
@@ -379,7 +379,7 @@ public:
   }
 
   void addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers, const kv::PageStorage &kv,
-                 std::span<const kv::ChunkedPrefillParams> chunks, uint32_t lanes) const override {
+                 std::span<const kv::ChunkedPrefillParams> chunks, uint32_t lanes, uint32_t = 0) const override {
     VerifyStep step = verifyStep(graph, buffers, kv, chunks, lanes);
     for (uint32_t index = 0; index < geometry_.layers; ++index) {
       const Layer &layer = weights_.layers[index];
@@ -510,5 +510,11 @@ template std::unique_ptr<QwenTarget> makeQwenTarget(const Qwen3_8Weights &, cons
                                                     metal::MetalBackend &, const ops::ExecutionPlans &, uint32_t);
 template std::unique_ptr<QwenTarget> makeQwenTarget(const Qwen3_6MoeWeights &, const QwenTargetGeometry &,
                                                     metal::MetalBackend &, const ops::ExecutionPlans &, uint32_t);
+
+void QwenTarget::addMtpDraft(metal::CommandGraph &, QwenTargetVerifyBuffers,
+                              const kv::PageStorage &, std::span<const kv::ChunkedPrefillParams>,
+                              uint32_t, QwenTargetMtpDraft) const {
+  throw std::logic_error("the target has no MTP head");
+}
 
 } // namespace splash::model

@@ -63,7 +63,8 @@ in Chat. Anthropic Messages requests reason only when they set `thinking`.
 
 Splash supports these model families, each decoding with a DFlash2 draft: the
 one released for the family, selected automatically, or the one
-`--draft-model` names.
+`--draft-model` names. Qwen3.8-Flash-Next, for which none is released yet,
+drafts with its own MTP head instead.
 
 | Model | GGUF example | MLX 4-bit |
 | --- | --- | --- |
@@ -71,16 +72,19 @@ one released for the family, selected automatically, or the one
 | Qwen3.6-35B-A3B | `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M` | `mlx-community/Qwen3.6-35B-A3B-4bit` |
 | Qwen3.8-Flash-Next | `unsloth/Qwen3.8-Flash-Next-GGUF:UD-IQ3_XXS` | — |
 
-No DFlash2 draft of Qwen3.8-Flash-Next is released yet: its installation
-names one with `--draft-model`, a Hub repository or a local directory
-([Drafts](DEVELOPMENT.md#drafts)). Its routed experts and PLE n-gram table
-can stay on the SSD: `UD-IQ3_XXS` runs on a 36 GB Mac with
+No DFlash2 draft of Qwen3.8-Flash-Next is released yet: without
+`--draft-model`, its installation takes the MTP head its repository publishes
+beside the target (`MTP/mtp-*-shared-Q8_0.gguf`, as Unsloth's does) and
+decodes with it, up to seven proposals a cycle at an adaptive depth
+([Drafts](DEVELOPMENT.md#drafts)); `--draft-model` names a DFlash2 draft, a
+Hub repository or a local directory, in its place. Its routed experts and PLE
+n-gram table can stay on the SSD: `UD-IQ3_XXS` runs on a 36 GB Mac with
 `--expert-memory 16G --ple-memory 2G`, and on a 64 GB Mac
 `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:Q2_0` keeps every expert in
 memory with `--ple-memory 2G`.
 
 ```bash
-splash serve --model unsloth/Qwen3.8-Flash-Next-GGUF:UD-IQ3_XXS --draft-model ./Qwen3.8-Flash-Next-DFlash2 --expert-memory 16G --ple-memory 2G
+splash serve --model unsloth/Qwen3.8-Flash-Next-GGUF:UD-IQ3_XXS --expert-memory 16G --ple-memory 2G
 ```
 
 Unsloth GGUF variants span **1–8 bits**, including mixed-precision UD formats

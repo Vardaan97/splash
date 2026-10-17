@@ -34,7 +34,7 @@ public:
                                                            const kv::PageStorage &kv, ops::AneFfn *aneFfn) override;
   void prepareVerifyLane(uint32_t lane, uint64_t position, const QwenTargetRequest &request) override;
   void addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers, const kv::PageStorage &kv,
-                 std::span<const kv::ChunkedPrefillParams> chunks, uint32_t lanes) const override;
+                 std::span<const kv::ChunkedPrefillParams> chunks, uint32_t lanes, uint32_t liveRows = 0) const override;
   // The hidden rows are the final mix, which the head reads as they are.
   void addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden, metal::MetalBuffer finalHidden,
                     metal::MetalBuffer logits, uint32_t lanes, ops::LinearScratch scratch) const override;
@@ -47,6 +47,9 @@ public:
   // from the convolution inputs and keys its verify wrote.
   void addStateCommit(metal::CommandGraph &graph, QwenTargetCommitBuffers buffers, uint32_t lanes) const override;
 
+  void addMtpDraft(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers, const kv::PageStorage &kv,
+                   std::span<const kv::ChunkedPrefillParams> chunks, uint32_t lanes,
+                   QwenTargetMtpDraft draft) const override;
   // The PLE rows of batch lane `lane`'s verify rows of the last step, each
   // row's heads' in order.
   [[nodiscard]] std::vector<uint32_t> verifyPleRows(uint32_t lane) const;
@@ -82,12 +85,12 @@ private:
 
   // A prefill step's mix of the streams through `hyper` into `output` and,
   // when it injects, the injection weights into the step's scratch.
-  void addPrefillMix(PrefillStep &step, const Qwen4HyperWeights &hyper, metal::MetalBuffer output) const;
+  void addPrefillMix(PrefillStep &step, const Qwen4HyperWeights &hyper, metal::MetalBuffer output, metal::MetalBuffer streams = {}) const;
   // A verify step's mix into `output`; its projections read the tables its
   // norm and low step write, and with `next`, the decode projection that
   // reads `output` first takes the table the mix writes (the returned input).
   ops::PreparedInput addVerifyMix(VerifyStep &step, const Qwen4HyperWeights &hyper, metal::MetalBuffer output,
-                                  const ops::Projection *next = nullptr) const;
+                                  const ops::Projection *next = nullptr, metal::MetalBuffer streams = {}) const;
   // The QSA of the attention layer the step reaches next: the indexer's
   // projections of the step's rows and the QSA keys and block index of each
   // sequence or lane (writing its rows' and its completed blocks' entries);
@@ -102,6 +105,10 @@ private:
   // scratch.pleSlots, with the table's own gather.
   void addPleGather(metal::CommandGraph &graph, const Qwen4Scratch &scratch, uint32_t count) const;
 
+  void addMtpPrefill(PrefillStep &step) const;
+  void addMtpVerify(VerifyStep &step, metal::MetalBuffer embedding, metal::MetalBuffer history,
+                    uint32_t limit, bool full, uint32_t firstRow = 0) const;
+  [[nodiscard]] metal::MetalBuffer mtpCarried(const metal::MetalBuffer &auxiliary) const;
   const Qwen4ExpWeights &weights_;
   // The step scratch and the inputs the target makes of a step's tokens.
   Qwen4Steps steps_;

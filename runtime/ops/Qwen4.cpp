@@ -1,4 +1,5 @@
 #include "ops/Qwen4.hpp"
+#include "ops/HyperConnection.hpp"
 
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Qwen4.h"
@@ -12,6 +13,15 @@
 #include <utility>
 
 namespace splash::ops {
+namespace {
+constexpr uint32_t kThreads = HYPER_CONNECTION_ROW_THREADS;
+uint32_t groups(uint32_t width) { return (width + kThreads - 1) / kThreads; }
+void requireShape(HyperShape shape) {
+  if (!shape.hidden || !shape.streams || shape.streams > HYPER_CONNECTION_MAXIMUM_STREAMS)
+    throw std::invalid_argument("invalid hyper-connection shape");
+}
+}
+
 
 namespace {
 
@@ -157,5 +167,62 @@ void Qwen4::addQsaCommit(metal::CommandGraph &graph, metal::MetalBuffer keys, ui
             {std::move(keys), std::move(retained), in[0], in[1], in[2], in[3], out[0], out[1], out[2], out[3]},
             params, {layers, lanes, 1}, {QWEN4_QSA_DIMENSION, 1, 1});
 }
+
+void Qwen4::addMtpTokens(metal::CommandGraph &graph, metal::MetalBuffer anchors, metal::MetalBuffer proposals,
+                         metal::MetalBuffer tokens, uint32_t lanes, uint32_t laneRows, uint32_t proposalsPerLane,
+                         uint32_t limit) {
+  if (!lanes || !limit || limit > laneRows || limit > proposalsPerLane + 1)
+    throw std::invalid_argument("invalid MTP step");
+  const uint32_t rows = lanes * laneRows;
+  const Qwen4MtpParams params{rows, 0, 0, laneRows, limit, 0, proposalsPerLane, 0, 0, 0, 0, 0};
+  graph.add("qwen4_mtp_tokens", {std::move(anchors), std::move(proposals), std::move(tokens)}, params,
+            {groups(rows), 1, 1}, {kThreads, 1, 1});
+}
+
+void Qwen4::addMtpInput(metal::CommandGraph &graph, metal::MetalBuffer embedding, metal::MetalBuffer carried,
+                        metal::MetalBuffer history, const NormWeights &embedNorm, const NormWeights &hiddenNorm,
+                        metal::MetalBuffer output, HyperShape shape, uint32_t rows, uint32_t limit,
+                        uint32_t rowOffset, uint32_t totalRows) {
+  requireShape(shape);
+  if (!rows || !limit || limit > rows || rowOffset + rows > totalRows) throw std::invalid_argument("invalid MTP input");
+  const Qwen4MtpParams params{rows, shape.hidden, shape.streams, totalRows, limit, 0, 0, 0, rowOffset, 0, 0, 0};
+  // A single row reads no history: it binds the carried streams instead.
+  graph.add("qwen4_mtp_input",
+            {std::move(embedding), carried, history ? std::move(history) : carried, embedNorm.buffer,
+             hiddenNorm.buffer, std::move(output)},
+            params, {rows, 1, 1}, {kThreads, 1, 1});
+}
+
+void Qwen4::addMtpWiden(metal::CommandGraph &graph, metal::MetalBuffer projected, metal::MetalBuffer streams,
+                        HyperShape shape, uint32_t rows) {
+  requireShape(shape);
+  if (!rows) throw std::invalid_argument("invalid MTP widen");
+  const Qwen4MtpParams params{rows, shape.hidden, shape.streams, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  graph.add("qwen4_mtp_widen", {std::move(projected), std::move(streams)}, params,
+            {groups(rows * shape.width()), 1, 1}, {kThreads, 1, 1});
+}
+
+void Qwen4::addMtpArgmax(metal::CommandGraph &graph, metal::MetalBuffer logits, metal::MetalBuffer proposals,
+                         metal::MetalBuffer candidates, uint32_t lanes, uint32_t laneRows, uint32_t vocabulary,
+                         uint32_t proposalsPerLane, uint32_t candidatesPerProposal, uint32_t row, bool last) {
+  if (!lanes || !vocabulary || !candidatesPerProposal || row >= laneRows || row >= proposalsPerLane)
+    throw std::invalid_argument("invalid MTP argmax");
+  const Qwen4MtpParams params{lanes * laneRows, 0, 0, laneRows, 0, vocabulary, proposalsPerLane,
+                              candidatesPerProposal, row, last ? 1u : 0u, 0, 0};
+  graph.add("qwen4_mtp_argmax", {std::move(logits), std::move(proposals), std::move(candidates)}, params,
+            {lanes, 1, 1}, {1024, 1, 1});
+}
+
+void Qwen4::addMtpCarry(metal::CommandGraph &graph, metal::MetalBuffer streams, metal::MetalBuffer carried,
+                        metal::MetalBuffer retained, HyperShape shape, uint32_t rows) {
+  requireShape(shape);
+  if (!rows) throw std::invalid_argument("invalid MTP carry");
+  const bool counted = static_cast<bool>(retained);
+  const Qwen4MtpParams params{rows, shape.hidden, shape.streams, rows, rows, 0, 0, 0, 0, 0, counted ? 1u : 0u, 0};
+  graph.add("qwen4_mtp_carry", {streams, std::move(carried), counted ? std::move(retained) : streams}, params,
+            {groups(shape.width()), 1, 1}, {kThreads, 1, 1});
+}
+
+
 
 } // namespace splash::ops

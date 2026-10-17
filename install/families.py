@@ -1,4 +1,5 @@
-"""The model families Splash serves and the DFlash2 draft released for each.
+"""The model families Splash serves and the DFlash2 draft released for each,
+or the head a family drafts with until one is.
 
 A target's family is the one the engine finds its configuration to describe,
 by the rules it holds every start to (upstream.check_model), never its
@@ -19,14 +20,20 @@ class ModelFamily:
     # release publishes it (config.json and BF16 safetensors). Installations
     # follow its default branch as they follow the target's. None while no
     # draft is released for the family: an installation names one with
-    # --draft-model.
+    # --draft-model, or the family drafts with its own head (mtp_head).
     draft_repo: str | None
+    # Whether the family's model carries an MTP head the engine drafts with
+    # when no DFlash2 draft is given: Qwen3.8-Flash-Next's, the GGUF its
+    # repository publishes beside the target (upstream.select_mtp). An
+    # installation takes it without --draft-model while no draft is released
+    # for the family, or with --draft-model mtp (upstream.MTP_HEAD).
+    mtp_head: bool = False
 
 
 FAMILIES = (
     ModelFamily("Qwen3.8-27B", "incoai/Qwen3.8-27B-DFlash2"),
     ModelFamily("Qwen3.6-35B-A3B", "incoai/Qwen3.6-35B-A3B-DFlash2"),
-    ModelFamily("Qwen3.8-Flash-Next", None),
+    ModelFamily("Qwen3.8-Flash-Next", None, mtp_head=True),
 )
 
 

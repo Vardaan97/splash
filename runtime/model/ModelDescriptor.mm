@@ -624,10 +624,12 @@ void validateVisionConfig(NSDictionary *vision, const ops::VisionLayout &layout,
 // config's model type names, from the source formats its record names, with
 // each config checked: the target's, as those formats require, its vision
 // tower's, and its DFlash2 draft's, whose layout it reads (readDraftLayout),
-// unless draft is nil.
+// unless draft is nil. With `mtp`, the model decodes without a DFlash2 draft,
+// drafting with its own head, which only Qwen3.8-Flash-Next has
+// (Qwen4ExpLayout::mtpLayers).
 ModelDescriptor describeSourceModel(std::string name, std::string_view targetFormat,
                                     std::string_view visionFormat, NSDictionary *config,
-                                    NSDictionary *draft) {
+                                    NSDictionary *draft, bool mtp = false) {
   NSDictionary *text = config[@"text_config"];
   if (![text isKindOfClass:[NSDictionary class]]) throw unsupportedModel("its config has no text_config");
   const auto type = requireString(text, @"model_type", "text model type");
@@ -650,17 +652,24 @@ ModelDescriptor describeSourceModel(std::string name, std::string_view targetFor
   // (inspectSourceConfiguration), and is not valid; a model root always
   // holds its draft's.
   DFlashDraftLayout draftLayout;
-  std::visit([&](const auto &layout) {
+  if (mtp && draft) throw std::invalid_argument("a model drafting with its MTP head takes no DFlash2 draft");
+  std::visit([&](auto &layout) {
     if (targetSource == TargetSource::Safetensors && !layout.loadsSafetensors)
       throw std::invalid_argument(std::string(layout.family) + " loads from a GGUF only");
     validateTextConfig(text, layout, layout.family, targetSource);
     if (targetSource == TargetSource::Safetensors) requireQuantization(config, layout);
     if (draft) draftLayout = readDraftLayout(draft, layout);
+    if (mtp) {
+      if constexpr (requires { layout.mtpLayers; }) layout.mtpLayers = 1;
+      else throw std::invalid_argument(std::string(layout.family) + " has no MTP head to draft with");
+      draftLayout = nullDraftLayout(layout.hiddenSize, layout.vocabularySize);
+    }
   }, *target);
   ModelDescriptor result = makeModelDescriptor(std::move(name), *target, draftLayout,
                                                {.outputHiddenSize = std::visit(
                                                     [](const auto &layout) { return layout.hiddenSize; }, *target)},
                                                targetSource, visionSource);
+  result.draftModel = !mtp;
   if (result.hasVision())
     validateVisionConfig(requireObject(config, @"vision_config", "vision config"), result.vision,
                          result.targetSource);
@@ -745,6 +754,18 @@ bool ModelDescriptor::valid() const noexcept {
       target);
 }
 
+DFlashDraftLayout nullDraftLayout(uint32_t hiddenSize, uint32_t vocabularySize) {
+  DFlashDraftLayout layout;
+  layout.layers = 1;
+  layout.hiddenSize = hiddenSize;
+  layout.vocabularySize = vocabularySize;
+  layout.kvHeads = 1;
+  layout.attentionHeadDimension = 8;
+  layout.targetLayers[0] = 0;
+  layout.targetLayerCount = 1;
+  return layout;
+}
+
 ModelDescriptor inspectModelRoot(const std::filesystem::path &root) {
   @autoreleasepool {
     std::string sourceIdentity;
@@ -754,11 +775,14 @@ ModelDescriptor inspectModelRoot(const std::filesystem::path &root) {
     const std::string targetFormat = requireString(record, @"target_format", "target format");
     const std::string visionFormat = requireString(record, @"vision_format", "vision format");
     NSDictionary *config = readObject(root / "config.json", "upstream model config");
-    // Every family decodes with its DFlash2 draft, in draft/.
-    if (!std::filesystem::exists(root / "draft"))
+    // A model decodes with the DFlash2 draft in draft/ or, without one, with
+    // the MTP head in mtp/ (Qwen3.8-Flash-Next's, install/upstream.py).
+    const bool draftDirectory = std::filesystem::exists(root / "draft");
+    const bool mtp = !draftDirectory && std::filesystem::exists(root / "mtp");
+    if (!draftDirectory && !mtp)
       throw std::invalid_argument("the model's root holds no draft/ for its DFlash2 draft");
-    NSDictionary *draft = readObject(root / "draft" / "config.json", "draft config");
-    ModelDescriptor result = describeSourceModel(std::move(name), targetFormat, visionFormat, config, draft);
+    NSDictionary *draft = draftDirectory ? readObject(root / "draft" / "config.json", "draft config") : nil;
+    ModelDescriptor result = describeSourceModel(std::move(name), targetFormat, visionFormat, config, draft, mtp);
     result.sourceIdentity = std::move(sourceIdentity);
     if (!result.valid()) throw std::invalid_argument("incompatible target and draft model");
     return result;

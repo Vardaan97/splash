@@ -171,19 +171,20 @@ namespace {
 // A step's grouping into tiles, which its expert passes read: the gate and up
 // passes' column tiles of a staged GGUF plan that runs them in one pass are
 // its staged columns.
-MoeGroupParams groupParams(const MoePlan &plan) {
+MoeGroupParams groupParams(const MoePlan &plan, uint32_t firstRow = 0, uint32_t lastRow = 0) {
   const MoeShape shape = plan.shape();
   const bool oneGateUp = oneGateUpPass(plan);
   return {plan.rows(), shape.expertsPerToken, plan.tileRows(), shape.experts,
           shape.expertIntermediateSize / (oneGateUp ? GGUF_STAGED_COLUMNS : GGUF_TILE_COLUMNS),
-          shape.hiddenSize / GGUF_TILE_COLUMNS};
+          shape.hiddenSize / GGUF_TILE_COLUMNS, (firstRow || lastRow) ? SPLASH_TARGET_VERIFY_ROWS : 0u, firstRow,
+          lastRow};
 }
 
 } // namespace
 
 void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
-              const BlockMoeWeights &weights, const MoePlan &plan) {
-  addRouting(graph, buffers, weights, plan);
+              const BlockMoeWeights &weights, const MoePlan &plan, uint32_t firstRow, uint32_t lastRow) {
+  addRouting(graph, buffers, weights, plan, firstRow, lastRow);
   if (weights.stream) {
     const MoeLoadPart part{&buffers, &plan};
     weights.stream->addLoad(graph, {&part, 1}, weights.streamBlock);
@@ -192,10 +193,16 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
 }
 
 void MoE::addRouting(metal::CommandGraph &graph, const MoeBuffers &buffers,
-                     const BlockMoeWeights &weights, const MoePlan &plan) {
+                     const BlockMoeWeights &weights, const MoePlan &plan, uint32_t firstRow, uint32_t lastRow) {
   const MoeShape shape = plan.shape();
   const uint32_t rows = plan.rows();
   validate(weights, shape);
+  // Lanes of a decode plan's verify rows.
+  if (firstRow && (firstRow >= SPLASH_TARGET_VERIFY_ROWS || rows % SPLASH_TARGET_VERIFY_ROWS))
+    throw std::invalid_argument("invalid MoE first row");
+  if (lastRow && (lastRow > SPLASH_TARGET_VERIFY_ROWS || lastRow <= firstRow || rows % SPLASH_TARGET_VERIFY_ROWS))
+    throw std::invalid_argument("invalid MoE last row");
+  if (lastRow == SPLASH_TARGET_VERIFY_ROWS) lastRow = 0;
   const MoeWorkspace &required = plan.workspace();
   const uint64_t hiddenRows = uint64_t{rows} * shape.hiddenSize * sizeof(uint16_t);
   requireBytes(buffers.input, hiddenRows, "MoE input");
@@ -214,7 +221,7 @@ void MoE::addRouting(metal::CommandGraph &graph, const MoeBuffers &buffers,
   graph.add(routingKernel("moe_group_routes", shape),
             {scratch.selectedExperts, scratch.tileDescriptors,
              scratch.tileCount, scratch.groupedRoutes, scratch.routeRows},
-            groupParams(plan), {1, 1, 1}, {shape.routerWidth(), 1, 1});
+            groupParams(plan, firstRow, lastRow), {1, 1, 1}, {shape.routerWidth(), 1, 1});
 }
 
 void MoE::addRouted(metal::CommandGraph &graph, const MoeBuffers &buffers,

@@ -6,6 +6,7 @@
 // them.
 
 #include "metal/CommandGraph.hpp"
+#include "ops/HyperConnection.hpp"
 #include "metal/abi/Qwen4.h"
 #include "ops/Normalization.hpp"
 
@@ -22,6 +23,31 @@ namespace splash::ops {
 struct QsaIndex final {
   std::span<const metal::MetalBuffer> tables;
   uint32_t offset = 0;
+  // The MTP head (metal/abi/Qwen4.h Qwen4MtpParams). A draft step's tokens:
+  // each lane's anchor and its first limit - 1 proposals, then repeats.
+  static void addMtpTokens(metal::CommandGraph &graph, metal::MetalBuffer anchors, metal::MetalBuffer proposals,
+                           metal::MetalBuffer tokens, uint32_t lanes, uint32_t laneRows, uint32_t proposalsPerLane,
+                           uint32_t limit);
+  // One lane's (or sequence's) `rows` eh-projection inputs, rows rowOffset..
+  // of each stream's `totalRows` rows of `output`.
+  static void addMtpInput(metal::CommandGraph &graph, metal::MetalBuffer embedding, metal::MetalBuffer carried,
+                          metal::MetalBuffer history, const NormWeights &embedNorm, const NormWeights &hiddenNorm,
+                          metal::MetalBuffer output, HyperShape shape, uint32_t rows, uint32_t limit,
+                          uint32_t rowOffset, uint32_t totalRows);
+  // fp32 streams [rows][streams][hidden] from the eh projection's
+  // stream-major bf16 rows [streams][rows][hidden].
+  static void addMtpWiden(metal::CommandGraph &graph, metal::MetalBuffer projected, metal::MetalBuffer streams,
+                          HyperShape shape, uint32_t rows);
+  // Each lane's argmax of its logits row `row` (`vocabulary` logits per row)
+  // as its proposal `row` and, `last`, every later one.
+  static void addMtpArgmax(metal::CommandGraph &graph, metal::MetalBuffer logits, metal::MetalBuffer proposals,
+                           metal::MetalBuffer candidates, uint32_t lanes, uint32_t laneRows, uint32_t vocabulary,
+                           uint32_t proposalsPerLane, uint32_t candidatesPerProposal, uint32_t row, bool last);
+  // Row retained - 1 of `streams` (retained a GPU count) or, without
+  // `retained`, row `rows` - 1.
+  static void addMtpCarry(metal::CommandGraph &graph, metal::MetalBuffer streams, metal::MetalBuffer carried,
+                          metal::MetalBuffer retained, HyperShape shape, uint32_t rows);
+
 };
 
 // QSA of a dispatch's lanes (a verify step's, or a prefill sequence as one):
@@ -36,6 +62,31 @@ struct QsaRows final {
   uint32_t topBlocks = 0;
   uint32_t maskWords = 0;
   uint32_t scoreStride = 0;
+  // The MTP head (metal/abi/Qwen4.h Qwen4MtpParams). A draft step's tokens:
+  // each lane's anchor and its first limit - 1 proposals, then repeats.
+  static void addMtpTokens(metal::CommandGraph &graph, metal::MetalBuffer anchors, metal::MetalBuffer proposals,
+                           metal::MetalBuffer tokens, uint32_t lanes, uint32_t laneRows, uint32_t proposalsPerLane,
+                           uint32_t limit);
+  // One lane's (or sequence's) `rows` eh-projection inputs, rows rowOffset..
+  // of each stream's `totalRows` rows of `output`.
+  static void addMtpInput(metal::CommandGraph &graph, metal::MetalBuffer embedding, metal::MetalBuffer carried,
+                          metal::MetalBuffer history, const NormWeights &embedNorm, const NormWeights &hiddenNorm,
+                          metal::MetalBuffer output, HyperShape shape, uint32_t rows, uint32_t limit,
+                          uint32_t rowOffset, uint32_t totalRows);
+  // fp32 streams [rows][streams][hidden] from the eh projection's
+  // stream-major bf16 rows [streams][rows][hidden].
+  static void addMtpWiden(metal::CommandGraph &graph, metal::MetalBuffer projected, metal::MetalBuffer streams,
+                          HyperShape shape, uint32_t rows);
+  // Each lane's argmax of its logits row `row` (`vocabulary` logits per row)
+  // as its proposal `row` and, `last`, every later one.
+  static void addMtpArgmax(metal::CommandGraph &graph, metal::MetalBuffer logits, metal::MetalBuffer proposals,
+                           metal::MetalBuffer candidates, uint32_t lanes, uint32_t laneRows, uint32_t vocabulary,
+                           uint32_t proposalsPerLane, uint32_t candidatesPerProposal, uint32_t row, bool last);
+  // Row retained - 1 of `streams` (retained a GPU count) or, without
+  // `retained`, row `rows` - 1.
+  static void addMtpCarry(metal::CommandGraph &graph, metal::MetalBuffer streams, metal::MetalBuffer carried,
+                          metal::MetalBuffer retained, HyperShape shape, uint32_t rows);
+
 };
 
 // The QSA blocks a dispatch's lanes' rows complete, which the pool pools:
@@ -49,6 +100,31 @@ struct QsaBlocks final {
   uint32_t laneRecords = 0;
   metal::MetalBuffer keys;
   std::span<const metal::MetalBuffer> pending;
+  // The MTP head (metal/abi/Qwen4.h Qwen4MtpParams). A draft step's tokens:
+  // each lane's anchor and its first limit - 1 proposals, then repeats.
+  static void addMtpTokens(metal::CommandGraph &graph, metal::MetalBuffer anchors, metal::MetalBuffer proposals,
+                           metal::MetalBuffer tokens, uint32_t lanes, uint32_t laneRows, uint32_t proposalsPerLane,
+                           uint32_t limit);
+  // One lane's (or sequence's) `rows` eh-projection inputs, rows rowOffset..
+  // of each stream's `totalRows` rows of `output`.
+  static void addMtpInput(metal::CommandGraph &graph, metal::MetalBuffer embedding, metal::MetalBuffer carried,
+                          metal::MetalBuffer history, const NormWeights &embedNorm, const NormWeights &hiddenNorm,
+                          metal::MetalBuffer output, HyperShape shape, uint32_t rows, uint32_t limit,
+                          uint32_t rowOffset, uint32_t totalRows);
+  // fp32 streams [rows][streams][hidden] from the eh projection's
+  // stream-major bf16 rows [streams][rows][hidden].
+  static void addMtpWiden(metal::CommandGraph &graph, metal::MetalBuffer projected, metal::MetalBuffer streams,
+                          HyperShape shape, uint32_t rows);
+  // Each lane's argmax of its logits row `row` (`vocabulary` logits per row)
+  // as its proposal `row` and, `last`, every later one.
+  static void addMtpArgmax(metal::CommandGraph &graph, metal::MetalBuffer logits, metal::MetalBuffer proposals,
+                           metal::MetalBuffer candidates, uint32_t lanes, uint32_t laneRows, uint32_t vocabulary,
+                           uint32_t proposalsPerLane, uint32_t candidatesPerProposal, uint32_t row, bool last);
+  // Row retained - 1 of `streams` (retained a GPU count) or, without
+  // `retained`, row `rows` - 1.
+  static void addMtpCarry(metal::CommandGraph &graph, metal::MetalBuffer streams, metal::MetalBuffer carried,
+                          metal::MetalBuffer retained, HyperShape shape, uint32_t rows);
+
 };
 
 struct Qwen4 final {
@@ -92,6 +168,31 @@ struct Qwen4 final {
                            uint32_t laneRows, std::span<const uint32_t> firstPositions, metal::MetalBuffer retained,
                            std::span<const metal::MetalBuffer> pendingIn,
                            std::span<const metal::MetalBuffer> pendingOut);
+  // The MTP head (metal/abi/Qwen4.h Qwen4MtpParams). A draft step's tokens:
+  // each lane's anchor and its first limit - 1 proposals, then repeats.
+  static void addMtpTokens(metal::CommandGraph &graph, metal::MetalBuffer anchors, metal::MetalBuffer proposals,
+                           metal::MetalBuffer tokens, uint32_t lanes, uint32_t laneRows, uint32_t proposalsPerLane,
+                           uint32_t limit);
+  // One lane's (or sequence's) `rows` eh-projection inputs, rows rowOffset..
+  // of each stream's `totalRows` rows of `output`.
+  static void addMtpInput(metal::CommandGraph &graph, metal::MetalBuffer embedding, metal::MetalBuffer carried,
+                          metal::MetalBuffer history, const NormWeights &embedNorm, const NormWeights &hiddenNorm,
+                          metal::MetalBuffer output, HyperShape shape, uint32_t rows, uint32_t limit,
+                          uint32_t rowOffset, uint32_t totalRows);
+  // fp32 streams [rows][streams][hidden] from the eh projection's
+  // stream-major bf16 rows [streams][rows][hidden].
+  static void addMtpWiden(metal::CommandGraph &graph, metal::MetalBuffer projected, metal::MetalBuffer streams,
+                          HyperShape shape, uint32_t rows);
+  // Each lane's argmax of its logits row `row` (`vocabulary` logits per row)
+  // as its proposal `row` and, `last`, every later one.
+  static void addMtpArgmax(metal::CommandGraph &graph, metal::MetalBuffer logits, metal::MetalBuffer proposals,
+                           metal::MetalBuffer candidates, uint32_t lanes, uint32_t laneRows, uint32_t vocabulary,
+                           uint32_t proposalsPerLane, uint32_t candidatesPerProposal, uint32_t row, bool last);
+  // Row retained - 1 of `streams` (retained a GPU count) or, without
+  // `retained`, row `rows` - 1.
+  static void addMtpCarry(metal::CommandGraph &graph, metal::MetalBuffer streams, metal::MetalBuffer carried,
+                          metal::MetalBuffer retained, HyperShape shape, uint32_t rows);
+
 };
 
 } // namespace splash::ops

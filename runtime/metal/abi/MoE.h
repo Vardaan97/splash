@@ -48,7 +48,12 @@ static_assert(sizeof(MoeTileDescriptor) == 8,
 #define MOE_GGUF_COLUMN_ROWS 2u
 
 // The column tiles of the gate/up and down passes, whose grids the grouping
-// writes (MoeTileCount).
+// writes (MoeTileCount). With `lane_rows`, the rows of each lane_rows rows
+// before `first_row`, and from `last_row` on when it is set, route to no
+// expert: their routes are left out of the tiles and their routed outputs
+// read their shared expert's row (ops::MoE::add firstRow and lastRow, the
+// rows of an MTP draft step that repeat a step before and a verify's rows
+// past the proposals the head drafted). Zero lane_rows routes every row.
 struct MoeGroupParams {
   uint32_t rows;
   uint32_t top_k;
@@ -56,10 +61,13 @@ struct MoeGroupParams {
   uint32_t experts;
   uint32_t gate_up_columns;
   uint32_t down_columns;
+  uint32_t lane_rows;
+  uint32_t first_row;
+  uint32_t last_row;
 };
 
-static_assert(sizeof(MoeGroupParams) == 24,
-              "MoE grouping parameters are 24 bytes on both sides");
+static_assert(sizeof(MoeGroupParams) == 36,
+              "MoE grouping parameters are 36 bytes on both sides");
 
 // What the grouping writes besides the tiles: their count, which every pass
 // over them reads first, and the grids (column tiles, tiles, 1) of the

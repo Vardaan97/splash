@@ -170,6 +170,47 @@ class UpstreamTest(unittest.TestCase):
         ):
             upstream.check_model("mlx-affine", "none", config)
 
+    def test_mtp_head_is_the_one_shared_q8_0_head(self):
+        heads = {
+            "MTP/README.md",
+            "MTP/mtp-Qwen3.8-Flash-Next-BF16.gguf",
+            "MTP/mtp-Qwen3.8-Flash-Next-Q8_0.gguf",
+            "MTP/mtp-Qwen3.8-Flash-Next-shared-BF16.gguf",
+            "MTP/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf",
+            "MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf",
+            "mmproj-BF16.gguf",
+        }
+        self.assertEqual(
+            upstream.select_mtp(heads), "MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"
+        )
+        self.assertIsNone(
+            upstream.select_mtp(heads - {"MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"})
+        )
+        self.assertIsNone(
+            upstream.select_mtp(heads | {"MTP/mtp-Other-shared-Q8_0.gguf"})
+        )
+
+    def test_a_family_with_an_mtp_head_drafts_with_it_unless_a_draft_is_named(self):
+        flash = families.named("Qwen3.8-Flash-Next")
+        self.assertTrue(upstream.drafts_with_mtp(flash, selection(self.root)))
+        self.assertFalse(
+            upstream.drafts_with_mtp(flash, selection(self.root, draft_model="o/d"))
+        )
+        # The head by name, which only a family with one takes; a released
+        # draft becomes the default without changing that.
+        self.assertEqual(models.parse_draft_model("mtp"), models.MTP_HEAD)
+        self.assertTrue(
+            upstream.drafts_with_mtp(flash, selection(self.root, draft_model="mtp"))
+        )
+        self.assertFalse(upstream.drafts_with_mtp(DENSE, selection(self.root)))
+        with self.assertRaisesRegex(models.ModelError, "has no MTP head"):
+            upstream.drafts_with_mtp(DENSE, selection(self.root, draft_model="mtp"))
+        released = dataclasses.replace(flash, draft_repo="owner/draft")
+        self.assertFalse(upstream.drafts_with_mtp(released, selection(self.root)))
+        self.assertTrue(
+            upstream.drafts_with_mtp(released, selection(self.root, draft_model="mtp"))
+        )
+
     def test_gguf_selection_is_exact_and_takes_split_variant_folders(self):
         files = {
             "Qwen3.8-27B-UD-Q4_K_M.gguf",
@@ -1462,7 +1503,7 @@ class UpstreamTest(unittest.TestCase):
             lambda r: r.update(metadata="0" * 64),
             lambda r: r.update(target_format="safetensors"),
             lambda r: r.update(version=True),
-            lambda r: r["sources"].pop("draft"),
+            lambda r: r["sources"].update(other=r["sources"]["target"]),
             lambda r: r["sources"]["draft"].update(revision="main"),
             lambda r: r["files"]["config.json"].pop("mtime_ns"),
             lambda r: r["files"]["config.json"].update(digest="z" * 64),
