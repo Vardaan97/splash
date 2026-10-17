@@ -1692,6 +1692,24 @@ differ from drafting with the whole head, since the same acceptance uniform
 can keep a different token when the proposal differs. `SPLASH_MTP_DRAFT_VOCAB=0`
 drafts from the whole head at every step and writes no image.
 
+Experimental MTP tuning is opt-in. `SPLASH_MTP_LANES=1` at batch widths
+above one lets each request choose its own adaptive draft depth and
+vocabulary gate. Exhausted lanes stop selecting proposals and routing
+experts; their verify routing and retention stop at their own depth plus
+the anchor. Homogeneous heads keep the batched projection; mixed reduced
+and whole heads use one-lane logits plans and independent context rows.
+`SPLASH_MTP_DRAFT_ONE_ROW=1` routes only the consumed row in each draft
+step, retaining the untrimmed routing occupancy's column/staged arithmetic
+for that row. `SPLASH_LIVE_VERIFY_THRESHOLD` in (0, 1] trims the greedy
+verify's leading proposal chain by cumulative head confidence. Dropping
+trunk rows can change expert tile arithmetic and sparse-attention reduction
+partitions, so TRIM and per-lane scheduling are not batch-invariant.
+`SPLASH_MTP_SAMPLED_DRAFT=1` selects sampled proposals from a truncated
+top-16 draft distribution. Boolean switches require exactly `1`.
+`SPLASH_MTP_DRAFT_LOG=1` reports per-step routed tile counts, while
+`SPLASH_MTP_DRAFT_TRACE=1` logs proposal IDs and depth after each completed
+cycle. These diagnostics are for untimed checks.
+
 A draft's `config.json` states its layers, intermediate size, rotary base and
 the target layers whose outputs it reads (`dflash_config.target_layer_ids`,
 ascending, at most eight); its hidden size, vocabulary and mask token are its
