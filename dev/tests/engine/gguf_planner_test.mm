@@ -7,12 +7,14 @@
 #include "GgufFixtures.hpp"
 #include "metal/abi/Gguf.h"
 #include "model/GgufPreparation.hpp"
+#include "model/Qwen4DraftVocabulary.hpp"
 #include "model/Qwen4Exp.hpp"
 
 #include <fcntl.h>
 #include <unistd.h>
 
 #include <bit>
+#include <cstring>
 #include <memory>
 #include <optional>
 
@@ -657,10 +659,15 @@ void checkMtpHead(const std::filesystem::path &directory) {
   for (const char *name : {"hc_attn_down.weight", "hc_attn_up.weight", "hc_ffn_down.weight", "hc_ffn_up.weight",
                            "nextn.eh_proj.weight", "nextn.hc_head_down.weight", "nextn.hc_head_up.weight"})
     types[name] = kQ8_0;
-  const std::string p = "blk." + std::to_string(g.layers) + ".";
+  // The head's block is a full-attention layer's with its indexer: the
+  // fixture's layer 1, named as blk.<layers>.
+  const std::string p = "blk." + std::to_string(g.layers) + ".", full = "blk.1.";
   std::vector<Tensor> tensors;
   for (Tensor &tensor : targetTensors(declared, types))
-    if (tensor.name.starts_with(p)) tensors.push_back(std::move(tensor));
+    if (tensor.name.starts_with(full)) {
+      tensor.name = p + tensor.name.substr(full.size());
+      tensors.push_back(std::move(tensor));
+    }
   const auto add = [&](const std::string &name, std::vector<uint64_t> dims) {
     const uint32_t type = typeOf(types, name);
     const model::GgmlTypeTraits &traits = *model::ggmlTypeTraits(type);
@@ -706,6 +713,71 @@ void checkMtpHead(const std::filesystem::path &directory) {
         "planner refuses an MTP GGUF without its nextn layer");
 }
 
+// A draft vocabulary's head (gguf::planDraftHeadImage): the head's rows of
+// its tokens as one repack of a source per run of consecutive tokens, whole
+// tiles of rows, then the tokens; tokens out of order, repeated or past the
+// vocabulary refused. And Qwen3.8's draft vocabulary itself.
+void checkDraftHead(const std::filesystem::path &directory) {
+  const SmallTarget target = smallTarget(false);
+  const model::QwenTargetDimensions &g = target.geometry;
+  const auto path = directory / "draft-head.gguf";
+  writeGguf(path, target.tensors, g);
+  model::WeightSource source(path);
+  const model::GgufFile gguf(source);
+  const model::GgufTensor &head = gguf.require("output.weight");
+  const std::vector<uint32_t> tokens{0, 1, 2, 5, 100, 101, 255};
+  const model::gguf::Image image = model::gguf::planDraftHeadImage(gguf, g, tokens);
+  const uint64_t rowBytes = head.bytes / g.vocabularySize;
+  bool runs = image.repacks.size() == 1 && image.repacks[0].rows == QUANT_TILE_ROWS &&
+              image.repacks[0].columns == g.hiddenSize && image.repacks[0].sources.size() == 4;
+  const std::pair<uint32_t, uint32_t> expected[] = {{0, 3}, {5, 1}, {100, 2}, {255, 1}};
+  for (size_t i = 0; runs && i < 4; ++i) {
+    const model::gguf::TensorRows &rows = image.repacks[0].sources[i];
+    runs = rows.offset == head.offset && rows.first == expected[i].first && rows.rows == expected[i].second &&
+           rows.rowBytes == rowBytes && rows.name == "output.weight";
+  }
+  check(runs, "draft head: a source per run of consecutive tokens, whole tiles of rows");
+  const auto ids = std::find_if(image.fills.begin(), image.fills.end(), [&](const model::gguf::Fill &fill) {
+    return fill.bytes.size() == tokens.size() * sizeof(uint32_t);
+  });
+  check(ids != image.fills.end() && !std::memcmp(ids->bytes.data(), tokens.data(), ids->bytes.size()),
+        "draft head: the tokens after the rows");
+  for (const std::vector<uint32_t> &bad : {std::vector<uint32_t>{2, 1}, std::vector<uint32_t>{3, 3},
+                                          std::vector<uint32_t>{0, 256}, std::vector<uint32_t>{}}) {
+    bool refused = false;
+    try {
+      static_cast<void>(model::gguf::planDraftHeadImage(gguf, g, bad));
+    } catch (const model::GgufError &) {
+      refused = true;
+    }
+    check(refused, "draft head: refuses tokens out of order, repeated, past the vocabulary or none");
+  }
+
+  for (const uint32_t size : {model::kQwen4DraftVocabularyTokens, model::kQwen4DraftVocabularyLargeTokens}) {
+    const std::span<const uint32_t> vocabulary = model::qwen4DraftVocabulary(size);
+    check(vocabulary.size() == size && std::is_sorted(vocabulary.begin(), vocabulary.end()) &&
+              std::adjacent_find(vocabulary.begin(), vocabulary.end()) == vocabulary.end() &&
+              vocabulary.back() < model::kQwen4DraftVocabularySource,
+          "Qwen3.8's draft vocabulary of " + std::to_string(size) + ": its tokens, ascending, within the vocabulary");
+    bool members = std::all_of(vocabulary.begin(), vocabulary.end(),
+                               [&](uint32_t token) { return model::qwen4DraftContains(token, size); });
+    // Token 0 (what a row without a finite logit drafts), the stop tokens and
+    // the chat template's, tool-call and thinking tokens.
+    for (const uint32_t token : {0u, 248044u, 248045u, 248046u, 248058u, 248059u, 248066u, 248067u, 248068u, 248069u})
+      members &= model::qwen4DraftContains(token, size);
+    check(members && !model::qwen4DraftContains(model::kQwen4DraftVocabularySource, size),
+          "Qwen3.8's draft vocabulary of " + std::to_string(size) +
+              ": token 0, the stop, chat template, tool-call and thinking tokens");
+  }
+  // The smaller set nests in the larger.
+  const std::span<const uint32_t> small = model::qwen4DraftVocabulary(model::kQwen4DraftVocabularyTokens);
+  check(std::all_of(small.begin(), small.end(),
+                    [](uint32_t token) { return model::qwen4DraftContains(token, model::kQwen4DraftVocabularyLargeTokens); }),
+        "Qwen3.8's draft vocabulary: the 32768 tokens are among the 65536");
+  check(model::qwen4DraftVocabulary(0).empty() && model::qwen4DraftTokensFor(1000) == 0,
+        "no draft vocabulary for another vocabulary");
+}
+
 } // namespace
 
 int main() {
@@ -720,6 +792,7 @@ int main() {
     guarded("planner on Flash-Next hyper-connections", [&] { checkHyperConnections(directory.path()); });
     guarded("planner on Flash-Next's PLE table", [&] { checkPleTable(directory.path()); });
     guarded("planner on Flash-Next's MTP head", [&] { checkMtpHead(directory.path()); });
+    guarded("planner on a draft vocabulary's head", [&] { checkDraftHead(directory.path()); });
     std::printf("%s (%d failures)\n", failures ? "GGUF planner tests FAILED" : "GGUF planner tests passed", failures);
     return failures ? 1 : 0;
   }

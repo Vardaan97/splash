@@ -47,6 +47,8 @@ public:
   // from the convolution inputs and keys its verify wrote.
   void addStateCommit(metal::CommandGraph &graph, QwenTargetCommitBuffers buffers, uint32_t lanes) const override;
 
+  [[nodiscard]] const Qwen4ExpWeights *qwen4() const noexcept override { return &weights_; }
+  [[nodiscard]] bool hasMtpDraftVocabulary() const noexcept override;
   void addMtpDraft(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers, const kv::PageStorage &kv,
                    std::span<const kv::ChunkedPrefillParams> chunks, uint32_t lanes,
                    QwenTargetMtpDraft draft) const override;
@@ -107,7 +109,7 @@ private:
 
   void addMtpPrefill(PrefillStep &step) const;
   void addMtpVerify(VerifyStep &step, metal::MetalBuffer embedding, metal::MetalBuffer history,
-                    uint32_t limit, bool full, uint32_t firstRow = 0) const;
+                    uint32_t limit, bool full, uint32_t firstRow = 0, const Qwen4DraftHead *draftHead = nullptr) const;
   [[nodiscard]] metal::MetalBuffer mtpCarried(const metal::MetalBuffer &auxiliary) const;
   const Qwen4ExpWeights &weights_;
   // The step scratch and the inputs the target makes of a step's tokens.

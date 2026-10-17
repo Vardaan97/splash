@@ -566,6 +566,66 @@ void checkRepack(MetalBackend &backend, const std::filesystem::path &directory, 
   }
 }
 
+// The draft head of a draft vocabulary through the production loader: each
+// token's row of the head's planes, byte for byte, then zero rows to the
+// tile's end, then the tokens; the same bytes once released and restored.
+void checkDraftHead(MetalBackend &backend, const std::filesystem::path &directory) {
+  const SmallTarget target = smallTarget(false);
+  const model::QwenTargetDimensions &g = target.geometry;
+  const auto path = directory / "draft-head.gguf";
+  writeGguf(path, target.tensors, g);
+  const std::vector<uint32_t> tokens{0, 1, 2, 5, 6, 7, 63, 64, 100, 200, 254, 255};
+  model::WeightImages images(backend, "fixture");
+  model::GgufTargetLoader loader(backend, images, {path}, architecture(g), g, {}, {}, tokens);
+  for (uint32_t layer = 0; layer < g.layers; ++layer) static_cast<void>(loader.layer(layer));
+  model::WeightFile head = loader.head();
+  static_cast<void>(model::readNorm(head, g.hiddenSize, true, "norm"));
+  const ops::QuantizedSegment full = model::readQuantizedSegment(head, "logits");
+  head.finish();
+  static_cast<void>(loader.embedding());
+  model::WeightFile drafts = loader.draftHead();
+  const ops::QuantizedSegment draft = model::readQuantizedSegment(drafts, "draft-logits");
+  const auto ids = drafts.section(tokens.size() * sizeof(uint32_t), "draft-tokens");
+  drafts.finish();
+  check(draft.formatId == full.formatId && draft.outputSize == QUANT_TILE_ROWS && draft.inputSize == g.hiddenSize,
+        "draft head: the head's format, whole tiles of rows");
+  // A row's bytes in each plane: [rows / T][units][T][unit bytes].
+  const QuantFormat &format = kQuantFormats[full.formatId];
+  const auto rowOf = [&](const ops::QuantizedSegment &segment, uint32_t row) {
+    std::vector<uint8_t> bytes;
+    const auto append = [&](const splash::metal::MetalBuffer &plane, uint32_t units, uint32_t unitBytes) {
+      const auto *data = static_cast<const uint8_t *>(plane.contents());
+      for (uint32_t unit = 0; unit < units; ++unit) {
+        const uint64_t at =
+            ((uint64_t{row / QUANT_TILE_ROWS} * units + unit) * QUANT_TILE_ROWS + row % QUANT_TILE_ROWS) * unitBytes;
+        bytes.insert(bytes.end(), data + at, data + at + unitBytes);
+      }
+    };
+    const uint32_t groups = segment.inputSize / 32;
+    append(segment.plane0, groups, format.plane0_bytes);
+    if (format.plane1_bytes) append(segment.plane1, groups, format.plane1_bytes);
+    append(segment.meta, groups / format.meta_groups, format.meta_bytes);
+    return bytes;
+  };
+  const auto draftRows = [&] {
+    std::vector<std::vector<uint8_t>> rows;
+    for (uint32_t row = 0; row < QUANT_TILE_ROWS; ++row) rows.push_back(rowOf(draft, row));
+    return rows;
+  };
+  const auto loaded = draftRows();
+  bool same = true, zero = true;
+  for (uint32_t row = 0; row < QUANT_TILE_ROWS; ++row)
+    if (row < tokens.size()) same &= loaded[row] == rowOf(full, tokens[row]);
+    else zero &= std::all_of(loaded[row].begin(), loaded[row].end(), [](uint8_t b) { return b == 0; });
+  check(same, "draft head: each token's row of the head, byte for byte");
+  check(zero, "draft head: zero rows past the tokens");
+  check(!std::memcmp(ids.contents(), tokens.data(), tokens.size() * sizeof(uint32_t)), "draft head: its tokens");
+  images.release();
+  while (!images.restore(splash::test::admitAll)) {
+  }
+  check(draftRows() == loaded, "draft head: the same rows once released and restored");
+}
+
 void checkExecutor(MetalBackend &backend, const std::filesystem::path &directory) {
   const Shape shapes[] = {{512, 1024, {}}, {768, 1280, {256, 16, 8, 4}}, {768, 8448, {128, 16, 8, 5}}};
   for (int s = 0; s < 3; ++s)
@@ -875,6 +935,7 @@ int main(int argc, char **argv) {
     guarded("preparation of quantized alpha/beta", [&] { checkQuantizedAlphaBeta(backend, directory.path()); });
     guarded("llama.cpp NVFP4", [&] { checkGgufNvfp4(backend, directory.path()); });
     guarded("the target loader", [&] { checkDenseTarget(backend, directory.path()); });
+    guarded("a draft vocabulary's head", [&] { checkDraftHead(backend, directory.path()); });
     guarded("MLX sources", [&] { checkMlxSources(backend, directory.path(), argv[3]); });
     guarded("NVFP4 and FP8 sources", [&] { checkFloatSources(backend, directory.path()); });
     std::printf("%s (%d failures)\n", failures ? "GGUF preparation tests FAILED" : "GGUF preparation tests passed",

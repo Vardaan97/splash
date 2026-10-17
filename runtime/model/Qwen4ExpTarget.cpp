@@ -2,6 +2,7 @@
 
 #include "metal/abi/Qwen4.h"
 #include "model/Qwen4Exp.hpp"
+#include "model/Qwen4DraftVocabulary.hpp"
 #include "model/SparseRowStore.hpp"
 #include "ops/Embedding.hpp"
 #include "ops/HyperConnection.hpp"
@@ -448,6 +449,17 @@ void includeFamilyProjections(QwenTargetGeometry &geometry, const Qwen4ExpWeight
     geometry.include(mtp.block.indexer->query);
     geometry.include(mtp.block.indexer->key);
     geometry.include(mtp.embedHidden);
+    // The draft vocabulary's head runs at decode alone, on plans of its own
+    // shape (their scratch and storage rows), and its context rows as one
+    // quantized tensor of the vocabulary projection's format.
+    if (mtp.draftHead) {
+      geometry.include( mtp.draftHead->logits);
+      const auto &segments = weights.logitsProjection.blocks().segments;
+      if (segments.size() == 1 && !segments.front().isFloat() && !weights.logitsProjection.rotation) {
+        geometry.mtpDraftContextFormat = segments.front().formatId;
+        geometry.decodeProjections.push_back({kQwen4DraftContextTokens, weights.layout.hiddenSize, false});
+      }
+    }
   }
 }
 
@@ -495,7 +507,8 @@ metal::MetalBuffer Qwen4ExpTarget::mtpCarried(const metal::MetalBuffer &auxiliar
 }
 
 void Qwen4ExpTarget::addMtpVerify(VerifyStep &step, metal::MetalBuffer embedding,
-                                   metal::MetalBuffer history, uint32_t limit, bool full, uint32_t firstRow) const {
+                                   metal::MetalBuffer history, uint32_t limit, bool full, uint32_t firstRow,
+                                   const Qwen4DraftHead *draftHead) const {
   constexpr uint32_t laneRows = kVerifyRows;
   const Qwen4MtpWeights &mtp = *weights_.mtp;
   const QwenTargetVerifyBuffers &b = step.buffers;
@@ -524,19 +537,37 @@ void Qwen4ExpTarget::addMtpVerify(VerifyStep &step, metal::MetalBuffer embedding
   addVerifyMix(step, mtp.block.ffnHyper, b.normalized, nullptr, h.mtpStreams);
   ops::MoE::add(step.graph, {b.normalized, h.zeros, h.branch, b.moe}, mtp.block.ffn, *step.moe, firstRow);
   ops::HyperConnection::addCombine(step.graph, h.mtpStreams, h.branch, h.weights, hs, rows);
-  addDecodeProjection(step.graph, b.finalHidden, weights_.logitsProjection, b.logits, step.lanes,
-                      b.linearScratch,
-                      addVerifyMix(step, mtp.head, b.finalHidden, &weights_.logitsProjection, h.mtpStreams));
+  const ops::Projection &logits = draftHead ? draftHead->logits : weights_.logitsProjection;
+  addDecodeProjection(step.graph, b.finalHidden, logits, b.logits, step.lanes, b.linearScratch,
+                      addVerifyMix(step, mtp.head, b.finalHidden, &logits, h.mtpStreams));
 }
 
 void Qwen4ExpTarget::addMtpDraft(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers, const kv::PageStorage &kv,
                              std::span<const kv::ChunkedPrefillParams> chunks, uint32_t lanes,
                              QwenTargetMtpDraft draft) const {
-  const Qwen4ExpWeights *weights = &weights_;
+  const Qwen4ExpWeights *weights = qwen4();
   constexpr uint32_t laneRows = kVerifyRows;
   if (!weights || !weights->mtp || !draft.steps || draft.steps > buffers.proposalsPerLane ||
       buffers.proposalsPerLane + 1 > laneRows || !buffers.candidatesPerProposal)
     throw std::invalid_argument("invalid MTP draft batch");
+  // The draft vocabulary's logits are its tokens', ascending.
+  const Qwen4DraftHead *draftHead = draft.draftVocabulary && weights->mtp->draftHead ? &*weights->mtp->draftHead : nullptr;
+  if (draftHead && draftHead->logits.outputSize < weights->layout.mtpDraftTokens)
+    throw std::logic_error("the draft head's rows are fewer than its tokens");
+  const uint32_t vocabulary = draftHead ? weights->layout.mtpDraftTokens : geometry_.vocabularySize;
+  // Each lane's context rows: copied in from the vocabulary projection's
+  // rows first, then projected after the draft head at every step.
+  bool context = false;
+  if (draftHead)
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+      if (!buffers.draftContextCounts[lane]) continue;
+      context = true;
+      const ops::QuantizedSegment &rows = buffers.draftContextHeads[lane].blocks().segments.front();
+      if (rows.outputSize != kQwen4DraftContextTokens || buffers.draftContextCounts[lane] > rows.outputSize)
+        throw std::invalid_argument("invalid MTP draft context rows");
+      ops::Qwen4::addCopyHeadRows(graph, weights->logitsProjection.blocks().segments.front(), rows,
+                                  buffers.draftContextCopies[lane], buffers.draftContextCopyCounts[lane]);
+    }
   VerifyStep step{verifyStep(graph, buffers, kv, chunks, lanes)};
   const std::vector<uint32_t> offsets = indexOffsets(kv, geometry_.kvLayout.attentionLayers);
   step.scratch = steps_.verifyScratch(decodeStorageLanes(lanes) * kVerifyRows);
@@ -557,10 +588,29 @@ void Qwen4ExpTarget::addMtpDraft(metal::CommandGraph &graph, QwenTargetVerifyBuf
       ops::Qwen4::addMtpTokens(graph, buffers.anchors, buffers.proposals, h.mtpTokens, lanes, laneRows,
                                buffers.proposalsPerLane, j);
       ops::Embedding::add(graph, h.mtpTokens, weightsBase_.tokenEmbedding, buffers.hidden[1], step.rows);
-      addMtpVerify(step, buffers.hidden[1], h.mtpHistory, j, true, j - 1);
-      ops::Qwen4::addMtpArgmax(graph, buffers.logits, buffers.proposals, buffers.candidates, lanes, laneRows,
-                               geometry_.vocabularySize, buffers.proposalsPerLane, buffers.candidatesPerProposal,
-                               j - 1, j == draft.steps);
+      addMtpVerify(step, buffers.hidden[1], h.mtpHistory, j, true, j - 1, draftHead);
+      if (context) {
+        for (uint32_t lane = 0; lane < lanes; ++lane)
+          if (buffers.draftContextCounts[lane])
+            addDecodeProjection(graph,
+                                rowsOf<uint16_t>(buffers.finalHidden, lane * laneRows, laneRows,
+                                                 geometry_.hiddenSize),
+                                buffers.draftContextHeads[lane],
+                                backend_.view(buffers.draftContextLogits,
+                                              uint64_t{lane} * buffers.draftContextLogitsSlot * sizeof(float),
+                                              uint64_t{buffers.draftContextLogitsSlot} * sizeof(float)),
+                                1, buffers.linearScratch);
+        ops::Qwen4::addMtpArgmaxContext(graph, buffers.logits, buffers.proposals, buffers.candidates,
+                                        draftHead->tokens, buffers.draftContextLogits, buffers.draftContextTokens,
+                                        buffers.draftContextInfo, lanes, laneRows, vocabulary,
+                                        kQwen4DraftContextTokens, buffers.draftContextLogitsSlot,
+                                        buffers.proposalsPerLane, buffers.candidatesPerProposal, j - 1,
+                                        j == draft.steps);
+      } else {
+        ops::Qwen4::addMtpArgmax(graph, buffers.logits, buffers.proposals, buffers.candidates, lanes, laneRows,
+                                 vocabulary, buffers.proposalsPerLane, buffers.candidatesPerProposal, j - 1,
+                                 j == draft.steps, draftHead ? draftHead->tokens : metal::MetalBuffer{});
+      }
       if (j < draft.steps)
         for (uint32_t lane = 0; lane < lanes; ++lane)
           ops::Qwen4::addMtpCarry(graph, rowsOf<float>(h.mtpStreams, lane * laneRows, j, width),
@@ -568,6 +618,11 @@ void Qwen4ExpTarget::addMtpDraft(metal::CommandGraph &graph, QwenTargetVerifyBuf
                                   hyperShape(geometry_), j);
     }
   }
+}
+
+bool Qwen4ExpTarget::hasMtpDraftVocabulary() const noexcept {
+  const Qwen4ExpWeights *weights = qwen4();
+  return weights && weights->mtp && weights->mtp->draftHead;
 }
 
 } // namespace splash::model
