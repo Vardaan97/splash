@@ -152,6 +152,10 @@ void GDN::addPrefill(metal::CommandGraph &graph, const metal::MetalBackend &back
   metal::MetalBuffer convolution = buffers.convolutionIn;
   metal::MetalBuffer recurrent = buffers.recurrentIn;
   uint32_t begin = 0;
+  // Each capture splits the scan: an fp32 state stored and reloaded is the
+  // same bits for any partition, a bf16 one rounds at every split, so a
+  // retained grid of checkpoints (EngineConfig::retainedCheckpointTokens)
+  // changes bf16 states' numerics where its captures fall.
   for (size_t index = 0; index <= captures.size(); ++index) {
     const bool last = index == captures.size();
     const uint32_t end = last ? tokens : captures[index].tokens;

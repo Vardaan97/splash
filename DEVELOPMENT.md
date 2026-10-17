@@ -438,6 +438,24 @@ Restarts recompute everything unless `--persistent-cache` is on (see
 pages and states for the session only, in temporary files whose space returns
 when the engine exits.
 
+### Retained checkpoint grid
+
+The rolling checkpoints keep a prompt's last few states and retire the rest
+as its prefill goes on, so a conversation edited deep in its history, past
+every state the cache still holds, prefills again from the start.
+`SPLASH_GDN_CHECKPOINT_TOKENS=16384` (0, or a multiple of 2048 of at least
+4096; off by default) keeps a state every that many prompt tokens
+(`engine::retainedCheckpoints`), captured inside the prefill command as the
+rolling ones are, with every target's state of the row, Qwen3.8-Flash-Next's
+PLE history and carried streams included. The grid's states are ordinary
+cached states: a prompt's rolling checkpoints never retire them, the cache
+and the governor may still evict them, and a lookup then falls back to the
+point before. On an M5 Max with Qwen3.8-Flash-Next UD-Q4_K_XL, re-prefilling
+after an edit at three quarters of a 32K prompt took 9.5 s with the grid
+instead of a 17.7 s full re-prefill. An fp32 GDN state is the same bits
+however its scan is split; a bf16 state rounds at every split, so the grid
+changes bf16 states' numerics where its captures fall.
+
 ### Persistent cache
 
 `--persistent-cache` keeps the SSD cache across restarts of the same model, so a
