@@ -1,4 +1,5 @@
 #include "model/Runtime.hpp"
+#include "model/MtpTuning.hpp"
 #ifdef SPLASH_RUNTIME_INSTRUMENTATION
 #include "model/Qwen4ExpTarget.hpp"
 #include "model/RuntimeInstrumentation.hpp"
@@ -32,6 +33,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <future>
 #include <limits>
@@ -405,6 +407,26 @@ struct Runtime::Impl {
   // 7, default 7), fewer while a lane's proposals are rejected
   // (mtpStepsFor); SPLASH_MTP_ADAPTIVE=0 always drafts SPLASH_MTP_DRAFTS
   // (default 3). The later proposals repeat the last.
+  bool mtpDraftOneRow = mtpSwitchFromEnvironment("SPLASH_MTP_DRAFT_ONE_ROW");
+  bool mtpDraftLog = mtpSwitchFromEnvironment("SPLASH_MTP_DRAFT_LOG");
+  MetalBuffer mtpDraftTileCounts;
+  std::array<uint64_t, kDraftProposalTokens> mtpTileTotals{}, mtpTileSamples{};
+  uint64_t mtpLoggedCycles = 0;
+  void logMtpDraft(uint32_t steps, uint32_t lanes) {
+    if (!mtpDraftLog || !targetModel->hasMtp()) return;
+    const auto *counts = contents<uint32_t>(mtpDraftTileCounts, "MTP tile counts");
+    for (uint32_t j = 0; j < steps; ++j) {
+      // One shared-expert tile per lane; at B1 the rest count distinct experts.
+      mtpTileTotals[j] += counts[j] - lanes;
+      ++mtpTileSamples[j];
+    }
+    if (++mtpLoggedCycles % 128) return;
+    std::fprintf(stderr, "MTP draft routed tiles (B%u):", lanes);
+    for (uint32_t j = 0; j < kDraftProposalTokens; ++j)
+      if (mtpTileSamples[j])
+        std::fprintf(stderr, " step%u=%.2f", j + 1, double(mtpTileTotals[j]) / mtpTileSamples[j]);
+    std::fprintf(stderr, "\n");
+  }
   bool mtpAdaptive = mtpAdaptiveFromEnvironment();
   uint32_t mtpDraftSteps = mtpDraftStepsFromEnvironment(mtpAdaptive);
   static bool mtpAdaptiveFromEnvironment() {
@@ -2126,6 +2148,13 @@ struct Runtime::Impl {
       if (draftVocabulary) bindDraftContext(buffers, entries.first(lanes));
       QwenTargetMtpDraft draft;
       draft.steps = steps;
+      draft.oneRow = mtpDraftOneRow;
+      if (mtpDraftLog) {
+        if (!mtpDraftTileCounts)
+          mtpDraftTileCounts = backend.allocateBuffer(kDraftProposalTokens * sizeof(uint32_t), BufferStorage::Shared,
+                                                       "MTP draft tile counts");
+        draft.tileCounts = mtpDraftTileCounts;
+      }
       draft.draftVocabulary = draftVocabulary;
       if (plePrefetch && pleStore && steps > 1) armPlePrefetch(draft, entries.first(lanes), items, (steps + 1) / 2);
       targetModel->addMtpDraft(graph, std::move(buffers), kvPages, std::span(chunks).first(lanes), lanes, draft);
@@ -2297,6 +2326,7 @@ struct Runtime::Impl {
   std::vector<ModelStepResult> finalizeDecode(
       std::span<DecodeLaneResult> lanes, std::span<const ModelBatchItem> items,
       CommandTiming timing) {
+    if (!lanes.empty()) logMtpDraft(lanes.front().request->mtpDrafted, static_cast<uint32_t>(lanes.size()));
     for (uint32_t lane = 0; lane < items.size(); ++lane) {
       DecodeLaneResult &laneResult = lanes[lane];
       auto d = [&](DecodeTensor tensor) {

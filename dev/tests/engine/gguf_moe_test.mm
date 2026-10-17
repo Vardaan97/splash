@@ -890,6 +890,9 @@ int moe(MetalBackend &backend) {
             checkLiveRows(backend, m, b, plan, firstRow, lastRow, run,
                           label + " rows " + std::to_string(firstRow) + ".." +
                               std::to_string(lastRow ? lastRow : SPLASH_TARGET_VERIFY_ROWS));
+          for (uint32_t row = 0; row < SPLASH_TARGET_VERIFY_ROWS - 1; ++row)
+            checkLiveRows(backend, m, b, plan, row, row + 1, run,
+                          label + " draft row " + std::to_string(row));
           if (widest.output.empty()) widest = run;
           else compareWidest(run, label);
         }

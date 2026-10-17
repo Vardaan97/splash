@@ -509,7 +509,7 @@ metal::MetalBuffer Qwen4ExpTarget::mtpCarried(const metal::MetalBuffer &auxiliar
 
 void Qwen4ExpTarget::addMtpVerify(VerifyStep &step, metal::MetalBuffer embedding,
                                    metal::MetalBuffer history, uint32_t limit, bool full, uint32_t firstRow,
-                                   const Qwen4DraftHead *draftHead) const {
+                                   const Qwen4DraftHead *draftHead, uint32_t lastRow) const {
   constexpr uint32_t laneRows = kVerifyRows;
   const Qwen4MtpWeights &mtp = *weights_.mtp;
   const QwenTargetVerifyBuffers &b = step.buffers;
@@ -537,7 +537,7 @@ void Qwen4ExpTarget::addMtpVerify(VerifyStep &step, metal::MetalBuffer embedding
   if (!full) return;
   ops::HyperConnection::addCombine(step.graph, h.mtpStreams, h.branch, h.weights, hs, rows);
   addVerifyMix(step, mtp.block.ffnHyper, b.normalized, nullptr, h.mtpStreams);
-  ops::MoE::add(step.graph, {b.normalized, h.zeros, h.branch, b.moe}, mtp.block.ffn, *step.moe, firstRow);
+  ops::MoE::add(step.graph, {b.normalized, h.zeros, h.branch, b.moe}, mtp.block.ffn, *step.moe, firstRow, lastRow);
   ops::HyperConnection::addCombine(step.graph, h.mtpStreams, h.branch, h.weights, hs, rows);
   const ops::Projection &logits = draftHead ? draftHead->logits : weights_.logitsProjection;
   addDecodeProjection(step.graph, b.finalHidden, logits, b.logits, step.lanes, b.linearScratch,
@@ -590,7 +590,9 @@ void Qwen4ExpTarget::addMtpDraft(metal::CommandGraph &graph, QwenTargetVerifyBuf
       ops::Qwen4::addMtpTokens(graph, buffers.anchors, buffers.proposals, h.mtpTokens, lanes, laneRows,
                                buffers.proposalsPerLane, j);
       ops::Embedding::add(graph, h.mtpTokens, weightsBase_.tokenEmbedding, buffers.hidden[1], step.rows);
-      addMtpVerify(step, buffers.hidden[1], h.mtpHistory, j, true, j - 1, draftHead);
+      addMtpVerify(step, buffers.hidden[1], h.mtpHistory, j, true, j - 1, draftHead, draft.oneRow ? j : 0);
+      if (draft.tileCounts)
+        ops::RowCopy::add(graph, buffers.moe.tileCount, {0, 2, 0}, draft.tileCounts, {j - 1, 2, 0}, 1, 2);
       if (context) {
         const uint32_t hidden = geometry_.hiddenSize;
         for (uint32_t lane = 0; lane < lanes; ++lane)

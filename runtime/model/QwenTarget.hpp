@@ -371,6 +371,9 @@ struct QwenTargetMtpDraft final {
   // Whether the steps draft from the draft vocabulary and the lanes' context
   // rows (QwenTarget::hasMtpDraftVocabulary) rather than the whole head.
   bool draftVocabulary = false;
+  bool oneRow = false;
+  // Optional per-step MoE tile counts, copied before the scratch is reused.
+  metal::MetalBuffer tileCounts;
   // With `prefetchEvent`, step `prefetchStep` copies each lane's proposals so
   // far to `prefetchTokens` (proposalsPerLane uint32 per lane) and signals
   // the event to `prefetchValue`: a streamed PLE table reads the rows those

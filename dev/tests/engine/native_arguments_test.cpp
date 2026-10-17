@@ -2,6 +2,7 @@
 // (native_command_golden.txt), and the ones the engine refuses.
 
 #include "TestChecks.hpp"
+#include "model/MtpTuning.hpp"
 #include "TestFiles.hpp"
 #include "engine/NativeArguments.hpp"
 
@@ -12,6 +13,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -338,6 +340,18 @@ int main(int argc, char **argv) {
   try {
     testServerCommandLines(argv[1]);
     testNeuralEngine();
+    for (const char *name : {"SPLASH_MTP_DRAFT_ONE_ROW", "SPLASH_MTP_DRAFT_LOG"}) {
+      const char *old = std::getenv(name);
+      const std::optional<std::string> saved = old ? std::optional<std::string>(old) : std::nullopt;
+      unsetenv(name);
+      require(!model::mtpSwitchFromEnvironment(name), "MTP switch defaults off");
+      for (const char *value : {"", "0", "true", "2", "1"}) {
+        setenv(name, value, 1);
+        require(model::mtpSwitchFromEnvironment(name) == (std::string_view(value) == "1"), "MTP switch parse");
+      }
+      if (saved) setenv(name, saved->c_str(), 1);
+      else unsetenv(name);
+    }
     testRefusals();
     testModelDirectoryRoles();
     std::cout << "native arguments tests passed\n";
