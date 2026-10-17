@@ -346,6 +346,7 @@ struct Runtime::Impl {
     // The draft proposals the lane's thinking end replaced, which its
     // speculation counts leave out.
     uint32_t endDrafts = 0;
+    uint32_t drafted = kDraftProposalTokens;
     // Why the lane's selection is unusable (invalidSelection), found before
     // any lane commits.
     std::string failure;
@@ -617,7 +618,7 @@ struct Runtime::Impl {
   }
   // Binds each lane's context rows (copying in those it lacks) to a draft
   // from the draft vocabulary.
-  void bindDraftContext(QwenTargetVerifyBuffers &buffers, std::span<Request *const> entries) {
+  void bindDraftContext(QwenTargetVerifyBuffers &buffers, std::span<Request *const> entries, uint32_t laneMask = ~0u) {
     const uint32_t format = geometry.target.mtpDraftContextFormat;
     if (format >= GGUF_FMT_COUNT) return;
     const uint32_t lanes = static_cast<uint32_t>(entries.size());
@@ -628,6 +629,9 @@ struct Runtime::Impl {
     buffers.draftContextTokens = decodeArena->batchSlice(DecodeTensor::DraftContextTokens, kLaneCount);
     buffers.draftContextInfo = decodeArena->batchSlice(DecodeTensor::DraftContextInfo, lanes);
     for (uint32_t lane = 0; lane < lanes; ++lane) {
+      // A full-head lane must not mark context rows copied: it may switch
+      // back to the draft vocabulary in a later cycle.
+      if (!(laneMask & (1u << lane))) continue;
       Request &entry = *entries[lane];
       const uint32_t stateLane = entry.stateLane;
       const uint32_t count = static_cast<uint32_t>(entry.draftContext.tokens.size());
@@ -2181,7 +2185,7 @@ struct Runtime::Impl {
           if (entries[lane]->draftContext.useVocabulary(mtpVocabularyWarmStart, mtpVocabularyGate))
             vocabularyMask |= 1u << lane;
       const bool draftVocabulary = perLane ? vocabularyMask != 0 : useDraftVocabulary(entries.first(lanes));
-      if (draftVocabulary) bindDraftContext(buffers, entries.first(lanes));
+      if (draftVocabulary) bindDraftContext(buffers, entries.first(lanes), perLane ? vocabularyMask : ~0u);
       QwenTargetMtpDraft draft;
       draft.steps = steps;
       draft.perLane = perLane;
@@ -2400,6 +2404,8 @@ struct Runtime::Impl {
       if (laneResult.accepted > kDraftProposalTokens)
         throw std::runtime_error(
             "target accepted more than the draft proposed");
+      if (mtpLanes && lanes.size() > 1 && targetModel->hasMtp())
+        laneResult.drafted = laneResult.request->mtpDrafted;
       countMtpOutcome(*laneResult.request, laneResult.accepted);
       // The retained target tokens end with the next anchor. A non-finite
       // target row can also accept a sentinel draft proposal as an interior
@@ -2457,7 +2463,7 @@ struct Runtime::Impl {
                          std::move(output),
                          false,
                          DecodeStage::Regular,
-                         kDraftProposalTokens - laneResult.endDrafts,
+                         laneResult.drafted - std::min(laneResult.drafted, laneResult.endDrafts),
                          accepted - std::min(accepted, laneResult.endDrafts)});
       ModelStepResult &result = results.back();
       if (entry.generatedTokens < entry.maxNewTokens)
