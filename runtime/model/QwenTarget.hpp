@@ -375,6 +375,10 @@ struct QwenTargetMtpDraft final {
   // rows (QwenTarget::hasMtpDraftVocabulary) rather than the whole head.
   bool draftVocabulary = false;
   bool oneRow = false;
+  // Opt-in at B>1: each lane stops at its own depth and gates its own head.
+  bool perLane = false;
+  std::array<uint32_t, ExecutionLimits::maximumBatchWidth> laneSteps{};
+  uint32_t vocabularyMask = 0;
   uint32_t sampledMask = 0;
   std::array<ops::SamplingPolicy, ExecutionLimits::maximumBatchWidth> policies{};
   // Optional per-step MoE tile counts, copied before the scratch is reused.

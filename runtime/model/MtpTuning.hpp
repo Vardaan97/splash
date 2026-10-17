@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdlib>
+#include <array>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -13,6 +14,15 @@ namespace splash::model {
 inline bool mtpSwitchFromEnvironment(const char *name) {
   const char *value = std::getenv(name);
   return value && std::string_view(value) == "1";
+}
+
+// Zero depths mean the legacy batch-wide policy. An exhausted lane has an
+// empty [firstRow, lastRow) expert range, while its proposal tail stays filled.
+inline std::array<uint32_t, 4> mtpDraftLaneRows(std::span<const uint32_t> depths, uint32_t step, bool oneRow) {
+  std::array<uint32_t, 4> rows{};
+  for (uint32_t lane = 0; lane < depths.size(); ++lane)
+    rows[lane] = depths[lane] && depths[lane] < step ? step - 1 : oneRow ? step : 0;
+  return rows;
 }
 
 // Invalid thresholds leave the experiment off.

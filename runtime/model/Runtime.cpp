@@ -412,7 +412,9 @@ struct Runtime::Impl {
   float mtpLiveThreshold = mtpThresholdFromEnvironment();
   uint64_t mtpLiveTotal = 0, mtpLiveSamples = 0, mtpLiveCycles = 0;
   bool mtpSampledDraft = mtpSwitchFromEnvironment("SPLASH_MTP_SAMPLED_DRAFT");
+  bool mtpLanes = mtpSwitchFromEnvironment("SPLASH_MTP_LANES");
   bool mtpDraftOneRow = mtpSwitchFromEnvironment("SPLASH_MTP_DRAFT_ONE_ROW");
+  bool mtpDraftTrace = mtpSwitchFromEnvironment("SPLASH_MTP_DRAFT_TRACE");
   bool mtpDraftLog = mtpSwitchFromEnvironment("SPLASH_MTP_DRAFT_LOG");
   MetalBuffer mtpDraftTileCounts;
   std::array<uint64_t, kDraftProposalTokens> mtpTileTotals{}, mtpTileSamples{};
@@ -468,7 +470,7 @@ struct Runtime::Impl {
   std::array<uint32_t, kLaneCount> verifyLiveRows(std::span<Request *const> entries) const {
     std::array<uint32_t, kLaneCount> result{};
     if (!targetModel->hasMtp()) return result;
-    if (!(mtpLiveThreshold > 0)) {
+    if (!(mtpLiveThreshold > 0) && !(mtpLanes && entries.size() > 1)) {
       uint32_t rows = 0;
       for (const Request *entry : entries) {
         if (!entry->mtpDrafted) return result;
@@ -2156,10 +2158,15 @@ struct Runtime::Impl {
       buffers.draftUniforms = d(DecodeTensor::SamplingUniforms);
       buffers.proposalsPerLane = kDraftProposalTokens;
       buffers.candidatesPerProposal = SPLASH_DRAFT_CANDIDATES;
+      const bool perLane = mtpLanes && lanes > 1;
+      std::array<uint32_t, kLaneCount> depths{};
       uint32_t steps = 1;
-      for (uint32_t lane = 0; lane < lanes; ++lane) steps = std::max(steps, mtpStepsFor(*entries[lane]));
       for (uint32_t lane = 0; lane < lanes; ++lane) {
-        entries[lane]->mtpDrafted = steps;
+        depths[lane] = mtpStepsFor(*entries[lane]);
+        steps = std::max(steps, depths[lane]);
+      }
+      for (uint32_t lane = 0; lane < lanes; ++lane) {
+        entries[lane]->mtpDrafted = perLane ? depths[lane] : steps;
         entries[lane]->mtpLiveRows = 0;
       }
       // From the draft vocabulary and each lane's context while every lane
@@ -2168,10 +2175,18 @@ struct Runtime::Impl {
         for (uint32_t lane = 0; lane < lanes; ++lane)
           entries[lane]->draftContext.scan(entries[lane]->tokens, geometry.target.vocabularySize,
                                            kQwen4DraftContextTokens, std::get<Qwen4ExpWeights>(model.target).layout.mtpDraftTokens);
-      const bool draftVocabulary = useDraftVocabulary(entries.first(lanes));
+      uint32_t vocabularyMask = 0;
+      if (perLane && targetModel->hasMtpDraftVocabulary())
+        for (uint32_t lane = 0; lane < lanes; ++lane)
+          if (entries[lane]->draftContext.useVocabulary(mtpVocabularyWarmStart, mtpVocabularyGate))
+            vocabularyMask |= 1u << lane;
+      const bool draftVocabulary = perLane ? vocabularyMask != 0 : useDraftVocabulary(entries.first(lanes));
       if (draftVocabulary) bindDraftContext(buffers, entries.first(lanes));
       QwenTargetMtpDraft draft;
       draft.steps = steps;
+      draft.perLane = perLane;
+      draft.laneSteps = depths;
+      draft.vocabularyMask = vocabularyMask;
       draft.oneRow = mtpDraftOneRow;
       if (mtpSampledDraft)
         for (uint32_t lane = 0; lane < lanes; ++lane) {
@@ -2370,6 +2385,12 @@ struct Runtime::Impl {
       auto d = [&](DecodeTensor tensor) {
         return decodeArena->get(lane, tensor);
       };
+      if (mtpDraftTrace && targetModel->hasMtp() && laneResult.request->mtpDrafted) {
+        const auto *proposals = contents<uint32_t>(d(DecodeTensor::ProposedTokens), "MTP trace proposals");
+        std::fprintf(stderr, "MTP proposals lane=%u depth=%u:", lane, laneResult.request->mtpDrafted);
+        for (uint32_t j = 0; j < laneResult.request->mtpDrafted; ++j) std::fprintf(stderr, " %u", proposals[j]);
+        std::fprintf(stderr, "\n");
+      }
       laneResult.retained = *contents<uint32_t>(d(DecodeTensor::RetainedCount),
                                                 "GPU retained token count");
       laneResult.accepted = *contents<uint32_t>(d(DecodeTensor::AcceptedCount),

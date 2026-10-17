@@ -33,6 +33,7 @@
 #include "../../../runtime/metal/MetalBackend.hpp"
 #include "../../../runtime/ops/Linear.hpp"
 #include "../../../runtime/ops/MoE.hpp"
+#include "../../../runtime/ops/Qwen4.hpp"
 #include "GgufFormatReference.hpp"
 #include "MoeExtents.hpp"
 #include "MoeFixture.hpp"
@@ -760,6 +761,27 @@ void checkLiveRows(MetalBackend &backend, const Model &m, Buffers &b, const MoeP
     require(std::equal(run.output.begin() + uint64_t{row} * kHidden, run.output.begin() + uint64_t{row + 1} * kHidden,
                        reference.output.begin() + uint64_t{row} * kHidden),
             label + ": row " + std::to_string(row) + " differs from the run that routes every row");
+  }
+  if (preserveTileKind) {
+    // A deterministic synthetic head with identity vocabulary weights:
+    // compare actual GPU proposals, including the repeated tail at depth.
+    const uint32_t lanes = rows / SPLASH_TARGET_VERIFY_ROWS, proposals = SPLASH_TARGET_VERIFY_ROWS - 1;
+    std::array<MetalBuffer, 2> proposed;
+    CommandGraph select;
+    for (uint32_t arm = 0; arm < 2; ++arm) {
+      const auto &output = arm ? run.output : reference.output;
+      std::vector<float> logits(output.size());
+      std::transform(output.begin(), output.end(), logits.begin(), bf2f);
+      proposed[arm] = zeros(backend, lanes * proposals * sizeof(uint32_t), "one-row-proposals");
+      splash::ops::Qwen4::addMtpArgmax(select,
+          upload(backend, logits.data(), logits.size() * sizeof(float), "one-row-logits"), proposed[arm],
+          zeros(backend, lanes * proposals * sizeof(uint32_t), "one-row-candidates"),
+          zeros(backend, lanes * proposals * sizeof(float), "one-row-confidence"),
+          lanes, SPLASH_TARGET_VERIFY_ROWS, kHidden, proposals, 1, firstRow, true);
+    }
+    static_cast<void>(backend.submitCommandAsync(select.dispatches()).wait());
+    require(!std::memcmp(proposed[0].contents(), proposed[1].contents(), lanes * proposals * sizeof(uint32_t)),
+            label + ": ONE_ROW changed synthetic head proposals");
   }
 }
 

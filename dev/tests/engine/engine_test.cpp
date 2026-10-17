@@ -10401,6 +10401,11 @@ void testImpossibleSpeculativeCountsFailOnlyTheirOwnLane() {
 int main() {
   try {
     using model::mtpLiveRows;
+    const std::array<uint32_t, 4> depths{2, 7, 3, 5};
+    require(model::mtpDraftLaneRows(depths, 3, false) == std::array<uint32_t, 4>{2, 0, 0, 0},
+            "exhausted draft lanes route no rows at the current first row");
+    require(model::mtpDraftLaneRows(depths, 4, true) == std::array<uint32_t, 4>{3, 4, 3, 4},
+            "ONE_ROW and per-lane depth compose");
     const std::array<float, 3> confidence{0.8F, 0.5F, 0.25F};
     require(mtpLiveRows(confidence, 4, 0) == 4, "threshold zero keeps the draft bound");
     require(mtpLiveRows(confidence, 4, 0.3F) == 3, "cumulative confidence keeps a leading prefix");
