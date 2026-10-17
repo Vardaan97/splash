@@ -75,9 +75,10 @@ drafts with its own MTP head instead.
 No DFlash2 draft of Qwen3.8-Flash-Next is released yet: without
 `--draft-model`, its installation takes the MTP head its repository publishes
 beside the target (`MTP/mtp-*-shared-Q8_0.gguf`, as Unsloth's does) and
-decodes with it, up to seven proposals a cycle at an adaptive depth
-([Drafts](DEVELOPMENT.md#drafts)); `--draft-model` names a DFlash2 draft, a
-Hub repository or a local directory, in its place. Its routed experts and PLE
+decodes with it, up to seven proposals a cycle at an adaptive depth, each
+drafted from a vocabulary of the most frequent tokens and the request's own
+context ([Drafts](DEVELOPMENT.md#drafts)); `--draft-model` names a DFlash2
+draft, a Hub repository or a local directory, in its place. Its routed experts and PLE
 n-gram table can stay on the SSD: `UD-IQ3_XXS` runs on a 36 GB Mac with
 `--expert-memory 16G --ple-ssd-cache 2G`, and on a 64 GB Mac
 `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:Q2_0` keeps every expert in

@@ -39,6 +39,7 @@ struct Qwen3_6MoeLayerWeights;
 struct Qwen4ExpWeights;
 struct Qwen4ExpLayerWeights;
 struct Qwen4HyperWeights;
+struct Qwen4DraftHead;
 struct Qwen4Scratch;
 class Qwen4Steps;
 
@@ -112,6 +113,10 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
   // Qwen3.8-Flash-Next's MTP head's full-attention blocks (0 or 1), whose KV
   // is the last attention layer of kvLayout (Qwen4ExpLayout::mtpLayers).
   uint32_t mtpLayers = 0;
+  // With a draft vocabulary, the format of the vocabulary projection's rows
+  // each state lane keeps of its request's context tokens
+  // (Qwen4DraftVocabulary.hpp); GGUF_FMT_COUNT for none.
+  uint32_t mtpDraftContextFormat = GGUF_FMT_COUNT;
   // The target's KV layout in the format the runtime stores KV in, and its
   // GDN state layout.
   kv::Layout kvLayout{};
@@ -330,6 +335,21 @@ struct QwenTargetVerifyBuffers final {
   metal::MetalBuffer candidates;
   uint32_t proposalsPerLane = 0;
   uint32_t candidatesPerProposal = 0;
+  // With the draft vocabulary, each lane's context rows beside it
+  // (Qwen4DraftVocabulary.hpp): its head over its state lane's rows, how
+  // many of them hold its context tokens, and the (token, row) pairs to copy
+  // into them first; the lanes' logits of them (draftContextLogitsSlot
+  // floats each), the state lanes' tokens of them and each lane's
+  // Qwen4MtpContextLane. Lanes without draftContextCounts draft from the
+  // draft vocabulary alone.
+  std::array<ops::Projection, ExecutionLimits::maximumBatchWidth> draftContextHeads;
+  std::array<uint32_t, ExecutionLimits::maximumBatchWidth> draftContextCounts{};
+  std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> draftContextCopies;
+  std::array<uint32_t, ExecutionLimits::maximumBatchWidth> draftContextCopyCounts{};
+  metal::MetalBuffer draftContextLogits;
+  uint32_t draftContextLogitsSlot = 0;
+  metal::MetalBuffer draftContextTokens;
+  metal::MetalBuffer draftContextInfo;
 };
 
 // The auxiliary state after the rows each lane of a verify retained, which
@@ -348,6 +368,9 @@ struct QwenTargetCommitBuffers final {
 // from no expert (addVerify liveRows).
 struct QwenTargetMtpDraft final {
   uint32_t steps = 0;
+  // Whether the steps draft from the draft vocabulary and the lanes' context
+  // rows (QwenTarget::hasMtpDraftVocabulary) rather than the whole head.
+  bool draftVocabulary = false;
 };
 
 // The bytes of a target's own step scratch beside the runtime's arenas, a
@@ -430,6 +453,9 @@ public:
   [[nodiscard]] const Qwen4ExpWeights *qwen4() const noexcept;
   // Whether Qwen3.8-Flash-Next's MTP head drafts (Qwen4ExpLayout::mtpLayers).
   [[nodiscard]] bool hasMtp() const noexcept { return geometry_.mtpLayers != 0; }
+  // Whether the MTP head drafts from a draft vocabulary when asked
+  // (Qwen4ExpLayout::mtpDraftTokens).
+  [[nodiscard]] bool hasMtpDraftVocabulary() const noexcept;
   // `draft.steps` draft steps of the MTP head over each lane's verify rows,
   // before the verify: step j writes proposal j - 1, the last one also every
   // later proposal. The verify then writes the head's KV at its rows.
@@ -552,8 +578,11 @@ private:
   // with the carried streams and `history`), its attention block (writing
   // its KV) and, when `full`, its FFN, its head mix and logits. Each lane's
   // rows before `firstRow` route to no expert (ops::MoE::add).
+  // With `draftHead`, the logits are of its tokens rather than the whole
+  // vocabulary.
   void addQwen4MtpVerify(VerifyStep &step, const Qwen4ExpWeights &weights, metal::MetalBuffer embedding,
-                         metal::MetalBuffer history, uint32_t limit, bool full, uint32_t firstRow = 0) const;
+                         metal::MetalBuffer history, uint32_t limit, bool full, uint32_t firstRow = 0,
+                         const Qwen4DraftHead *draftHead = nullptr) const;
   // The MTP head's KV at a prefill chunk's rows, and each sequence's carried
   // streams after its rows (and at each state captured inside them).
   void addQwen4MtpPrefill(PrefillStep &step, const Qwen4ExpWeights &weights) const;

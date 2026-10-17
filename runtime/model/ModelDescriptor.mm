@@ -1,5 +1,6 @@
 #include "ModelDescriptor.hpp"
 #include "GgufImage.hpp"
+#include "Qwen4DraftVocabulary.hpp"
 #include "SafetensorsImage.hpp"
 #include "WeightStore.hpp"
 #include "metal/abi/DraftAttention.h"
@@ -651,8 +652,14 @@ ModelDescriptor describeSourceModel(std::string name, std::string_view targetFor
     if (targetSource == TargetSource::Safetensors) requireQuantization(config, layout);
     if (draft) draftLayout = readDraftLayout(draft, layout);
     if (mtp) {
-      if constexpr (requires { layout.mtpLayers; }) layout.mtpLayers = 1;
-      else throw std::invalid_argument(std::string(layout.family) + " has no MTP head to draft with");
+      if constexpr (requires { layout.mtpLayers; }) {
+        layout.mtpLayers = 1;
+        // The head drafts from the draft vocabulary unless
+        // SPLASH_MTP_DRAFT_VOCAB=0 (Qwen4DraftVocabulary.hpp).
+        layout.mtpDraftTokens = qwen4DraftTokensFor(layout.vocabularySize);
+      } else {
+        throw std::invalid_argument(std::string(layout.family) + " has no MTP head to draft with");
+      }
       draftLayout = nullDraftLayout(layout.hiddenSize, layout.vocabularySize);
     }
   }, *target);

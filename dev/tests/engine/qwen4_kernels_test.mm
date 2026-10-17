@@ -19,6 +19,7 @@
 #include "../../../runtime/ops/Sampling.hpp"
 #include "LinearInputReference.hpp"
 #include "metal/abi/KvExtent.h"
+#include "metal/abi/QuantFormat.h"
 #include "metal/abi/Qwen4.h"
 
 #import <Foundation/Foundation.h>
@@ -815,6 +816,128 @@ void mtpTest(MetalBackend &backend) {
       okArgmax &= c[(lane * proposals + i) * candidates + 1] == 7;
     }
   check(okArgmax, "MTP argmax: the row's argmax as its proposal and every later one");
+
+  // Over a draft vocabulary: the argmax's token, ties toward the lower token,
+  // and token 0 for a row without a finite logit, as without one.
+  const uint32_t drafted = 4096;
+  std::vector<uint32_t> draftTokens(drafted);
+  for (uint32_t i = 0; i < drafted; ++i) draftTokens[i] = 3 * i + 1;
+  auto draftLogits = randoms(rng, uint64_t{lanes} * laneRows * drafted, 1.0f);
+  draftLogits[(0 * laneRows + 2) * uint64_t{drafted} + 4000] = 50.0f;
+  draftLogits[(1 * laneRows + 2) * uint64_t{drafted} + 17] = 50.0f;
+  draftLogits[(1 * laneRows + 2) * uint64_t{drafted} + 9] = 50.0f; // tie: the lower token
+  for (uint32_t i = 0; i < drafted; ++i) draftLogits[(1 * laneRows + 3) * uint64_t{drafted} + i] = NAN;
+  std::vector<uint32_t> mappedProposals(lanes * proposals, 5), mappedCandidates(lanes * proposals * candidates, 7);
+  MetalBuffer mappedProposed = upload(backend, mappedProposals), mappedCandidate = upload(backend, mappedCandidates);
+  MetalBuffer draftLogitBuffer = upload(backend, draftLogits);
+  CommandGraph mapped;
+  ops::Qwen4::addMtpArgmax(mapped, draftLogitBuffer, mappedProposed, mappedCandidate, lanes, laneRows, drafted,
+                           proposals, candidates, 2, false, upload(backend, draftTokens));
+  ops::Qwen4::addMtpArgmax(mapped, draftLogitBuffer, mappedProposed, mappedCandidate, lanes, laneRows, drafted,
+                           proposals, candidates, 3, true, upload(backend, draftTokens));
+  run(backend, mapped);
+  const auto mp = download<uint32_t>(mappedProposed, lanes * proposals);
+  const auto mc = download<uint32_t>(mappedCandidate, lanes * proposals * candidates);
+  // Lane 0's row 3: its own argmax over the random logits.
+  uint32_t best = 0;
+  for (uint32_t i = 1; i < drafted; ++i)
+    if (draftLogits[3 * uint64_t{drafted} + i] > draftLogits[3 * uint64_t{drafted} + best]) best = i;
+  bool okMapped = true;
+  for (uint32_t lane = 0; lane < lanes; ++lane)
+    for (uint32_t i = 0; i < proposals; ++i) {
+      const uint32_t want = i < 2 ? 5 : i == 2 ? (lane ? 28 : 12001) : (lane ? 0 : draftTokens[best]);
+      okMapped &= mp[lane * proposals + i] == want;
+      okMapped &= mc[(lane * proposals + i) * candidates] == (i < 2 ? 7 : want);
+    }
+  check(okMapped, "MTP argmax over a draft vocabulary: the argmax's token, the lower on a tie, 0 for none finite");
+
+  // Over the draft vocabulary and each lane's context rows beside it: lane
+  // 0 (state lane 2) finds its best in its context, lane 1 (state lane 0)
+  // ties a vocabulary token with a lower context token; logits past a
+  // lane's count never count.
+  const uint32_t capacity = 64, slot = laneRows * capacity, stateLanes = 4;
+  std::vector<float> contextLogits(uint64_t{lanes} * slot, -5.0f);
+  std::vector<uint32_t> contextTokens(stateLanes * capacity, 0);
+  for (uint32_t lane = 0; lane < stateLanes; ++lane)
+    for (uint32_t i = 0; i < capacity; ++i) contextTokens[lane * capacity + i] = 200000 + lane * 1000 + i;
+  contextTokens[0 * capacity + 3] = 4;    // state lane 0's row 3: token 4, below lane 1's tie token 28
+  std::vector<uint32_t> info{10, 2, 0, 0, 5, 0, 0, 0};
+  contextLogits[0 * slot + 1 * capacity + 7] = 80.0f;   // lane 0, row 1: context row 7, state lane 2's token
+  contextLogits[0 * slot + 1 * capacity + 12] = 90.0f;  // past lane 0's count of 10: ignored
+  contextLogits[1 * slot + 1 * capacity + 3] = 50.0f;   // lane 1, row 1: ties the vocabulary's 50 at token 28
+  auto vocabularyLogits = draftLogits;
+  vocabularyLogits[(1 * laneRows + 1) * uint64_t{drafted} + 9] = 50.0f;
+  std::vector<uint32_t> contextProposals(lanes * proposals, 5), contextCandidates(lanes * proposals * candidates, 7);
+  MetalBuffer contextProposed = upload(backend, contextProposals), contextCandidate = upload(backend, contextCandidates);
+  CommandGraph withContext;
+  ops::Qwen4::addMtpArgmaxContext(withContext, upload(backend, vocabularyLogits), contextProposed, contextCandidate,
+                                  upload(backend, draftTokens), upload(backend, contextLogits),
+                                  upload(backend, contextTokens), upload(backend, info), lanes, laneRows, drafted,
+                                  capacity, slot, proposals, candidates, 1, true);
+  run(backend, withContext);
+  const auto cp = download<uint32_t>(contextProposed, lanes * proposals);
+  bool okContext = true;
+  for (uint32_t i = 1; i < proposals; ++i) {
+    okContext &= cp[i] == 202007;
+    okContext &= cp[proposals + i] == 4;
+  }
+  okContext &= cp[0] == 5 && cp[proposals] == 5;
+  check(okContext, "MTP argmax with context rows: a context token, the lower token on a tie, only the lane's count");
+
+  // Rows of one quantized tensor copied to rows of another: each pair's
+  // destination row is its source row, byte for byte, in every plane.
+  for (const uint32_t format : {GGUF_FMT_Q6K, GGUF_FMT_Q80, GGUF_FMT_Q4K}) {
+    const QuantFormat &layout = kQuantFormats[format];
+    const uint32_t sourceRows = 128, targetRows = 128, inputs = 512, groups = inputs / 32;
+    std::mt19937 bytes(format);
+    const auto planeOf = [&](uint32_t rows, uint32_t unitBytes, uint32_t units, bool random) {
+      std::vector<uint8_t> plane(std::max<uint64_t>(uint64_t{rows} * units * unitBytes, 16), 0);
+      if (random) for (uint8_t &b : plane) b = uint8_t(bytes());
+      return plane;
+    };
+    const auto s0 = planeOf(sourceRows, layout.plane0_bytes, groups, true);
+    const auto s1 = planeOf(sourceRows, layout.plane1_bytes, groups, true);
+    const auto sm = planeOf(sourceRows, layout.meta_bytes, groups / layout.meta_groups, true);
+    MetalBuffer t0 = upload(backend, planeOf(targetRows, layout.plane0_bytes, groups, false));
+    MetalBuffer t1 = upload(backend, planeOf(targetRows, layout.plane1_bytes, groups, false));
+    MetalBuffer tm = upload(backend, planeOf(targetRows, layout.meta_bytes, groups / layout.meta_groups, false));
+    const auto source = ops::QuantizedSegment::planes(format, sourceRows, inputs, upload(backend, s0),
+                                                      layout.plane1_bytes ? upload(backend, s1) : MetalBuffer{},
+                                                      upload(backend, sm));
+    const auto target =
+        ops::QuantizedSegment::planes(format, targetRows, inputs, t0, layout.plane1_bytes ? t1 : MetalBuffer{}, tm);
+    const std::vector<uint32_t> pairs{5, 0, 77, 1, 127, 63, 0, 64, 64, 127};
+    CommandGraph copies;
+    ops::Qwen4::addCopyHeadRows(copies, source, target, upload(backend, pairs), 5);
+    run(backend, copies);
+    const auto rowOf = [&](const uint8_t *plane, uint32_t row, uint32_t units, uint32_t unitBytes) {
+      std::vector<uint8_t> out;
+      for (uint32_t unit = 0; unit < units; ++unit) {
+        const uint64_t at = ((uint64_t{row / QUANT_TILE_ROWS} * units + unit) * QUANT_TILE_ROWS + row % QUANT_TILE_ROWS) *
+                            unitBytes;
+        out.insert(out.end(), plane + at, plane + at + unitBytes);
+      }
+      return out;
+    };
+    const auto *g0 = static_cast<const uint8_t *>(t0.contents()), *g1 = static_cast<const uint8_t *>(t1.contents()),
+               *gm = static_cast<const uint8_t *>(tm.contents());
+    bool okCopy = true;
+    std::vector<bool> written(targetRows, false);
+    for (size_t i = 0; i < pairs.size(); i += 2) {
+      written[pairs[i + 1]] = true;
+      okCopy &= rowOf(g0, pairs[i + 1], groups, layout.plane0_bytes) == rowOf(s0.data(), pairs[i], groups, layout.plane0_bytes);
+      if (layout.plane1_bytes)
+        okCopy &= rowOf(g1, pairs[i + 1], groups, layout.plane1_bytes) == rowOf(s1.data(), pairs[i], groups, layout.plane1_bytes);
+      okCopy &= rowOf(gm, pairs[i + 1], groups / layout.meta_groups, layout.meta_bytes) ==
+                rowOf(sm.data(), pairs[i], groups / layout.meta_groups, layout.meta_bytes);
+    }
+    for (uint32_t row = 0; row < targetRows; ++row)
+      if (!written[row]) {
+        const auto r = rowOf(g0, row, groups, layout.plane0_bytes);
+        okCopy &= std::all_of(r.begin(), r.end(), [](uint8_t b) { return b == 0; });
+      }
+    check(okCopy, std::string("head rows copied by pairs, plane for plane: ") + layout.name);
+  }
 
   const auto streamRows = randoms(rng, laneRows * width, 1.0f);
   MetalBuffer carriedOut = scratch(backend, width * 4), carriedFixed = scratch(backend, width * 4);

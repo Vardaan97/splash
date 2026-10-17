@@ -150,10 +150,41 @@ struct Qwen4MtpParams {
   uint32_t row;        // argmax: the row; input: the first output row
   uint32_t last;       // argmax: whether to fill the later proposals
   uint32_t counted;    // carry: whether `retained` is bound
-  uint32_t pad;
+  // argmax with context rows (qwen4_mtp_argmax_context): each lane's logits
+  // of its context rows, at context_slot floats per lane and
+  // context_capacity per row, and each state lane's tokens of them,
+  // context_capacity per lane; a lane's Qwen4MtpContextLane gives its count
+  // and state lane.
+  uint32_t context_capacity;
+  uint32_t context_slot;
+  uint32_t pad[3];
 };
 
-static_assert(sizeof(Qwen4MtpParams) == 48, "Qwen4 MTP parameters are 48 bytes on both sides");
+static_assert(sizeof(Qwen4MtpParams) == 64, "Qwen4 MTP parameters are 64 bytes on both sides");
+
+struct Qwen4MtpContextLane {
+  uint32_t count;
+  uint32_t state_lane;
+  uint32_t pad[2];
+};
+
+static_assert(sizeof(Qwen4MtpContextLane) == 16, "Qwen4 MTP context lanes are 16 bytes on both sides");
+
+// Rows of a quantized tensor's planes (metal/abi/QuantFormat.h) copied to
+// rows of another of the same format and width (qwen4_copy_head_rows):
+// `count` (source row, destination row) pairs; `groups` groups of 32 inputs
+// per row, `meta_groups` of them per meta unit.
+struct Qwen4HeadRowsParams {
+  uint32_t count;
+  uint32_t groups;
+  uint32_t meta_groups;
+  uint32_t plane0_bytes;
+  uint32_t plane1_bytes;
+  uint32_t meta_bytes;
+  uint32_t pad[2];
+};
+
+static_assert(sizeof(Qwen4HeadRowsParams) == 32, "Qwen4 head row parameters are 32 bytes on both sides");
 
 // The PLE rows (the n-gram hash, model/Qwen4Exp.hpp) of each lane's
 // SPLASH_TARGET_VERIFY_ROWS verify rows on the GPU, from the rows' tokens and

@@ -339,6 +339,19 @@ enum class DecodeTensor : uint32_t {
   // Indexed by state lane, like PageTable: a penalized request's penalty
   // words (ops::Sampling::rebuildPenaltyWords).
   PenaltyState,
+  // Indexed by state lane: the vocabulary projection's rows of the lane's
+  // request's context tokens beside the MTP head's draft vocabulary (planes
+  // of QwenTargetGeometry::mtpDraftContextFormat, kQwen4DraftContextTokens
+  // rows), those tokens, and the (token, row) pairs a cycle copies in.
+  DraftContextPlane0,
+  DraftContextPlane1,
+  DraftContextMeta,
+  DraftContextTokens,
+  DraftContextCopies,
+  // Indexed by decode lane: a draft step's logits of the lane's context
+  // rows, and its context (Qwen4MtpContextLane).
+  DraftContextLogits,
+  DraftContextInfo,
   // A GDN layer's packed input projection rows, which its mixer reads.
   GdnPacked,
   // Indexed by state lane, like PageTable: the lane's two decode tape slots

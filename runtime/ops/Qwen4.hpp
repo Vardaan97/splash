@@ -10,6 +10,7 @@
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/Qwen4.h"
 #include "ops/Normalization.hpp"
+#include "ops/Weights.hpp"
 #include "ops/RowCopy.hpp"
 
 #include <cstdint>
@@ -145,10 +146,29 @@ struct Qwen4 final {
   static void addMtpWiden(metal::CommandGraph &graph, metal::MetalBuffer projected, metal::MetalBuffer streams,
                           HyperShape shape, uint32_t rows);
   // Each lane's argmax of its logits row `row` (`vocabulary` logits per row)
-  // as its proposal `row` and, `last`, every later one.
+  // as its proposal `row` and, `last`, every later one. With `tokens`, the
+  // logits are a draft vocabulary's, ascending token ids of which `tokens`
+  // holds (uint32 each), and the proposal is the argmax's token.
   static void addMtpArgmax(metal::CommandGraph &graph, metal::MetalBuffer logits, metal::MetalBuffer proposals,
                            metal::MetalBuffer candidates, uint32_t lanes, uint32_t laneRows, uint32_t vocabulary,
-                           uint32_t proposalsPerLane, uint32_t candidatesPerProposal, uint32_t row, bool last);
+                           uint32_t proposalsPerLane, uint32_t candidatesPerProposal, uint32_t row, bool last,
+                           metal::MetalBuffer tokens = {});
+  // The same over the draft vocabulary (`tokens`, `vocabulary` logits) and,
+  // beside it, each lane's context rows: `contextLogits` (logitsSlot floats
+  // per lane, `capacity` per row), the state lanes' `contextTokens`
+  // (`capacity` each) and each lane's Qwen4MtpContextLane in `lanesInfo`.
+  // Ties go toward the lower token.
+  static void addMtpArgmaxContext(metal::CommandGraph &graph, metal::MetalBuffer logits, metal::MetalBuffer proposals,
+                                  metal::MetalBuffer candidates, metal::MetalBuffer tokens,
+                                  metal::MetalBuffer contextLogits, metal::MetalBuffer contextTokens,
+                                  metal::MetalBuffer lanesInfo, uint32_t lanes, uint32_t laneRows,
+                                  uint32_t vocabulary, uint32_t capacity, uint32_t logitsSlot,
+                                  uint32_t proposalsPerLane, uint32_t candidatesPerProposal, uint32_t row, bool last);
+  // Rows of `source` (one quantized tensor) copied to rows of `target` (one
+  // of the same format and width): `count` (source row, destination row)
+  // uint32 pairs in `pairs`.
+  static void addCopyHeadRows(metal::CommandGraph &graph, const QuantizedSegment &source,
+                              const QuantizedSegment &target, metal::MetalBuffer pairs, uint32_t count);
   // Row retained - 1 of `streams` (retained a GPU count) or, without
   // `retained`, row `rows` - 1.
   static void addMtpCarry(metal::CommandGraph &graph, metal::MetalBuffer streams, metal::MetalBuffer carried,
