@@ -141,6 +141,9 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
   captureLayers() const noexcept {
     return {captureLayerValues.data(), captureLayerCount};
   }
+  [[nodiscard]] constexpr uint64_t indexerPendingBytes() const noexcept {
+    return indexerBlockTokens ? uint64_t{kvLayout.attentionLayers} * (indexerBlockTokens - 1) * indexerHeadDimension * sizeof(uint16_t) : 0;
+  }
   // The trunk's attention layers, before the MTP head's in the KV pages.
   [[nodiscard]] constexpr uint32_t trunkAttentionLayers() const noexcept {
     return kvLayout.attentionLayers - mtpLayers;
@@ -490,7 +493,6 @@ public:
                             metal::MetalBuffer finalHidden, metal::MetalBuffer logits,
                             uint32_t lanes, ops::LinearScratch scratch) const = 0;
   [[nodiscard]] bool hasMtp() const noexcept { return geometry_.mtpLayers != 0; }
-  [[nodiscard]] virtual const Qwen4ExpWeights *qwen4() const noexcept { return nullptr; }
   [[nodiscard]] virtual bool hasMtpDraftVocabulary() const noexcept { return false; }
   virtual void addMtpDraft(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
                            const kv::PageStorage &kv, std::span<const kv::ChunkedPrefillParams> chunks,

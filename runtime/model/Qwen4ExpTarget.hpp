@@ -21,6 +21,7 @@ struct Qwen4ExpWeights;
 struct Qwen4ExpLayerWeights;
 struct Qwen4HyperWeights;
 struct Qwen4IndexerWeights;
+struct Qwen4DraftHead;
 
 class Qwen4ExpTarget final : public QwenTarget {
 public:
@@ -47,7 +48,6 @@ public:
   // from the convolution inputs and keys its verify wrote.
   void addStateCommit(metal::CommandGraph &graph, QwenTargetCommitBuffers buffers, uint32_t lanes) const override;
 
-  [[nodiscard]] const Qwen4ExpWeights *qwen4() const noexcept override { return &weights_; }
   [[nodiscard]] bool hasMtpDraftVocabulary() const noexcept override;
   void addMtpDraft(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers, const kv::PageStorage &kv,
                    std::span<const kv::ChunkedPrefillParams> chunks, uint32_t lanes,
@@ -87,7 +87,8 @@ private:
 
   // A prefill step's mix of the streams through `hyper` into `output` and,
   // when it injects, the injection weights into the step's scratch.
-  void addPrefillMix(PrefillStep &step, const Qwen4HyperWeights &hyper, metal::MetalBuffer output, metal::MetalBuffer streams = {}) const;
+  void addPrefillMix(PrefillStep &step, const Qwen4HyperWeights &hyper, metal::MetalBuffer output,
+                      metal::MetalBuffer streams = {}) const;
   // A verify step's mix into `output`; its projections read the tables its
   // norm and low step write, and with `next`, the decode projection that
   // reads `output` first takes the table the mix writes (the returned input).

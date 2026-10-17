@@ -148,7 +148,7 @@ void Qwen4ExpTarget::addPrefillLayer(PrefillStep &step, uint32_t index) const {
       layer.mixer);
   ops::HyperConnection::addCombine(step.graph, h.streams, h.branch, h.weights, hyperShape(geometry_), rows);
   addPrefillMix(step, layer.ffnHyper, b.normalized);
-  ops::MoE::addRouting(step.graph, step.ffn, layer.ffn, *step.moe, 0, liveRows);
+  ops::MoE::addRouting(step.graph, step.ffn, layer.ffn, *step.moe);
 }
 
 const ops::BlockMoeWeights *Qwen4ExpTarget::moe(uint32_t index) const { return &weights_.layers[index].ffn; }
@@ -504,7 +504,7 @@ void Qwen4ExpTarget::addMtpPrefill(PrefillStep &step) const {
 }
 
 metal::MetalBuffer Qwen4ExpTarget::mtpCarried(const metal::MetalBuffer &auxiliary) const {
-  return backend_.view(auxiliary, geometry_.pleHistoryBytes(), uint64_t{geometry_.streamWidth()} * sizeof(float));
+  return backend_.view(auxiliary, geometry_.pleHistoryBytes() + geometry_.indexerPendingBytes(), uint64_t{geometry_.streamWidth()} * sizeof(float));
 }
 
 void Qwen4ExpTarget::addMtpVerify(VerifyStep &step, metal::MetalBuffer embedding,
@@ -531,9 +531,9 @@ void Qwen4ExpTarget::addMtpVerify(VerifyStep &step, metal::MetalBuffer embedding
   const uint32_t attentionLayer = geometry_.trunkAttentionLayers();
   const QwenAttentionWeights &attention = std::get<QwenAttentionWeights>(mtp.block.mixer);
   step.attentionLayer = attentionLayer;
-  addVerifyMixer(step, attention,
-                 addVerifyMix(step, mtp.block.mixerHyper, b.normalized, &attention.inputProjection, h.mtpStreams),
-                 {h.branch, {}}, addVerifyQsa(step, *mtp.block.indexer));
+  const ops::PreparedInput input =
+      addVerifyMix(step, mtp.block.mixerHyper, b.normalized, &attention.inputProjection, h.mtpStreams);
+  addVerifyMixer(step, attention, input, {h.branch, {}}, addVerifyQsa(step, *mtp.block.indexer));
   if (!full) return;
   ops::HyperConnection::addCombine(step.graph, h.mtpStreams, h.branch, h.weights, hs, rows);
   addVerifyMix(step, mtp.block.ffnHyper, b.normalized, nullptr, h.mtpStreams);
@@ -547,7 +547,7 @@ void Qwen4ExpTarget::addMtpVerify(VerifyStep &step, metal::MetalBuffer embedding
 void Qwen4ExpTarget::addMtpDraft(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers, const kv::PageStorage &kv,
                              std::span<const kv::ChunkedPrefillParams> chunks, uint32_t lanes,
                              QwenTargetMtpDraft draft) const {
-  const Qwen4ExpWeights *weights = qwen4();
+  const Qwen4ExpWeights *weights = &weights_;
   constexpr uint32_t laneRows = kVerifyRows;
   if (!weights || !weights->mtp || !draft.steps || draft.steps > buffers.proposalsPerLane ||
       buffers.proposalsPerLane + 1 > laneRows || !buffers.candidatesPerProposal)
@@ -631,7 +631,7 @@ void Qwen4ExpTarget::addMtpDraft(metal::CommandGraph &graph, QwenTargetVerifyBuf
 }
 
 bool Qwen4ExpTarget::hasMtpDraftVocabulary() const noexcept {
-  const Qwen4ExpWeights *weights = qwen4();
+  const Qwen4ExpWeights *weights = &weights_;
   return weights && weights->mtp && weights->mtp->draftHead;
 }
 

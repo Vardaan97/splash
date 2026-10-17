@@ -73,7 +73,7 @@ struct Tensor final {
 // reads after the last.
 uint64_t keyRowBytes(bool decode) { return decode ? 0 : bytesFor<uint16_t>(QWEN4_QSA_DIMENSION); }
 uint64_t keyFixedBytes(const QwenTargetGeometry &g, bool decode) {
-  return decode ? bytesFor<uint16_t>(uint64_t{g.attentionLayerCount()} * kStepRows * QWEN4_QSA_DIMENSION) : 0;
+  return decode ? bytesFor<uint16_t>(uint64_t{g.kvLayout.attentionLayers} * kStepRows * QWEN4_QSA_DIMENSION) : 0;
 }
 
 // A prefill chunk's or a decode step's tensors; a streamed PLE table's rows
@@ -328,8 +328,8 @@ std::array<uint32_t, ExecutionLimits::maximumBatchWidth> Qwen4Steps::verifyPosit
 }
 
 metal::MetalBuffer Qwen4Steps::qsaPending(const metal::MetalBuffer &auxiliary, uint32_t layer, uint32_t layers) const {
-  const uint64_t layerBytes = geometry_.indexerPendingBytes() / geometry_.attentionLayerCount();
-  if (!layers || layer + layers > geometry_.attentionLayerCount())
+  const uint64_t layerBytes = geometry_.indexerPendingBytes() / geometry_.kvLayout.attentionLayers;
+  if (!layers || layer + layers > geometry_.kvLayout.attentionLayers)
     throw std::out_of_range("Qwen3.8-Flash-Next QSA pending layers");
   return backend_.view(auxiliary, geometry_.pleHistoryBytes() + layer * layerBytes, layers * layerBytes);
 }

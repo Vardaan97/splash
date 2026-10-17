@@ -508,7 +508,7 @@ struct Runtime::Impl {
                        std::vector<uint32_t> &ids) const {
     const size_t base = ids.size();
     ids.resize(base + tokens.size() * geometry.target.pleHeads());
-    qwen4PleRows(*targetModel->qwen4(), position, tokens, history, ids.data() + base);
+    qwen4PleRows(std::get<Qwen4ExpWeights>(model.target), position, tokens, history, ids.data() + base);
   }
   // Reads ahead the anchors' rows now and arms the listener for the
   // proposals of the draft's step `step` of the lanes' cycle.
@@ -2121,7 +2121,7 @@ struct Runtime::Impl {
       if (targetModel->hasMtpDraftVocabulary())
         for (uint32_t lane = 0; lane < lanes; ++lane)
           entries[lane]->draftContext.scan(entries[lane]->tokens, geometry.target.vocabularySize,
-                                           kQwen4DraftContextTokens, targetModel->qwen4()->layout.mtpDraftTokens);
+                                           kQwen4DraftContextTokens, std::get<Qwen4ExpWeights>(model.target).layout.mtpDraftTokens);
       const bool draftVocabulary = useDraftVocabulary(entries.first(lanes));
       if (draftVocabulary) bindDraftContext(buffers, entries.first(lanes));
       QwenTargetMtpDraft draft;
@@ -3508,7 +3508,7 @@ std::unique_ptr<RuntimeModel> createRuntime(RuntimeContext context) {
 
 #ifdef SPLASH_RUNTIME_INSTRUMENTATION
 std::vector<uint32_t> RuntimeInstrumentation::lastPleRows(const Runtime &runtime, uint32_t lane) {
-  const auto *target = dynamic_cast<const Qwen4ExpTarget *>(runtime.impl_->targetModel->get());
+  const auto *target = dynamic_cast<const Qwen4ExpTarget *>(runtime.impl_->targetModel.get());
   return target ? target->verifyPleRows(lane) : std::vector<uint32_t>{};
 }
 
