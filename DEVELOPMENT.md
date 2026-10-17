@@ -84,7 +84,7 @@ access.
 | --- | --- | --- |
 | `--model` | Required | The upstream model, `OWNER/REPO`, or a GGUF's `OWNER/REPO:VARIANT`. See [upstream model loading](#upstream-model-loading). |
 | `--revision` | Default branch | Select an upstream target branch, tag, or commit. See [revisions](#revisions). |
-| `--draft-model` | The family's released DFlash2 draft | A compatible repository or local directory in its place; required for a family without a released draft. See [drafts](#drafts). |
+| `--draft-model` | The family's released DFlash2 draft, or the model's MTP head for a family without one | A compatible repository or local directory in its place, or `mtp`, the model's own MTP head (Qwen3.8-Flash-Next). See [drafts](#drafts). |
 | `--language-only` | Off | Skip vision loading; image and PDF input is rejected. See [vision](#vision). |
 | `--offline` | Off | Start the installed model without asking the Hub, as `HF_HUB_OFFLINE=1` does. See [revisions](#revisions). |
 | `--port` | `SPLASH_PORT` or `8000` | HTTP port. |
@@ -1606,17 +1606,58 @@ the parameters, `GgufFile` and the planner check the rest).
 
 ### Drafts
 
-Every model decodes with a DFlash2 draft. Each family names the repository
-of the DFlash2 checkpoint trained for it (`families.FAMILIES`), which holds
-it as the release publishes it: `config.json` and BF16 `model.safetensors`
-(or the shards its index names); no draft of Qwen3.8-Flash-Next is released
-yet, so its installation names one with `--draft-model`. Installation
-downloads only those files and follows the repository's default branch as it
-follows the target's ([Revisions](#revisions)); `--draft-model` accepts
-another repository, followed the same way, or a local directory that holds
-them. A checkpoint is installed only when the engine accepts its
-configuration with the target's (its `model-check`), so a draft of another
-architecture never replaces one that loads.
+Every model decodes with a DFlash2 draft or, Qwen3.8-Flash-Next without one,
+with its own MTP head. Each family names the repository of the DFlash2
+checkpoint trained for it (`families.FAMILIES`), which holds it as the
+release publishes it: `config.json` and BF16 `model.safetensors` (or the
+shards its index names). Installation downloads only those files and follows
+the repository's default branch as it follows the target's
+([Revisions](#revisions)); `--draft-model` accepts another repository,
+followed the same way, or a local directory that holds them. A checkpoint is
+installed only when the engine accepts its configuration with the target's
+(its `model-check`), so a draft of another architecture never replaces one
+that loads.
+
+No draft of Qwen3.8-Flash-Next is released yet. Without `--draft-model`, its
+installation links the MTP head its GGUF repository publishes beside the
+target (`MTP/mtp-*-shared-Q8_0.gguf`, the head's own block sharing the
+target's embedding and output, `upstream.select_mtp`) as the assembly's
+`mtp/`, and records no draft source; a repository without one is refused
+with the hint to name a draft. `--draft-model mtp` asks for the head by
+name, which stays the choice once a draft is released. The engine then
+decodes without a DFlash2 draft: the model root has `mtp/` and no `draft/`
+(`inspectModelRoot`), the descriptor's draft is a placeholder that keeps the
+composite state's bookkeeping (`nullDraftLayout`: a one-layer ring of one
+head of eight values), and no draft loads or runs (`LoadedModel::hasDraft`).
+
+The head (`Qwen4MtpWeights`, loaded by `GgufMtpLoader` from the image
+`planMtpImage` lays out) is one more block of the trunk's form: a position's
+input pairs the trunk's residual streams at the position before (`hnorm` per
+stream) with the position's token embedding (`enorm`), each stream through
+`eh_proj`; a full-attention block with its QSA indexer, whose KV is the last
+attention layer of the KV pages; and the head's mix, which the trunk's
+vocabulary projection reads. Each state carries the streams of its last
+committed position after the PLE history (`QwenTarget::mtpCarried`,
+`Qwen4ExpLayout::mtpCarriedBytes`); a prefill writes the head's KV at its
+rows and carries its last row's streams (`addQwen4MtpPrefill`), a verify
+writes the head's KV at its rows from the trunk's streams and the commit
+carries the last retained row's. A decode cycle's draft (`addMtpDraft`) runs
+up to seven steps over the lane's eight verify rows: step j reads the anchor
+and the proposals so far, drafts proposal j - 1 as the argmax of its row's
+logits (`qwen4_mtp_argmax`) and keeps that row's output streams, which the
+next step reads as the streams of the position before; the rows before it
+rewrite their KV from those streams and route to no expert, the rows after
+repeat it (`ops::MoE::add firstRow`). The verify after the draft routes the
+rows past the drafted proposals to no expert and keeps no token from them
+(`addVerify liveRows`), as they only repeat the last proposal. Sampled
+requests draft the same way: each proposal is a certain draw, so acceptance
+keeps the target distribution. `SPLASH_MTP_DRAFTS` (1 to 7, default 7)
+bounds the steps; a lane drafts proposal k while its recent acceptance rate
+r gives r^k at least 0.3, and at least two (`Runtime::Impl::mtpStepsFor`);
+`SPLASH_MTP_ADAPTIVE=0` always drafts `SPLASH_MTP_DRAFTS` (then default 3).
+The 27B and 35B, and Flash-Next with a draft, run as before: the head loads
+only for a root without `draft/`, and the MoE grouping routes every row
+unless a step drops some.
 
 A draft's `config.json` states its layers, intermediate size, rotary base and
 the target layers whose outputs it reads (`dflash_config.target_layer_ids`,

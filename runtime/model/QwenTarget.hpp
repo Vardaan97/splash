@@ -111,6 +111,9 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
   // The layers whose output rows the DFlash2 draft reads, ascending.
   std::array<uint32_t, ExecutionLimits::maximumDraftTargetLayers> captureLayerValues{};
   uint32_t captureLayerCount = 0;
+  // Qwen3.8-Flash-Next's MTP head's full-attention blocks (0 or 1), whose KV
+  // is the last attention layer of kvLayout (Qwen4ExpLayout::mtpLayers).
+  uint32_t mtpLayers = 0;
   // The target's KV layout in the format the runtime stores KV in, and its
   // GDN state layout.
   kv::Layout kvLayout{};
@@ -145,6 +148,10 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
   captureLayers() const noexcept {
     return {captureLayerValues.data(), captureLayerCount};
   }
+  // The trunk's attention layers, before the MTP head's in the KV pages.
+  [[nodiscard]] constexpr uint32_t trunkAttentionLayers() const noexcept {
+    return kvLayout.attentionLayers - mtpLayers;
+  }
   // The capture slot of `layer`, whose output the draft reads.
   [[nodiscard]] constexpr std::optional<uint32_t> captureSlot(uint32_t layer) const noexcept {
     const auto layers = captureLayers();
@@ -176,7 +183,8 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
       const auto ids = captureLayers();
       return std::ranges::adjacent_find(ids, std::ranges::greater_equal{}) == ids.end() && ids.back() < layers;
     };
-    return captured() && stateLayout.layers + kvLayout.attentionLayers == layers &&
+    return captured() && mtpLayers <= 1 && mtpLayers <= kvLayout.attentionLayers &&
+           stateLayout.layers + trunkAttentionLayers() == layers &&
            gdnShape().valid() &&
            kvLayout.kvHeads == attentionKvHeads &&
            kvLayout.headDimension == attentionHeadDimension &&
@@ -322,6 +330,15 @@ struct QwenTargetVerifyBuffers final {
   // Each lane's auxiliary state before the step; the commit writes the one
   // after it (addStateCommit).
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> auxiliary;
+  // An MTP draft's (addMtpDraft): each lane's anchor at row 0 of its draft
+  // input rows, the proposals it writes (proposalsPerLane per lane) and the
+  // sparse candidates of each (candidatesPerProposal per proposal, the
+  // proposal written as the first).
+  metal::MetalBuffer anchors;
+  metal::MetalBuffer proposals;
+  metal::MetalBuffer candidates;
+  uint32_t proposalsPerLane = 0;
+  uint32_t candidatesPerProposal = 0;
 };
 
 // The auxiliary state after the rows each lane of a verify retained, which
@@ -331,6 +348,15 @@ struct QwenTargetCommitBuffers final {
   metal::MetalBuffer retainedCounts;
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> auxiliaryIn;
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> auxiliaryOut;
+};
+
+// The MTP head's draft (addMtpDraft): `steps` draft steps, the first from
+// each lane's anchor; the proposals of a lane are those its head drafted,
+// and, from the step that drafts the deepest lane's last, every later one
+// repeats it. The verify after it keeps rows past a lane's drafted proposals
+// from no expert (addVerify liveRows).
+struct QwenTargetMtpDraft final {
+  uint32_t steps = 0;
 };
 
 // The bytes of a target's own step scratch beside the runtime's arenas, a
@@ -370,6 +396,12 @@ template <class Weights>
       geometry.include(mixer.outputProjection);
     }, layer.mixer);
     if (const ops::BlockMoeWeights *block = qwenMoeBlock(layer)) moeBlocks.push_back(block);
+  }
+  if constexpr (requires { weights.mtp; }) {
+    geometry.mtpLayers = weights.layout.mtpLayers;
+    if (static_cast<bool>(weights.mtp) != (geometry.mtpLayers == 1))
+      throw WeightStoreError("the MTP head does not match the layout");
+    if (weights.mtp) moeBlocks.push_back(&weights.mtp->block.ffn);
   }
   includeFamilyProjections(geometry, weights);
   geometry.finish(moeBlocks, weights.logitsProjection);
@@ -431,13 +463,17 @@ public:
       metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
       const kv::PageStorage &kv,
       std::span<const kv::ChunkedPrefillParams> chunks,
-      uint32_t lanes) const = 0;
+      uint32_t lanes, uint32_t liveRows = 0) const = 0;
   // The head over `lanes` lanes of targetVerifyRows rows of the last layer's
   // output, as verify ends: one sweep of the vocabulary projection for every
   // lane.
   virtual void addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden,
                             metal::MetalBuffer finalHidden, metal::MetalBuffer logits,
                             uint32_t lanes, ops::LinearScratch scratch) const = 0;
+  [[nodiscard]] bool hasMtp() const noexcept { return geometry_.mtpLayers != 0; }
+  virtual void addMtpDraft(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
+                           const kv::PageStorage &kv, std::span<const kv::ChunkedPrefillParams> chunks,
+                           uint32_t lanes, QwenTargetMtpDraft draft) const;
   // The verify input tokens addEmbedding then gathers: each lane's anchor,
   // row 0 of its draft input, and the draft's proposals; then the inputs the
   // target makes of them itself.

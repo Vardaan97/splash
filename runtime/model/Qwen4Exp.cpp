@@ -54,7 +54,8 @@ void requireQwen4Layout(const Qwen4ExpLayout &layout) {
   if (!layout.hyperConnections || !layout.hyperRank || !layout.indexerHeads || !layout.indexerHeadDimension ||
       !layout.indexerTopBlocks || !layout.indexerBlockTokens || layout.pleNgram < 2 ||
       layout.pleNgram > kPleMaximumNgram || !layout.pleHeadsPerNgram || !layout.pleHeadDimension ||
-      !layout.pleConvolutionTaps || layout.pleLayer >= layout.layers || layout.isFullAttentionLayer(layout.pleLayer))
+      !layout.pleConvolutionTaps || layout.pleLayer >= layout.layers || layout.isFullAttentionLayer(layout.pleLayer) ||
+      layout.mtpLayers > 1)
     throw WeightStoreError("Qwen3.8-Flash-Next layout is inconsistent");
 }
 
@@ -101,8 +102,9 @@ Qwen4PleHash readPleHash(const GgufFile &file, const Qwen4ExpLayout &layout) {
 } // namespace
 
 Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend, Qwen4ExpLayout layout,
-                                    const QwenTargetFiles &files) {
+                                    const QwenTargetFiles &files, GgufMtpLoader *mtp) {
   requireQwen4Layout(layout);
+  if ((mtp != nullptr) != (layout.mtpLayers == 1)) throw WeightStoreError("the MTP head does not match the layout");
   return loadQwenTarget<Qwen4ExpWeights>(
       backend, layout, files, [&](GgufTargetLoader &gguf, const BlockTargetFormat &format, const MoeExperts &experts) {
         Qwen4ExpWeights result;
@@ -147,6 +149,25 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend, Qwen4ExpLayout
           result.tokenEmbedding = format.embedding(file, layout.vocabularySize, layout.hiddenSize);
           file.finish();
           result.files.push_back(file.record());
+        }
+        if (mtp) {
+          // The image's order (GgufImage.cpp planMtpImage). The head's
+          // experts stay resident: the store holds the trunk's layers.
+          const MoeExperts resident = experts.store ? residentMoeExperts(backend, layout.experts) : experts;
+          WeightFile file = mtp->open();
+          Qwen4MtpWeights head;
+          head.block.mixerHyper = readHyper(file, layout, true, "mtp-mixer-hyper");
+          head.block.mixer = readQwenMixer(file, format, layout, true);
+          head.block.indexer = readIndexer(file, layout);
+          head.block.ffnHyper = readHyper(file, layout, true, "mtp-ffn-hyper");
+          head.block.ffn = readMoeBlock(file, resident, layout.layers);
+          head.embedHidden = format.projection(file, layout.hiddenSize, 2 * layout.hiddenSize, "mtp-embed-hidden");
+          head.embedNorm = format.norm(file, layout.hiddenSize, "mtp-embed-norm");
+          head.hiddenNorm = format.norm(file, streams, "mtp-hidden-norm");
+          head.head = readHyper(file, layout, false, "mtp-head");
+          file.finish();
+          result.files.push_back(file.record());
+          result.mtp = std::move(head);
         }
         if (std::optional<GgufTargetLoader::StreamedTable> table = gguf.streamTable()) {
           if (table->store->table().rows != result.pleHash.tableRows)

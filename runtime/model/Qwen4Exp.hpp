@@ -16,7 +16,9 @@
 //  - A PLE n-gram embedding feeds one GDN layer: the 2- and 3-gram hashes of
 //    every token gather rows of a table of hundreds of millions of rows,
 //    which gate a value added to every stream through a dilated convolution.
-// Its weights load from a GGUF only.
+// Its weights load from a GGUF only. Its MTP head (Qwen4MtpWeights), one more
+// block of the trunk's form, drafts the decode's proposals when no DFlash2
+// draft is installed.
 
 #include "QwenHybridLayout.hpp"
 #include "QwenTarget.hpp"
@@ -53,6 +55,10 @@ struct Qwen4ExpLayout final : QwenHybridLayout {
   // GGUF states both (ple.eos_token_id, ple.image_token_id).
   uint32_t pleEosToken = stopTokens[0];
   uint32_t pleImageToken = 248056;
+  // The MTP head's full-attention blocks, 1 when the head drafts
+  // (ModelDescriptor.mm: a model root with mtp/ and no draft/), else 0. Its
+  // KV is the last attention layer of the KV pages.
+  uint32_t mtpLayers = 0;
 
   constexpr Qwen4ExpLayout()
       : QwenHybridLayout{{.nativeContextTokens = 262'144,
@@ -92,6 +98,24 @@ struct Qwen4ExpLayout final : QwenHybridLayout {
                           .pleHeadsPerNgram = 8,
                           .pleHeadDimension = 160,
                           .pleConvolutionTaps = 4}} {}
+
+  // The MTP head's KV after the trunk's attention layers.
+  [[nodiscard]] constexpr kv::Layout kvLayout() const noexcept {
+    kv::Layout layout = QwenHybridLayout::kvLayout();
+    layout.attentionLayers += mtpLayers;
+    return layout;
+  }
+  // With the MTP head, each state also carries the fp32 streams of the
+  // position before the next one the head reads (QwenTarget::mtpCarried),
+  // after the PLE history.
+  [[nodiscard]] constexpr uint64_t mtpCarriedBytes() const noexcept {
+    return mtpLayers ? uint64_t{streamWidth()} * sizeof(float) : 0;
+  }
+  [[nodiscard]] constexpr GdnStateLayout gdnStateLayout() const noexcept {
+    GdnStateLayout layout = QwenHybridLayout::gdnStateLayout();
+    layout.auxiliaryBytes = pleHistoryBytes() + mtpCarriedBytes();
+    return layout;
+  }
   bool operator==(const Qwen4ExpLayout &) const = default;
 };
 
@@ -164,6 +188,21 @@ struct Qwen4ExpLayerWeights final {
   std::optional<Qwen4PleWeights> ple;
 };
 
+// The MTP head (blk.<layers> of the model's MTP GGUF, GgufImage.cpp
+// planMtpImage): a position's input is the trunk's residual streams at the
+// position before (hiddenNorm per stream) and the position's token embedding
+// (embedNorm), each stream through embedHidden ([e ; h_s] -> hidden); then
+// one full-attention block of the trunk's form, whose output streams feed the
+// next draft step, and the head's mix, whose output the trunk's vocabulary
+// projection reads.
+struct Qwen4MtpWeights final {
+  Qwen4ExpLayerWeights block;
+  ops::Projection embedHidden;
+  ops::NormWeights embedNorm;
+  ops::NormWeights hiddenNorm;
+  Qwen4HyperWeights head;
+};
+
 struct Qwen4ExpWeights final : QwenTargetWeightsBase {
   Qwen4ExpLayout layout;
   std::vector<Qwen4ExpLayerWeights> layers;
@@ -175,10 +214,14 @@ struct Qwen4ExpWeights final : QwenTargetWeightsBase {
   ops::EmbeddingWeights pleTable;
   uint32_t pleFormat = 0;
   Qwen4PleHash pleHash;
+  // The MTP head, with layout.mtpLayers.
+  std::optional<Qwen4MtpWeights> mtp;
 };
 
+class GgufMtpLoader;
+// Loads the target and, with `mtp`, its MTP head (layout.mtpLayers).
 [[nodiscard]] Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend, Qwen4ExpLayout layout,
-                                                  const QwenTargetFiles &files);
+                                                  const QwenTargetFiles &files, GgufMtpLoader *mtp = nullptr);
 
 // The family's target (model/Qwen4ExpTarget.hpp), whose prefill commands run
 // up to `prefillChunks` chunks; the step scratch it keeps itself; and the

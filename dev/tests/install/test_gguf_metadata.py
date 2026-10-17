@@ -1124,16 +1124,35 @@ class GgufMetadataTests(unittest.TestCase):
             family_config(FLASH_NEXT, "draft/config.json"),
         )
 
-    def test_flash_next_without_a_draft_is_refused_before_any_download(self):
+    def test_flash_next_without_a_draft_drafts_with_the_mtp_head(self):
+        # Without --draft-model, the MTP head the repository publishes beside
+        # the target is linked as mtp/, no draft is resolved or recorded, and
+        # a repository without the head is refused before any download.
         repo = "someone/Flash-Next-GGUF"
         fake = self.flash_next_repository(repo, "someone/Flash-Next-DFlash2")
         with self.assertRaisesRegex(
             models.ModelError,
-            "no DFlash2 draft is released for Qwen3.8-Flash-Next; "
-            "name one with --draft-model",
+            "publishes no MTP head .*; name a DFlash2 draft with --draft-model",
         ):
             self.prepare(selection(self.root, repo + ":Q2_0"))
         self.assertNotIn(f"{repo}/model-Q2_0.gguf", fake.downloads)
+        head = "MTP/mtp-Flash-Next-shared-Q8_0.gguf"
+        published = fake.remote / repo / ("a" * 40) / head
+        published.parent.mkdir()
+        published.write_bytes(b"the MTP head")
+        chosen = selection(self.root, repo + ":Q2_0")
+        output = self.prepare(chosen)
+        self.assertIn("draft the MTP head", output)
+        self.assertEqual(fake.requests, [(repo, None), (repo, None)])
+        self.assertEqual(
+            sorted(fake.downloads),
+            sorted([f"{repo}/model-Q2_0.gguf", f"{repo}/{head}"]),
+        )
+        record = assembly.verify(chosen.link, full=True)
+        self.assertEqual(record["family"], FLASH_NEXT.name)
+        self.assertEqual(set(record["sources"]), {"target"})
+        self.assertTrue((chosen.link / "mtp" / Path(head).name).is_file())
+        self.assertFalse((chosen.link / "draft").exists())
 
     def test_a_layer_count_no_family_has_is_rejected_before_screening(self):
         # Screening lists every tensor of every layer a header claims; only

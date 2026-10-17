@@ -932,6 +932,120 @@ void streamMeanTest(MetalBackend &backend) {
   check(ok, "stream mean: each row's streams' mean, bf16, in its slot of wider rows");
 }
 
+// The MTP head's kernels (ops::Qwen4::addMtp*): the stream-major inputs of
+// the embedding and the shifted streams, the widening of the eh projection's
+// rows, a draft step's tokens, the argmax proposals and the carried row.
+void mtpTest(MetalBackend &backend) {
+  std::mt19937 rng(11);
+  const uint32_t rows = 8, hidden = 256, streams = 4, width = hidden * streams, total = 16, offset = 8, limit = 3;
+  const ops::HyperShape shape{hidden, streams, 0};
+  const auto embedding = randoms(rng, rows * hidden, 1.0f);
+  const auto carried = randoms(rng, width, 2.0f);
+  const auto history = randoms(rng, rows * width, 2.0f);
+  const auto enorm = randoms(rng, hidden, 1.0f);
+  const auto hnorm = randoms(rng, width, 1.0f);
+  const auto e16 = bf16s(embedding);
+  MetalBuffer output = scratch(backend, uint64_t{streams} * total * 2 * hidden * 2);
+  std::memset(output.contents(), 0, output.sizeBytes());
+  CommandGraph graph;
+  ops::Qwen4::addMtpInput(graph, upload(backend, e16), upload(backend, carried), upload(backend, history),
+                          NormWeights{upload(backend, enorm), true}, NormWeights{upload(backend, hnorm), true}, output,
+                          shape, rows, limit, offset, total);
+  run(backend, graph);
+  const auto got = download<uint16_t>(output, uint64_t{streams} * total * 2 * hidden);
+  bool ok = true;
+  for (uint32_t r = 0; r < rows; ++r) {
+    const uint32_t source = std::min(r, limit - 1);
+    double es = 0;
+    for (uint32_t d = 0; d < hidden; ++d) es += double(f32(e16[source * hidden + d])) * f32(e16[source * hidden + d]);
+    const double escale = 1.0 / std::sqrt(es / hidden + 1e-6);
+    const float *h = source == 0 ? carried.data() : history.data() + (source - 1) * width;
+    for (uint32_t s = 0; s < streams; ++s) {
+      double hs = 0;
+      for (uint32_t d = 0; d < hidden; ++d) hs += double(h[s * hidden + d]) * h[s * hidden + d];
+      const double hscale = 1.0 / std::sqrt(hs / hidden + 1e-6);
+      const uint16_t *o = got.data() + (uint64_t{s} * total + offset + r) * 2 * hidden;
+      for (uint32_t d = 0; d < hidden; ++d) {
+        ok &= closeBf16(f32(o[d]), f32(e16[source * hidden + d]) * escale * enorm[d]);
+        ok &= closeBf16(f32(o[hidden + d]), h[s * hidden + d] * hscale * hnorm[s * hidden + d]);
+      }
+    }
+  }
+  // Rows of other lanes stay untouched.
+  for (uint32_t s = 0; s < streams; ++s)
+    for (uint32_t i = 0; i < offset * 2 * hidden; ++i) ok &= got[uint64_t{s} * total * 2 * hidden + i] == 0;
+  check(ok, "MTP input: stream-major norms of the embedding and the shifted streams");
+
+  const auto projected = bf16s(randoms(rng, rows * width, 1.0f));
+  MetalBuffer widened = scratch(backend, rows * width * 4);
+  CommandGraph widen;
+  ops::Qwen4::addMtpWiden(widen, upload(backend, projected), widened, shape, rows);
+  run(backend, widen);
+  const auto w = download<float>(widened, rows * width);
+  bool okWiden = true;
+  for (uint32_t r = 0; r < rows; ++r)
+    for (uint32_t s = 0; s < streams; ++s)
+      for (uint32_t d = 0; d < hidden; ++d)
+        okWiden &= w[(r * streams + s) * hidden + d] == f32(projected[(uint64_t{s} * rows + r) * hidden + d]);
+  check(okWiden, "MTP widen: stream-major rows to fp32 streams");
+
+  const uint32_t lanes = 2, laneRows = 8, proposals = 7, candidates = 16, vocabulary = 70001;
+  std::vector<uint32_t> anchors(lanes * laneRows, 0), proposed(lanes * proposals, 0);
+  anchors[0] = 11;
+  anchors[laneRows] = 22;
+  for (uint32_t i = 0; i < lanes * proposals; ++i) proposed[i] = 100 + i;
+  MetalBuffer anchorBuffer = upload(backend, anchors), proposedBuffer = upload(backend, proposed),
+              tokens = scratch(backend, lanes * laneRows * 4);
+  CommandGraph tokenGraph;
+  ops::Qwen4::addMtpTokens(tokenGraph, anchorBuffer, proposedBuffer, tokens, lanes, laneRows, proposals, 3);
+  run(backend, tokenGraph);
+  const auto t = download<uint32_t>(tokens, lanes * laneRows);
+  bool okTokens = true;
+  for (uint32_t lane = 0; lane < lanes; ++lane)
+    for (uint32_t r = 0; r < laneRows; ++r) {
+      const uint32_t row = std::min(r, 2u);
+      okTokens &= t[lane * laneRows + r] == (row == 0 ? anchors[lane * laneRows] : proposed[lane * proposals + row - 1]);
+    }
+  check(okTokens, "MTP tokens: anchor, proposals so far, then repeats");
+
+  auto logits = randoms(rng, uint64_t{lanes} * laneRows * vocabulary, 1.0f);
+  logits[(0 * laneRows + 4) * uint64_t{vocabulary} + 69999] = 50.0f;
+  logits[(1 * laneRows + 4) * uint64_t{vocabulary} + 5] = 50.0f;
+  logits[(1 * laneRows + 4) * uint64_t{vocabulary} + 3] = 50.0f; // tie: the lower id
+  std::vector<uint32_t> cand(lanes * proposals * candidates, 7);
+  MetalBuffer candidateBuffer = upload(backend, cand);
+  CommandGraph argmax;
+  ops::Qwen4::addMtpArgmax(argmax, upload(backend, logits), proposedBuffer, candidateBuffer, lanes, laneRows,
+                           vocabulary, proposals, candidates, 4, true);
+  run(backend, argmax);
+  const auto p = download<uint32_t>(proposedBuffer, lanes * proposals);
+  const auto c = download<uint32_t>(candidateBuffer, lanes * proposals * candidates);
+  bool okArgmax = true;
+  for (uint32_t lane = 0; lane < lanes; ++lane)
+    for (uint32_t i = 0; i < proposals; ++i) {
+      const uint32_t want = i < 4 ? 100 + lane * proposals + i : (lane ? 3 : 69999);
+      okArgmax &= p[lane * proposals + i] == want;
+      okArgmax &= c[(lane * proposals + i) * candidates] == (i < 4 ? 7 : want);
+      okArgmax &= c[(lane * proposals + i) * candidates + 1] == 7;
+    }
+  check(okArgmax, "MTP argmax: the row's argmax as its proposal and every later one");
+
+  const auto streamRows = randoms(rng, laneRows * width, 1.0f);
+  MetalBuffer carriedOut = scratch(backend, width * 4), carriedFixed = scratch(backend, width * 4);
+  MetalBuffer streamBuffer = upload(backend, streamRows);
+  CommandGraph carry;
+  ops::Qwen4::addMtpCarry(carry, streamBuffer, carriedOut, upload(backend, std::vector<uint32_t>{5}), shape, laneRows);
+  ops::Qwen4::addMtpCarry(carry, streamBuffer, carriedFixed, {}, shape, 3);
+  run(backend, carry);
+  const auto co = download<float>(carriedOut, width), cf = download<float>(carriedFixed, width);
+  bool okCarry = true;
+  for (uint32_t i = 0; i < width; ++i) {
+    okCarry &= co[i] == streamRows[4 * width + i];
+    okCarry &= cf[i] == streamRows[2 * width + i];
+  }
+  check(okCarry, "MTP carry: the last retained row, or the last row");
+}
+
 // The PLE hash on the GPU against the same hash on the CPU, as
 // model/Qwen4Steps.cpp's qwen4PleRows computes it, of three lanes of
 // SPLASH_TARGET_VERIFY_ROWS rows each.
@@ -1024,6 +1138,7 @@ int main(int argc, const char *argv[]) {
         qsaSelectRefusesNarrowScratch(backend);
         streamMeanTest(backend);
         pleHashTest(backend);
+        mtpTest(backend);
       }
     } catch (const std::exception &error) {
       std::cerr << "qwen4 kernel test error: " << error.what() << '\n';
