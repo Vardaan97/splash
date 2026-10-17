@@ -2,6 +2,9 @@
 #ifdef SPLASH_RUNTIME_INSTRUMENTATION
 #include "model/RuntimeInstrumentation.hpp"
 #endif
+#include "model/Qwen4DraftContext.hpp"
+#include "model/Qwen4Exp.hpp"
+#include "model/Qwen4Steps.hpp"
 #include "AwakeClock.hpp"
 #include "model/QwenState.hpp"
 #include "model/QwenTarget.hpp"
@@ -10,6 +13,7 @@
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/GDN.h"
+#include "metal/abi/QuantFormat.h"
 #include "ops/AneFfn.hpp"
 #include "ops/Linear.hpp"
 #include "ops/PagedAttention.hpp"
@@ -320,6 +324,10 @@ struct Runtime::Impl {
     uint32_t mtpDrafted = 0;
     float mtpAccepted = 4.0F;
     float mtpJudged = 5.0F;
+    // With the head's draft vocabulary: the request's context tokens beside
+    // it and the count by which it falls back to the whole head
+    // (Qwen4DraftContext.hpp).
+    Qwen4DraftContext draftContext;
   };
 
   struct DecodeLaneResult final {
@@ -445,6 +453,77 @@ struct Runtime::Impl {
     entry.mtpAccepted = kMtpDecay * entry.mtpAccepted + static_cast<float>(kept);
     entry.mtpJudged = kMtpDecay * entry.mtpJudged + static_cast<float>(kept < entry.mtpDrafted ? kept + 1 : kept);
     entry.mtpDrafted = 0;
+  }
+  // With a draft vocabulary (Qwen4DraftVocabulary.hpp), each step of the
+  // MTP head reads a quarter of the vocabulary projection at most, but a
+  // token outside it and the request's context is never proposed, and each
+  // such token the target emits ends its cycle's accepted run. A lane
+  // drafts from them while at most SPLASH_MTP_DRAFT_VOCAB_GATE (default
+  // 0.06) of its recent tokens fell outside, counted from a warm start
+  // unless SPLASH_MTP_DRAFT_VOCAB_WARMSTART=0 (Qwen4DraftContext), and the
+  // batch while every lane does.
+  float mtpVocabularyGate = [] {
+    const char *value = std::getenv("SPLASH_MTP_DRAFT_VOCAB_GATE");
+    if (!value || !*value) return 0.06F;
+    char *end = nullptr;
+    const float gate = std::strtof(value, &end);
+    if (end == value || *end || !std::isfinite(gate) || gate < 0.0F || gate > 1.0F)
+      throw std::invalid_argument("SPLASH_MTP_DRAFT_VOCAB_GATE must be a fraction in [0, 1]");
+    return gate;
+  }();
+  bool mtpVocabularyWarmStart = [] {
+    const char *value = std::getenv("SPLASH_MTP_DRAFT_VOCAB_WARMSTART");
+    return !value || std::string_view(value) != "0";
+  }();
+  Qwen4DraftContextCache<kLaneCount> draftContextCache;
+  [[nodiscard]] bool useDraftVocabulary(std::span<Request *const> entries) const {
+    return targetModel->hasMtpDraftVocabulary() && std::ranges::all_of(entries, [this](const Request *entry) {
+      return entry->draftContext.useVocabulary(mtpVocabularyWarmStart, mtpVocabularyGate);
+    });
+  }
+  void countDraftVocabulary(Request &entry, std::span<const uint32_t> tokens) const {
+    if (targetModel->hasMtpDraftVocabulary()) entry.draftContext.record(tokens);
+  }
+  // Binds each lane's context rows (copying in those it lacks) to a draft
+  // from the draft vocabulary.
+  void bindDraftContext(QwenTargetVerifyBuffers &buffers, std::span<Request *const> entries) {
+    const uint32_t format = geometry.target.mtpDraftContextFormat;
+    if (format >= GGUF_FMT_COUNT) return;
+    const uint32_t lanes = static_cast<uint32_t>(entries.size());
+    const uint32_t hidden = geometry.target.hiddenSize;
+    buffers.draftContextLogits = decodeArena->batchSlice(DecodeTensor::DraftContextLogits, lanes);
+    buffers.draftContextLogitsSlot =
+        static_cast<uint32_t>(decodeArena->get(0, DecodeTensor::DraftContextLogits).sizeBytes() / sizeof(float));
+    buffers.draftContextTokens = decodeArena->batchSlice(DecodeTensor::DraftContextTokens, kLaneCount);
+    buffers.draftContextInfo = decodeArena->batchSlice(DecodeTensor::DraftContextInfo, lanes);
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+      Request &entry = *entries[lane];
+      const uint32_t stateLane = entry.stateLane;
+      const uint32_t count = static_cast<uint32_t>(entry.draftContext.tokens.size());
+      auto *pairs = contents<uint32_t>(decodeArena->get(stateLane, DecodeTensor::DraftContextCopies), "context copies");
+      auto *tokens = contents<uint32_t>(decodeArena->get(stateLane, DecodeTensor::DraftContextTokens), "context tokens");
+      const uint32_t synced = draftContextCache.bind(stateLane, entry.id, count);
+      for (uint32_t row = synced; row < count; ++row) {
+        pairs[2 * (row - synced)] = entry.draftContext.tokens[row];
+        pairs[2 * (row - synced) + 1] = row;
+        tokens[row] = entry.draftContext.tokens[row];
+      }
+      buffers.draftContextCopies[lane] = decodeArena->get(stateLane, DecodeTensor::DraftContextCopies);
+      buffers.draftContextCopyCounts[lane] = count - synced;
+      buffers.draftContextCounts[lane] = count;
+      const MetalBuffer plane1 = decodeArena->get(stateLane, DecodeTensor::DraftContextPlane1);
+      ops::Projection head(kQwen4DraftContextTokens, hidden,
+                           ops::BlockWeights{{ops::QuantizedSegment::planes(
+                               format, kQwen4DraftContextTokens, hidden,
+                               decodeArena->get(stateLane, DecodeTensor::DraftContextPlane0), plane1,
+                               decodeArena->get(stateLane, DecodeTensor::DraftContextMeta))}});
+      head.destination = ops::FloatOutput::Float32;
+      buffers.draftContextHeads[lane] = std::move(head);
+      auto *info = contents<uint32_t>(decodeArena->get(lane, DecodeTensor::DraftContextInfo), "context lane");
+      info[0] = count;
+      info[1] = stateLane;
+      info[2] = info[3] = 0;
+    }
   }
   ops::AneFfn *aneFfn;
   explicit Impl(RuntimeContext value)
@@ -659,6 +738,7 @@ struct Runtime::Impl {
       states.clearDraftRings(entry.stateLane);
     states.releaseLane(entry.stateLane, entry.id);
     pageTableBindings[entry.stateLane] = {};
+    draftContextCache.release(entry.stateLane);
   }
 
   // A request lets go of its images; the encoded ones stay in the cache.
@@ -1958,7 +2038,16 @@ struct Runtime::Impl {
       uint32_t steps = 1;
       for (uint32_t lane = 0; lane < lanes; ++lane) steps = std::max(steps, mtpStepsFor(*entries[lane]));
       for (uint32_t lane = 0; lane < lanes; ++lane) entries[lane]->mtpDrafted = steps;
-      targetModel->addMtpDraft(graph, std::move(buffers), kvPages, std::span(chunks).first(lanes), lanes, {steps});
+      // From the draft vocabulary and each lane's context while every lane
+      // does.
+      if (targetModel->hasMtpDraftVocabulary())
+        for (uint32_t lane = 0; lane < lanes; ++lane)
+          entries[lane]->draftContext.scan(entries[lane]->tokens, geometry.target.vocabularySize,
+                                           kQwen4DraftContextTokens, targetModel->qwen4()->layout.mtpDraftTokens);
+      const bool draftVocabulary = useDraftVocabulary(entries.first(lanes));
+      if (draftVocabulary) bindDraftContext(buffers, entries.first(lanes));
+      targetModel->addMtpDraft(graph, std::move(buffers), kvPages, std::span(chunks).first(lanes), lanes,
+                              {steps, draftVocabulary});
       return;
     }
     targetModel->addVerify(graph, std::move(buffers), kvPages,
@@ -2149,6 +2238,8 @@ struct Runtime::Impl {
           d(DecodeTensor::OutputTokens), "target output tokens");
       laneResult.failure =
           invalidSelection({targetTokens, laneResult.retained}, lane);
+      if (laneResult.failure.empty())
+        countDraftVocabulary(*laneResult.request, {targetTokens, laneResult.retained});
     }
 
     std::vector<ModelStepResult> results;

@@ -1659,6 +1659,37 @@ The 27B and 35B, and Flash-Next with a draft, run as before: the head loads
 only for a root without `draft/`, and the MoE grouping routes every row
 unless a step drops some.
 
+Each draft step ends with the vocabulary projection, 248,320 rows (521 MB
+at Q6_K, 675 MB at Q8_0), whose argmax picks one proposal. The head drafts
+instead from a draft vocabulary (`Qwen4DraftVocabulary.hpp`): the 65,536
+tokens (or 32,768, `SPLASH_MTP_DRAFT_VOCAB`) that text decodes to most
+often, ranked offline over a mixed corpus of reasoning, chat, code, 17
+languages' web text and math with the tokenizer's added tokens first
+(`dev/tools/draft_vocabulary.py`; the bitmaps are
+`Qwen4DraftVocabularyData.cpp`, their manifests beside it). As the GGUF
+target loader writes the head it also writes those tokens' rows to
+`draft-head.bin` (`planDraftHeadImage`), released and restored with the other
+weights and counted in the memory plan but outside the weight manifest
+fingerprint, since no computed state depends on them; a draft step reads
+those rows alone and `qwen4_mtp_argmax_mapped` maps the argmax back to its
+token. Beside them each request drafts from its own context: the tokens
+outside the vocabulary in its prompt and output, in the order they first
+appear, up to 4,096 (`Qwen4DraftContext`), whose rows of the projection are
+copied once per lane activation into planes its state lane keeps in the
+decode arena (`qwen4_copy_head_rows`) and projected after the draft head at
+every step; `qwen4_mtp_argmax_context` takes the argmax over both, ties
+toward the lower token. A token outside both is never proposed and ends its
+cycle's accepted run when the target emits it, so each request keeps a
+decayed count (about its last 50 tokens) of such tokens and the batch drafts
+from the vocabulary while every lane's rate is at most
+`SPLASH_MTP_DRAFT_VOCAB_GATE` (default 0.06), counted from a warm start of
+50 tokens inside unless `SPLASH_MTP_DRAFT_VOCAB_WARMSTART=0`; otherwise from
+the whole head. The verify and everything after it read the whole
+projection, so greedy output is unchanged; a seeded sampled stream can
+differ from drafting with the whole head, since the same acceptance uniform
+can keep a different token when the proposal differs. `SPLASH_MTP_DRAFT_VOCAB=0`
+drafts from the whole head at every step and writes no image.
+
 A draft's `config.json` states its layers, intermediate size, rotary base and
 the target layers whose outputs it reads (`dflash_config.target_layer_ids`,
 ascending, at most eight); its hidden size, vocabulary and mask token are its

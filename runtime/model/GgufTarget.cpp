@@ -32,7 +32,7 @@ std::vector<std::filesystem::path> findTargetGgufs(const std::filesystem::path &
 GgufTargetLoader::GgufTargetLoader(metal::MetalBackend &backend, WeightImages &images,
                                    const std::vector<std::filesystem::path> &paths, std::string_view architecture,
                                    const QwenTargetDimensions &geometry, SparseRowStoreOptions table,
-                                   ExpertStoreOptions experts)
+                                   ExpertStoreOptions experts, std::span<const uint32_t> draftTokens)
     : backend_(backend), images_(images), planned_(std::make_shared<Planned>(paths)) {
   planned_->images =
       gguf::planImages(planned_->source.file(), architecture, geometry,
@@ -40,6 +40,10 @@ GgufTargetLoader::GgufTargetLoader(metal::MetalBackend &backend, WeightImages &i
   planned_->layers = geometry.layers;
   planned_->table = table;
   planned_->experts = experts;
+  if (!draftTokens.empty()) {
+    planned_->draftHead = planned_->images.size();
+    planned_->images.push_back(gguf::planDraftHeadImage(planned_->source.file(), geometry, draftTokens));
+  }
 }
 
 StreamedBlocks GgufTargetLoader::streamedExperts() const {
@@ -49,7 +53,12 @@ StreamedBlocks GgufTargetLoader::streamedExperts() const {
 
 const gguf::Image *GgufTargetLoader::tablePlan() const noexcept {
   const size_t index = planned_->layers + 2;
-  return index < planned_->images.size() ? &planned_->images[index] : nullptr;
+  return index < planned_->images.size() && planned_->draftHead != index ? &planned_->images[index] : nullptr;
+}
+
+WeightFile GgufTargetLoader::draftHead() {
+  if (!planned_->draftHead) throw GgufError("the target loader planned no draft head");
+  return open(*planned_->draftHead);
 }
 
 WeightFile GgufTargetLoader::table() {
