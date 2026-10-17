@@ -725,12 +725,14 @@ void checkLiveRows(MetalBackend &backend, const Model &m, Buffers &b, const MoeP
   MoeRun reference = full;
   if (preserveTileKind) {
     CommandGraph baseline;
-    MoE::add(baseline, b.moe, m.weights, plan, firstRow);
+    std::vector<uint32_t> referenceEnds(lastRows.begin(), lastRows.end());
+    for (uint32_t &end : referenceEnds) if (end > firstRow) end = 0;
+    MoE::add(baseline, b.moe, m.weights, plan, firstRow, 0, referenceEnds);
     static_cast<void>(backend.submitCommandAsync(baseline.dispatches()).wait());
     reference.column = columnRoutes(b.moe.scratch, plan);
     std::memcpy(reference.output.data(), b.moe.output.contents(), reference.output.size() * 2);
     CommandGraph legacy;
-    MoE::add(legacy, b.moe, m.weights, plan, firstRow, lastRow);
+    MoE::add(legacy, b.moe, m.weights, plan, firstRow, lastRow, lastRows);
     static_cast<void>(backend.submitCommandAsync(legacy.dispatches()).wait());
     const auto legacyKinds = columnRoutes(b.moe.scratch, plan);
     const auto *legacyOutput = static_cast<const uint16_t *>(b.moe.output.contents());
@@ -949,6 +951,8 @@ int moe(MetalBackend &backend) {
             checkLiveRows(backend, m, b, plan, 0, 0, run, label + " per-lane bounds", cuts);
             const std::array<uint32_t, 4> exhausted{2, 4, 2, 0};
             checkLiveRows(backend, m, b, plan, 2, 0, run, label + " exhausted lanes", exhausted);
+            const std::array<uint32_t, 4> oneRowExhausted{2, 3, 2, 3};
+            checkLiveRows(backend, m, b, plan, 2, 0, run, label + " ONE_ROW with exhausted lanes", oneRowExhausted, true);
             const std::array<uint32_t, 4> invalid{1, 3, 9, 0};
             CommandGraph rejected;
             bool refused = false;

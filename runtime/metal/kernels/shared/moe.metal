@@ -165,10 +165,16 @@ inline void moe_group_routes_phase(
   // selection is needed for those rows; their experts need not execute.
   uint reference_rows = 0;
   if (params.preserve_tile_kind)
-    for (uint route = 0; route < routes; ++route)
-      if (route % routes_per_row != params.top_k &&
-          route / routes_per_row % params.lane_rows >= params.first_row && selected[route] == thread_index)
+    for (uint route = 0; route < routes; ++route) {
+      const uint row = route / routes_per_row;
+      const uint lane_last = params.last_rows[row / params.lane_rows];
+      // An exhausted lane was already absent before ONE_ROW trimmed the
+      // active lanes' tails. It contributes no reference occupancy either.
+      const bool exhausted = lane_last && lane_last == params.first_row;
+      if (!exhausted && route % routes_per_row != params.top_k &&
+          row % params.lane_rows >= params.first_row && selected[route] == thread_index)
         ++reference_rows;
+    }
   uint expert_tiles = (count + params.tile_rows - 1) / params.tile_rows;
   uint prefix = simd_prefix_exclusive_sum(expert_tiles);
   if (simd_lane == 31)
