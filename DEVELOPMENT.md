@@ -1696,8 +1696,9 @@ Experimental MTP tuning is opt-in. `SPLASH_MTP_LANES=1` at batch widths
 above one lets each request choose its own adaptive draft depth and
 vocabulary gate. Exhausted lanes stop selecting proposals and routing
 experts; their verify routing and retention stop at their own depth plus
-the anchor. Homogeneous heads keep the batched projection; mixed reduced
-and whole heads use one-lane logits plans and independent context rows.
+the anchor. Reduced-head lanes share one batched logits projection; mixed
+whole-head lanes use one-lane fallback plans after those selections finish.
+Context rows keep their independent one-lane plans.
 `SPLASH_MTP_DRAFT_ONE_ROW=1` routes only the consumed row in each draft
 step, retaining the untrimmed routing occupancy's column/staged arithmetic
 for that row. `SPLASH_LIVE_VERIFY_THRESHOLD` in (0, 1] trims the greedy

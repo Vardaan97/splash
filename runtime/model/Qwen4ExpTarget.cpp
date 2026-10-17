@@ -525,7 +525,7 @@ metal::MetalBuffer Qwen4ExpTarget::mtpCarried(const metal::MetalBuffer &auxiliar
 void Qwen4ExpTarget::addMtpVerify(VerifyStep &step, metal::MetalBuffer embedding,
                                    metal::MetalBuffer history, uint32_t limit, bool full, uint32_t firstRow,
                                    const Qwen4DraftHead *draftHead, uint32_t lastRow, bool preserveTileKind,
-                                   std::span<const uint32_t> lastRows, bool splitHead,
+                                   std::span<const uint32_t> lastRows,
                                    std::span<const uint32_t> laneSteps) const {
   constexpr uint32_t laneRows = kVerifyRows;
   const Qwen4MtpWeights &mtp = *weights_.mtp;
@@ -557,10 +557,6 @@ void Qwen4ExpTarget::addMtpVerify(VerifyStep &step, metal::MetalBuffer embedding
   addVerifyMix(step, mtp.block.ffnHyper, b.normalized, nullptr, h.mtpStreams);
   ops::MoE::add(step.graph, {b.normalized, h.zeros, h.branch, b.moe}, mtp.block.ffn, *step.moe, firstRow, lastRow, lastRows, preserveTileKind);
   ops::HyperConnection::addCombine(step.graph, h.mtpStreams, h.branch, h.weights, hs, rows);
-  if (splitHead) {
-    addVerifyMix(step, mtp.head, b.finalHidden, nullptr, h.mtpStreams);
-    return;
-  }
   const ops::Projection &logits = draftHead ? draftHead->logits : weights_.logitsProjection;
   addDecodeProjection(step.graph, b.finalHidden, logits, b.logits, step.lanes, b.linearScratch,
                       addVerifyMix(step, mtp.head, b.finalHidden, &logits, h.mtpStreams));
@@ -623,27 +619,29 @@ void Qwen4ExpTarget::addMtpDraft(metal::CommandGraph &graph, QwenTargetVerifyBuf
       const auto lastRows = mtpDraftLaneRows(std::span(draft.laneSteps).first(lanes), j, draft.oneRow);
       addMtpVerify(step, buffers.hidden[1], h.mtpHistory, j, true, j - 1, draftHead,
                    draft.oneRow ? j : 0, draft.oneRow,
-                   draft.perLane ? std::span<const uint32_t>(lastRows) : std::span<const uint32_t>{}, splitHead,
+                   draft.perLane ? std::span<const uint32_t>(lastRows) : std::span<const uint32_t>{},
                    draft.perLane ? std::span<const uint32_t>(draft.laneSteps).first(lanes) : std::span<const uint32_t>{});
       if (draft.tileCounts)
         ops::RowCopy::add(graph, buffers.moe.tileCount, {0, 2, 0}, draft.tileCounts, {j - 1, 2, 0}, 1, 2);
       if (draft.perLane) {
-        // In a mixed-head batch the final mix is shared, then each lane uses
-        // the existing B1 logits plan. Reuse logits only after selection has
-        // consumed the previous lane, and keep proposals at their batch offsets.
-        for (uint32_t lane = 0; lane < lanes; ++lane) {
+        // The reduced head projects once for the batch. Consume its lanes
+        // first, then reuse logits for each whole-head lane's B1 projection.
+        // Context heads keep their existing one-lane plans and batch offsets.
+        const auto headLanes = mtpDraftHeadLanes(draft.vocabularyMask, lanes);
+        for (uint32_t index = 0; index < lanes; ++index) {
+          const uint32_t lane = headLanes[index];
           if (j > draft.laneSteps[lane]) continue;
           const bool mapped = draftHead && (draft.vocabularyMask & (1u << lane));
           const bool laneContext = mapped && buffers.draftContextCounts[lane];
           const uint32_t vocab = mapped ? vocabulary : geometry_.vocabularySize;
           const uint32_t hidden = geometry_.hiddenSize;
           metal::MetalBuffer logits = buffers.logits;
-          if (splitHead || laneContext) {
+          if ((splitHead && !mapped) || laneContext) {
             ops::RowCopy::add(graph, buffers.finalHidden, {lane * laneRows, hidden, 0}, h.branch,
                               {0, hidden, 0}, laneRows, hidden);
           }
-          if (splitHead)
-            addDecodeProjection(graph, h.branch, mapped ? draftHead->logits : weights_.logitsProjection,
+          if (splitHead && !mapped)
+            addDecodeProjection(graph, h.branch, weights_.logitsProjection,
                                 logits, 1, buffers.linearScratch);
           else
             logits = backend_.view(logits, uint64_t{lane} * laneRows * vocab * sizeof(float),

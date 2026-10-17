@@ -10401,6 +10401,10 @@ void testImpossibleSpeculativeCountsFailOnlyTheirOwnLane() {
 int main() {
   try {
     using model::mtpLiveRows;
+    require(model::mtpDraftHeadLanes(0b1010, 4) == std::array<uint32_t, 4>{1, 3, 0, 2},
+            "mapped head selections finish before whole-head lanes overwrite logits");
+    require(model::mtpDraftHeadLanes(0, 4) == std::array<uint32_t, 4>{0, 1, 2, 3},
+            "homogeneous heads keep their lane order");
     const std::array<uint32_t, 4> depths{2, 7, 3, 5};
     require(model::mtpDraftLaneRows(depths, 3, false) == std::array<uint32_t, 4>{2, 0, 0, 0},
             "exhausted draft lanes route no rows at the current first row");

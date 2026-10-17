@@ -25,6 +25,16 @@ inline std::array<uint32_t, 4> mtpDraftLaneRows(std::span<const uint32_t> depths
   return rows;
 }
 
+// Select mapped lanes before whole-head fallbacks reuse their logits buffer.
+inline std::array<uint32_t, 4> mtpDraftHeadLanes(uint32_t vocabularyMask, uint32_t lanes) {
+  std::array<uint32_t, 4> order{};
+  uint32_t count = 0;
+  for (bool mapped : {true, false})
+    for (uint32_t lane = 0; lane < lanes; ++lane)
+      if (bool(vocabularyMask & (1u << lane)) == mapped) order[count++] = lane;
+  return order;
+}
+
 // Invalid thresholds leave the experiment off.
 inline float mtpThresholdFromEnvironment() {
   const char *value = std::getenv("SPLASH_LIVE_VERIFY_THRESHOLD");

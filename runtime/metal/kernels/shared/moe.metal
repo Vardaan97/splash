@@ -167,7 +167,8 @@ inline void moe_group_routes_phase(
   if (params.preserve_tile_kind)
     for (uint route = 0; route < routes; ++route) {
       const uint row = route / routes_per_row;
-      const uint lane_last = params.last_rows[row / params.lane_rows];
+      const uint lane = row / params.lane_rows;
+      const uint lane_last = lane < SPLASH_MAXIMUM_BATCH_WIDTH ? params.last_rows[lane] : 0;
       // An exhausted lane was already absent before ONE_ROW trimmed the
       // active lanes' tails. It contributes no reference occupancy either.
       const bool exhausted = lane_last && lane_last == params.first_row;
