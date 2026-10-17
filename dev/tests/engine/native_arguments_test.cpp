@@ -340,7 +340,7 @@ int main(int argc, char **argv) {
   try {
     testServerCommandLines(argv[1]);
     testNeuralEngine();
-    for (const char *name : {"SPLASH_MTP_DRAFT_ONE_ROW", "SPLASH_MTP_DRAFT_LOG"}) {
+    for (const char *name : {"SPLASH_MTP_DRAFT_ONE_ROW", "SPLASH_MTP_DRAFT_LOG", "SPLASH_MTP_SAMPLED_DRAFT"}) {
       const char *old = std::getenv(name);
       const std::optional<std::string> saved = old ? std::optional<std::string>(old) : std::nullopt;
       unsetenv(name);

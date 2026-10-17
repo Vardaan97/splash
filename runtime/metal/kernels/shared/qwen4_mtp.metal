@@ -1,6 +1,7 @@
 #include "metal/abi/KernelABI.h"
 #include "metal/abi/Qwen4.h"
 #include "metal/abi/QuantFormat.h"
+#include "metal/abi/Sampling.h"
 #include "metal/abi/HyperConnection.h"
 #include "metal/kernels/common/rms_inverse.h"
 #include <metal_stdlib>
@@ -137,6 +138,7 @@ inline void qwen4_mtp_argmax_row(device const float *logits, device uint *propos
                                  device const uint *tokens, device float *confidence, constant Qwen4MtpParams &p, uint lane_index, uint tid,
                                  uint threads, uint lane, uint sg, threadgroup float *best_values,
                                  threadgroup uint *best_ids, threadgroup float *maxima, threadgroup float *masses) {
+  if (p.pad[0] & (1u << lane_index)) return;
   device const float *x = logits + (ulong(lane_index) * p.lane_rows + p.row) * p.vocabulary;
   float maximum = -INFINITY, mass = 0;
   float best = -INFINITY;
@@ -247,6 +249,7 @@ kernel void qwen4_mtp_argmax_context(device const float *logits [[buffer(0)]],
                                      uint threads [[threads_per_threadgroup]],
                                      uint lane [[thread_index_in_simdgroup]],
                                      uint sg [[simdgroup_index_in_threadgroup]]) {
+  if (p.pad[0] & (1u << lane_index)) return;
   threadgroup float best_values[32];
   threadgroup uint best_tokens[32];
   threadgroup float maxima[32], masses[32];
@@ -289,6 +292,149 @@ kernel void qwen4_mtp_argmax_context(device const float *logits [[buffer(0)]],
     candidates[(lane_index * p.proposals + slot) * p.candidates] = token;
   }
 }
+
+// Each thread keeps its best 16 logits. Repeated global maxima merge those
+// sorted lists into a deterministic top-16 (ties go to the lower token).
+// Context tokens are disjoint from the mapped vocabulary, as in the draft
+// context cache. Selecting a token advances every matching local list.
+inline void qwen4_mtp_insert(thread float *values, thread uint *ids, float value, uint token) {
+  if (!isfinite(value)) return;
+  constexpr uint K = SPLASH_DRAFT_CANDIDATES;
+  uint at = K;
+  for (uint j = 0; j < K; ++j)
+    if (value > values[j] || (value == values[j] && token < ids[j])) { at = j; break; }
+  if (at == K) return;
+  for (uint j = K - 1; j > at; --j) { values[j] = values[j - 1]; ids[j] = ids[j - 1]; }
+  values[at] = value;
+  ids[at] = token;
+}
+
+template <bool Mapped, bool Context>
+inline void qwen4_mtp_sample_row(device const float *logits, device uint *proposals, device uint *candidates,
+                                  device float *probabilities, device const float *uniforms,
+                                  device const uint *tokens, device const float *context_logits,
+                                  device const uint *context_tokens, device const Qwen4MtpContextLane *lanes,
+                                  constant Qwen4MtpSampleParams &params, uint batch, uint tid, uint threads,
+                                  uint lane, uint sg, threadgroup float *group_values, threadgroup uint *group_ids,
+                                  threadgroup float *top_values, threadgroup uint *top_ids) {
+  constant Qwen4MtpParams &p = params.mtp;
+  if (!(p.pad[0] & (1u << batch))) return;
+  constexpr uint K = SPLASH_DRAFT_CANDIDATES;
+  float values[K];
+  uint ids[K];
+  for (uint j = 0; j < K; ++j) { values[j] = -INFINITY; ids[j] = 0xffffffffu; }
+  device const float *x = logits + (ulong(batch) * p.lane_rows + p.row) * p.vocabulary;
+  for (uint v = tid; v < p.vocabulary; v += threads)
+    qwen4_mtp_insert(values, ids, x[v], Mapped ? tokens[v] : v);
+  if (Context) {
+    const Qwen4MtpContextLane own = lanes[batch];
+    device const float *y = context_logits + ulong(batch) * p.context_slot + ulong(p.row) * p.context_capacity;
+    device const uint *named = context_tokens + ulong(own.state_lane) * p.context_capacity;
+    for (uint v = tid; v < min(own.count, p.context_capacity); v += threads)
+      qwen4_mtp_insert(values, ids, y[v], named[v]);
+  }
+  uint cursor = 0;
+  for (uint rank = 0; rank < K; ++rank) {
+    float best = cursor < K ? values[cursor] : -INFINITY;
+    uint token = cursor < K ? ids[cursor] : 0xffffffffu;
+    const float maximum = simd_max(best);
+    token = simd_min(best == maximum ? token : 0xffffffffu);
+    if (lane == 0) { group_values[sg] = maximum; group_ids[sg] = token; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+      float winner = -INFINITY;
+      uint selected = 0xffffffffu;
+      for (uint g = 0; g < (threads + 31) / 32; ++g)
+        qwen4_consider(winner, selected, group_values[g], group_ids[g]);
+      top_values[rank] = winner;
+      top_ids[rank] = selected;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (cursor < K && ids[cursor] == top_ids[rank]) ++cursor;
+    // Every reader has consumed the group scratch before the next rank.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  if (tid != 0) return;
+  float q[K];
+  uint count = 0;
+  const uint limit = params.top_k[batch] ? min(K, params.top_k[batch]) : K;
+  float sum = 0;
+  for (uint j = 0; j < K; ++j) {
+    q[j] = 0;
+    if (j >= limit || top_ids[j] == 0xffffffffu) continue;
+    const float weight = exp((top_values[j] - top_values[0]) / params.temperature[batch]);
+    if (weight < params.min_p[batch]) continue;
+    q[j] = weight;
+    sum += weight;
+    count = j + 1;
+  }
+  if (!count) { top_ids[0] = 0; q[0] = 1; sum = 1; count = 1; }
+  float cumulative = 0;
+  uint kept = count;
+  for (uint j = 0; j < count; ++j) {
+    cumulative += q[j];
+    if (cumulative >= params.top_p[batch] * sum) { kept = j + 1; break; }
+  }
+  sum = 0;
+  for (uint j = 0; j < kept; ++j) sum += q[j];
+  for (uint j = 0; j < K; ++j) q[j] = j < kept ? q[j] / sum : 0;
+  const float uniform = uniforms[batch * SPLASH_SAMPLING_UNIFORMS + SPLASH_UNIFORM_PROPOSALS + p.row];
+  uint selected = kept - 1;
+  cumulative = 0;
+  for (uint j = 0; j < kept; ++j) {
+    cumulative += q[j];
+    if (uniform < cumulative) { selected = j; break; }
+  }
+  const uint end = p.last ? p.proposals : p.row + 1;
+  for (uint slot = p.row; slot < end; ++slot) {
+    proposals[batch * p.proposals + slot] = top_ids[selected];
+    for (uint j = 0; j < K; ++j) {
+      const ulong at = (ulong(batch) * p.proposals + slot) * K + j;
+      candidates[at] = top_ids[j] == 0xffffffffu ? 0 : top_ids[j];
+      probabilities[at] = q[j];
+    }
+  }
+}
+
+#define MTP_SAMPLE_GRID \
+    uint batch [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
+    uint threads [[threads_per_threadgroup]], uint lane [[thread_index_in_simdgroup]], \
+    uint sg [[simdgroup_index_in_threadgroup]]
+#define MTP_SAMPLE_SCRATCH \
+  threadgroup float group_values[32], top_values[SPLASH_DRAFT_CANDIDATES]; \
+  threadgroup uint group_ids[32], top_ids[SPLASH_DRAFT_CANDIDATES]
+
+kernel void qwen4_mtp_sample(device const float *logits [[buffer(0)]], device uint *proposals [[buffer(1)]],
+                              device uint *candidates [[buffer(2)]], device float *probabilities [[buffer(3)]],
+                              device const float *uniforms [[buffer(4)]],
+                              constant Qwen4MtpSampleParams &p [[buffer(5)]], MTP_SAMPLE_GRID) {
+  MTP_SAMPLE_SCRATCH;
+  qwen4_mtp_sample_row<false, false>(logits, proposals, candidates, probabilities, uniforms, nullptr, nullptr,
+      nullptr, nullptr, p, batch, tid, threads, lane, sg, group_values, group_ids, top_values, top_ids);
+}
+
+kernel void qwen4_mtp_sample_mapped(device const float *logits [[buffer(0)]], device uint *proposals [[buffer(1)]],
+                                     device uint *candidates [[buffer(2)]], device float *probabilities [[buffer(3)]],
+                                     device const float *uniforms [[buffer(4)]], device const uint *tokens [[buffer(5)]],
+                                     constant Qwen4MtpSampleParams &p [[buffer(6)]], MTP_SAMPLE_GRID) {
+  MTP_SAMPLE_SCRATCH;
+  qwen4_mtp_sample_row<true, false>(logits, proposals, candidates, probabilities, uniforms, tokens, nullptr,
+      nullptr, nullptr, p, batch, tid, threads, lane, sg, group_values, group_ids, top_values, top_ids);
+}
+
+kernel void qwen4_mtp_sample_context(device const float *logits [[buffer(0)]], device uint *proposals [[buffer(1)]],
+                                      device uint *candidates [[buffer(2)]], device float *probabilities [[buffer(3)]],
+                                      device const float *uniforms [[buffer(4)]], device const uint *tokens [[buffer(5)]],
+                                      device const float *context_logits [[buffer(6)]],
+                                      device const uint *context_tokens [[buffer(7)]],
+                                      device const Qwen4MtpContextLane *lanes [[buffer(8)]],
+                                      constant Qwen4MtpSampleParams &p [[buffer(9)]], MTP_SAMPLE_GRID) {
+  MTP_SAMPLE_SCRATCH;
+  qwen4_mtp_sample_row<true, true>(logits, proposals, candidates, probabilities, uniforms, tokens, context_logits,
+      context_tokens, lanes, p, batch, tid, threads, lane, sg, group_values, group_ids, top_values, top_ids);
+}
+#undef MTP_SAMPLE_GRID
+#undef MTP_SAMPLE_SCRATCH
 
 // One thread per (pair, group): copies the group's plane bytes of each
 // pair's source row to its destination row, and its meta unit when the group

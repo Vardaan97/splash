@@ -10,6 +10,7 @@
 #include "ops/MoE.hpp"
 #include "ops/Normalization.hpp"
 #include "ops/PagedAttention.hpp"
+#include "ops/Sampling.hpp"
 
 #include <algorithm>
 #include <array>
@@ -334,6 +335,7 @@ struct QwenTargetVerifyBuffers final {
   metal::MetalBuffer proposals;
   metal::MetalBuffer candidates;
   metal::MetalBuffer draftConfidence;
+  metal::MetalBuffer draftProbabilities, draftUniforms;
   uint32_t proposalsPerLane = 0;
   uint32_t candidatesPerProposal = 0;
   // With the draft vocabulary, each lane's context rows beside it
@@ -373,6 +375,8 @@ struct QwenTargetMtpDraft final {
   // rows (QwenTarget::hasMtpDraftVocabulary) rather than the whole head.
   bool draftVocabulary = false;
   bool oneRow = false;
+  uint32_t sampledMask = 0;
+  std::array<ops::SamplingPolicy, ExecutionLimits::maximumBatchWidth> policies{};
   // Optional per-step MoE tile counts, copied before the scratch is reused.
   metal::MetalBuffer tileCounts;
   // With `prefetchEvent`, step `prefetchStep` copies each lane's proposals so

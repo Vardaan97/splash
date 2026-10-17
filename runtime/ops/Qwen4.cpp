@@ -1,5 +1,7 @@
 #include "ops/Qwen4.hpp"
 #include "ops/HyperConnection.hpp"
+#include "ops/Sampling.hpp"
+#include "metal/abi/Sampling.h"
 
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/QuantFormat.h"
@@ -207,14 +209,14 @@ void Qwen4::addMtpWiden(metal::CommandGraph &graph, metal::MetalBuffer projected
 void Qwen4::addMtpArgmax(metal::CommandGraph &graph, metal::MetalBuffer logits, metal::MetalBuffer proposals,
                          metal::MetalBuffer candidates, metal::MetalBuffer confidence, uint32_t lanes, uint32_t laneRows, uint32_t vocabulary,
                          uint32_t proposalsPerLane, uint32_t candidatesPerProposal, uint32_t row, bool last,
-                         metal::MetalBuffer tokens) {
+                         metal::MetalBuffer tokens, uint32_t sampledMask) {
   if (!lanes || !vocabulary || !candidatesPerProposal || row >= laneRows || row >= proposalsPerLane ||
       confidence.sizeBytes() < uint64_t{lanes} * proposalsPerLane * sizeof(float))
     throw std::invalid_argument("invalid MTP argmax");
   if (tokens && tokens.sizeBytes() < uint64_t{vocabulary} * sizeof(uint32_t))
     throw std::invalid_argument("MTP draft vocabulary is shorter than its logits");
   const Qwen4MtpParams params{lanes * laneRows, 0, 0, laneRows, 0, vocabulary, proposalsPerLane,
-                              candidatesPerProposal, row, last ? 1u : 0u, 0, 0, 0, {0, 0, 0}};
+                              candidatesPerProposal, row, last ? 1u : 0u, 0, 0, 0, {sampledMask, 0, 0}};
   if (tokens)
     graph.add("qwen4_mtp_argmax_mapped",
               {std::move(logits), std::move(proposals), std::move(candidates), std::move(tokens), std::move(confidence)}, params,
@@ -229,7 +231,7 @@ void Qwen4::addMtpArgmaxContext(metal::CommandGraph &graph, metal::MetalBuffer l
                                 metal::MetalBuffer contextLogits, metal::MetalBuffer contextTokens,
                                 metal::MetalBuffer lanesInfo, uint32_t lanes, uint32_t laneRows, uint32_t vocabulary,
                                 uint32_t capacity, uint32_t logitsSlot, uint32_t proposalsPerLane,
-                                uint32_t candidatesPerProposal, uint32_t row, bool last) {
+                                uint32_t candidatesPerProposal, uint32_t row, bool last, uint32_t sampledMask) {
   if (!lanes || !vocabulary || !capacity || !candidatesPerProposal || row >= laneRows || row >= proposalsPerLane ||
       logitsSlot < uint64_t{laneRows} * capacity || tokens.sizeBytes() < uint64_t{vocabulary} * sizeof(uint32_t) ||
       contextLogits.sizeBytes() < (uint64_t{lanes - 1} * logitsSlot + uint64_t{laneRows} * capacity) * sizeof(float) ||
@@ -237,11 +239,51 @@ void Qwen4::addMtpArgmaxContext(metal::CommandGraph &graph, metal::MetalBuffer l
       confidence.sizeBytes() < uint64_t{lanes} * proposalsPerLane * sizeof(float))
     throw std::invalid_argument("invalid MTP context argmax");
   const Qwen4MtpParams params{lanes * laneRows, 0, 0, laneRows, 0, vocabulary, proposalsPerLane,
-                              candidatesPerProposal, row, last ? 1u : 0u, 0, capacity, logitsSlot, {0, 0, 0}};
+                              candidatesPerProposal, row, last ? 1u : 0u, 0, capacity, logitsSlot, {sampledMask, 0, 0}};
   graph.add("qwen4_mtp_argmax_context",
             {std::move(logits), std::move(proposals), std::move(candidates), std::move(tokens),
              std::move(contextLogits), std::move(contextTokens), std::move(lanesInfo), std::move(confidence)},
             params, {lanes, 1, 1}, {1024, 1, 1});
+}
+
+void Qwen4::addMtpSampled(metal::CommandGraph &graph, MtpSamplingBuffers b, uint32_t lanes,
+                          uint32_t laneRows, uint32_t vocabulary, uint32_t proposals, uint32_t candidates,
+                          uint32_t row, bool last, uint32_t sampledMask, std::span<const SamplingPolicy> policies,
+                          uint32_t contextCapacity, uint32_t contextSlot) {
+  if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH || !vocabulary || candidates != SPLASH_DRAFT_CANDIDATES ||
+      policies.size() != lanes || row >= laneRows || row >= proposals || sampledMask >> lanes ||
+      b.logits.sizeBytes() < uint64_t{lanes} * laneRows * vocabulary * sizeof(float) ||
+      b.proposals.sizeBytes() < uint64_t{lanes} * proposals * sizeof(uint32_t) ||
+      b.candidates.sizeBytes() < uint64_t{lanes} * proposals * candidates * sizeof(uint32_t) ||
+      b.probabilities.sizeBytes() < uint64_t{lanes} * proposals * candidates * sizeof(float) ||
+      b.uniforms.sizeBytes() < uint64_t{lanes} * SPLASH_SAMPLING_UNIFORMS * sizeof(float) ||
+      (b.tokens && b.tokens.sizeBytes() < uint64_t{vocabulary} * sizeof(uint32_t)))
+    throw std::invalid_argument("invalid MTP sampled draft");
+  if (!sampledMask) return;
+  if (contextCapacity && (!b.tokens || contextSlot < uint64_t{laneRows} * contextCapacity ||
+      b.contextLogits.sizeBytes() < uint64_t{lanes} * contextSlot * sizeof(float) ||
+      b.lanesInfo.sizeBytes() < uint64_t{lanes} * sizeof(Qwen4MtpContextLane) ||
+      b.contextTokens.sizeBytes() < uint64_t{SPLASH_MAXIMUM_BATCH_WIDTH} * contextCapacity * sizeof(uint32_t)))
+    throw std::invalid_argument("invalid MTP sampled context");
+  Qwen4MtpSampleParams params{};
+  params.mtp = {lanes * laneRows, 0, 0, laneRows, 0, vocabulary, proposals, candidates, row, last ? 1u : 0u,
+                0, contextCapacity, contextSlot, {sampledMask, 0, 0}};
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    if ((sampledMask & (1u << lane)) && !policies[lane].samples())
+      throw std::invalid_argument("MTP sampled lane is greedy");
+    params.temperature[lane] = policies[lane].temperature;
+    params.top_k[lane] = policies[lane].topK;
+    params.top_p[lane] = policies[lane].topP;
+    params.min_p[lane] = policies[lane].minP;
+  }
+  std::vector<metal::MetalBuffer> bindings{b.logits, b.proposals, b.candidates, b.probabilities, b.uniforms};
+  std::string kernel = "qwen4_mtp_sample";
+  if (b.tokens) { kernel += "_mapped"; bindings.push_back(b.tokens); }
+  if (contextCapacity) {
+    kernel = "qwen4_mtp_sample_context";
+    bindings.insert(bindings.end(), {b.contextLogits, b.contextTokens, b.lanesInfo});
+  }
+  graph.add(std::move(kernel), std::move(bindings), params, {lanes, 1, 1}, {1024, 1, 1});
 }
 
 void Qwen4::addCopyHeadRows(metal::CommandGraph &graph, const QuantizedSegment &source,

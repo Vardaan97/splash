@@ -872,6 +872,182 @@ void streamMeanTest(MetalBackend &backend) {
 // The MTP head's kernels (ops::Qwen4::addMtp*): the stream-major inputs of
 // the embedding and the shifted streams, the widening of the eh projection's
 // rows, a draft step's tokens, the argmax proposals and the carried row.
+// The three sampled heads against the same CPU top-16 and policy. Mixed
+// lanes leave greedy proposals and their point-mass probabilities intact.
+void mtpSampleTest(MetalBackend &backend) {
+  constexpr uint32_t lanes = 2, rows = 8, proposals = 7, K = SPLASH_DRAFT_CANDIDATES, capacity = 64;
+  std::mt19937 rng(97);
+  for (uint32_t vocabulary : {33u, 70001u, 248321u}) {
+    auto logits = randoms(rng, uint64_t{lanes} * rows * vocabulary, 1.0F);
+    for (uint32_t token : {3u, 19u, 32u}) logits[token] = 6.0F;
+    std::vector<uint32_t> names(vocabulary);
+    for (uint32_t token = 0; token < vocabulary; ++token) names[token] = 3 * token + 1;
+    auto context = randoms(rng, lanes * rows * capacity, 1.0F);
+    context[1] = 6.0F;
+    context[9] = 7.0F;
+    std::vector<uint32_t> contextNames(4 * capacity);
+    std::iota(contextNames.begin(), contextNames.end(), 3 * vocabulary + 100);
+    const std::vector<uint32_t> info{capacity - 7, 2, 0, 0, 3, 0, 0, 0};
+    for (uint32_t variant = 0; variant < 3; ++variant)
+      for (bool filtered : {false, true}) {
+        std::array<ops::SamplingPolicy, lanes> policies{};
+        policies[0] = {filtered ? 7u : 0u, 0.6F, filtered ? 0.8F : 1.0F};
+        policies[0].minP = filtered ? 0.3F : 0;
+        const uint32_t uniforms = lanes * SPLASH_SAMPLING_UNIFORMS;
+        std::vector<float> draws(uniforms, 0.43F);
+        ops::MtpSamplingBuffers b{upload(backend, logits),
+          upload(backend, std::vector<uint32_t>(lanes * proposals, 777)),
+          upload(backend, std::vector<uint32_t>(lanes * proposals * K, 778)),
+          upload(backend, std::vector<float>(lanes * proposals * K, -1)), upload(backend, draws),
+          variant ? upload(backend, names) : MetalBuffer{}, upload(backend, context),
+          upload(backend, contextNames), upload(backend, info)};
+        const MetalBuffer confidence = scratch(backend, lanes * proposals * sizeof(float));
+        CommandGraph graph;
+        if (variant == 2)
+          ops::Qwen4::addMtpArgmaxContext(graph, b.logits, b.proposals, b.candidates, confidence, b.tokens,
+            b.contextLogits, b.contextTokens, b.lanesInfo, lanes, rows, vocabulary, capacity, rows * capacity,
+            proposals, K, 0, false, 1);
+        else
+          ops::Qwen4::addMtpArgmax(graph, b.logits, b.proposals, b.candidates, confidence, lanes, rows, vocabulary,
+            proposals, K, 0, false, b.tokens, 1);
+        ops::Qwen4::addMtpSampled(graph, b, lanes, rows, vocabulary, proposals, K, 0, false, 1, policies,
+                                 variant == 2 ? capacity : 0, rows * capacity);
+        run(backend, graph);
+        std::vector<std::pair<float, uint32_t>> ordered;
+        for (uint32_t token = 0; token < vocabulary; ++token)
+          ordered.emplace_back(logits[token], variant ? names[token] : token);
+        if (variant == 2)
+          for (uint32_t j = 0; j < info[0]; ++j)
+            ordered.emplace_back(context[j], contextNames[2 * capacity + j]);
+        std::sort(ordered.begin(), ordered.end(), [](const auto &a, const auto &b) {
+          return a.first > b.first || (a.first == b.first && a.second < b.second);
+        });
+        std::array<double, K> want{};
+        double sum = 0;
+        uint32_t count = 0;
+        for (uint32_t j = 0; j < K; ++j) {
+          if (policies[0].topK && j >= policies[0].topK) break;
+          const double weight = std::exp((double(ordered[j].first) - ordered[0].first) / policies[0].temperature);
+          if (weight < policies[0].minP) break;
+          want[j] = weight; sum += weight; ++count;
+        }
+        double cumulative = 0;
+        uint32_t kept = count;
+        for (uint32_t j = 0; j < count; ++j) {
+          cumulative += want[j];
+          if (cumulative >= policies[0].topP * sum) { kept = j + 1; break; }
+        }
+        sum = std::accumulate(want.begin(), want.begin() + kept, 0.0);
+        for (uint32_t j = 0; j < K; ++j) want[j] = j < kept ? want[j] / sum : 0;
+        const auto candidates = download<uint32_t>(b.candidates, lanes * proposals * K);
+        const auto q = download<float>(b.probabilities, lanes * proposals * K);
+        const auto proposed = download<uint32_t>(b.proposals, lanes * proposals);
+        bool ok = true;
+        double qsum = 0;
+        for (uint32_t j = 0; j < K; ++j) {
+          ok &= candidates[j] == ordered[j].second && std::abs(q[j] - want[j]) <= 1e-6;
+          qsum += q[j];
+          ok &= q[proposals * K + j] == -1; // greedy lane's probabilities are untouched
+        }
+        cumulative = 0;
+        uint32_t selected = kept - 1;
+        for (uint32_t j = 0; j < kept; ++j) {
+          cumulative += want[j];
+          if (draws[SPLASH_UNIFORM_PROPOSALS] < cumulative) { selected = j; break; }
+        }
+        ok &= proposed[0] == ordered[selected].second && std::abs(qsum - 1) <= 1e-6;
+        uint32_t greedy = 0;
+        float best = -INFINITY;
+        for (uint32_t j = 0; j < vocabulary; ++j)
+          if (logits[uint64_t{rows} * vocabulary + j] > best) {
+            best = logits[uint64_t{rows} * vocabulary + j]; greedy = variant ? names[j] : j;
+          }
+        if (variant == 2)
+          for (uint32_t j = 0; j < info[4]; ++j)
+            if (context[rows * capacity + j] > best ||
+                (context[rows * capacity + j] == best && contextNames[j] < greedy)) {
+              best = context[rows * capacity + j]; greedy = contextNames[j];
+            }
+        ok &= proposed[proposals] == greedy;
+        for (uint32_t j = 1; j < proposals; ++j) ok &= proposed[j] == 777;
+        check(ok, "MTP sampled top-16 / policy / draw / mixed greedy lane: vocabulary " +
+                  std::to_string(vocabulary) + " variant " + std::to_string(variant) + (filtered ? " filtered" : " full"));
+      }
+  }
+}
+
+// Enumerate every position-0 accept/reject branch and every residual draw
+// interval, weighted by the GPU draft's q. The resulting marginal must be
+// the target's p, including tokens outside the draft's top-16 support.
+void mtpSampleMarginalTest(MetalBackend &backend) {
+  constexpr uint32_t V = 32, rows = 8, positions = 7, K = SPLASH_DRAFT_CANDIDATES;
+  const ops::Sampling sampling(V);
+  const ops::SamplingPolicy policy{0, 1.0F, 1.0F};
+  const auto ws = ops::Sampling::workspace(rows);
+  const auto zero = [&](uint64_t bytes) {
+    MetalBuffer b = scratch(backend, bytes); std::memset(b.contents(), 0, bytes); return b;
+  };
+  std::vector<float> draftLogits(rows * V), targetLogits(rows * V);
+  std::array<double, V> p{}, residual{}, marginal{};
+  double mass = 0;
+  for (uint32_t t = 0; t < V; ++t) {
+    draftLogits[t] = float(t % 9) * 0.13F;
+    targetLogits[t] = std::log(float(1 + (t * 7) % 11));
+    p[t] = std::exp(double(targetLogits[t])); mass += p[t];
+  }
+  for (double &v : p) v /= mass;
+  for (uint32_t r = 1; r < rows; ++r)
+    std::copy_n(targetLogits.begin(), V, targetLogits.begin() + r * V);
+  const MetalBuffer proposals = zero(positions * 4), candidates = zero(positions * K * 4),
+                    qbuffer = zero(positions * K * 4), uniforms = zero(SPLASH_SAMPLING_UNIFORMS * 4);
+  CommandGraph draft;
+  ops::Qwen4::addMtpSampled(draft, {upload(backend, draftLogits), proposals, candidates, qbuffer, uniforms, {}, {}, {}, {}},
+                           1, rows, V, positions, K, 0, true, 1, {&policy, 1});
+  run(backend, draft);
+  const auto ids = download<uint32_t>(candidates, positions * K);
+  const auto q = download<float>(qbuffer, positions * K);
+  residual = p;
+  for (uint32_t j = 0; j < K; ++j) residual[ids[j]] = std::max(0.0, p[ids[j]] - q[j]);
+  const double residualMass = std::accumulate(residual.begin(), residual.end(), 0.0);
+  ops::SamplingBuffers b{upload(backend, targetLogits), zero(ws.partialMassesBytes), zero(ws.vocabularyRowsBytes),
+    uniforms, zero(rows * 4), zero(rows * 4), zero(ws.argmaxValuesBytes), zero(ws.argmaxIndicesBytes),
+    zero(rows * 4), candidates, qbuffer, zero(ws.vocabularyRangesBytes), zero(ws.vocabularyArrivalsBytes)};
+  ops::AcceptanceBuffers acceptance{proposals, candidates, qbuffer, b.vocabularyRows, uniforms, b.outputTokens,
+                                   zero(4), zero(4)};
+  const std::array<uint32_t, 1> maximumRetained{1};
+  const MetalBuffer penalty = zero(V * 4);
+  const std::array<uint32_t, 1> penaltyRows{0};
+  CommandGraph graph;
+  sampling.addVerify(graph, {&policy, 1}, b, V - 2, V - 1, {penalty, penaltyRows});
+  sampling.addAcceptance(graph, acceptance, maximumRetained, {&policy, 1}, V - 2, V - 1);
+  auto *draws = static_cast<float *>(uniforms.contents());
+  const auto outcome = [&](uint32_t token, double acceptUniform, double correctionUniform) {
+    static_cast<uint32_t *>(proposals.contents())[0] = token;
+    static_cast<uint32_t *>(b.inputTokens.contents())[1] = token;
+    draws[SPLASH_UNIFORM_ACCEPTANCE] = float(acceptUniform);
+    draws[SPLASH_UNIFORM_CORRECTION] = float(correctionUniform);
+    run(backend, graph);
+    return static_cast<const uint32_t *>(b.outputTokens.contents())[0];
+  };
+  for (uint32_t j = 0; j < K; ++j) {
+    const uint32_t token = ids[j];
+    const double alpha = std::min(1.0, p[token] / q[j]);
+    marginal[outcome(token, alpha / 2, 0.5)] += q[j] * alpha;
+    if (alpha >= 1) continue;
+    double before = 0;
+    for (uint32_t t = 0; t < V; ++t) {
+      if (residual[t] > 0) {
+        const double uniform = (before + residual[t] / 2) / residualMass;
+        marginal[outcome(token, (1 + alpha) / 2, uniform)] += q[j] * (1 - alpha) * residual[t] / residualMass;
+      }
+      before += residual[t];
+    }
+  }
+  bool ok = true;
+  for (uint32_t t = 0; t < V; ++t) ok &= std::abs(marginal[t] - p[t]) <= 2e-6;
+  check(ok, "MTP sampled position-0 GPU acceptance/residual marginal equals target within 2e-6");
+}
+
 void mtpTest(MetalBackend &backend) {
   std::mt19937 rng(11);
   const uint32_t rows = 8, hidden = 256, streams = 4, width = hidden * streams, total = 16, offset = 8, limit = 3;
@@ -1199,6 +1375,9 @@ int main(int argc, const char *argv[]) {
         // Uninstrumented: the norm's kernels alone, exact.
         if (std::getenv("MTL_SHADER_VALIDATION")) throw std::runtime_error("bitwise runs without shader validation");
         hyperNormKernelsTest(backend, true);
+        mtpTest(backend);
+        mtpSampleTest(backend);
+        mtpSampleMarginalTest(backend);
       } else {
         hyperTest(backend);
         hyperTableTest(backend);
@@ -1224,6 +1403,8 @@ int main(int argc, const char *argv[]) {
         streamMeanTest(backend);
         pleHashTest(backend);
         mtpTest(backend);
+        mtpSampleTest(backend);
+        mtpSampleMarginalTest(backend);
       }
     } catch (const std::exception &error) {
       std::cerr << "qwen4 kernel test error: " << error.what() << '\n';

@@ -411,6 +411,7 @@ struct Runtime::Impl {
   // (default 3). The later proposals repeat the last.
   float mtpLiveThreshold = mtpThresholdFromEnvironment();
   uint64_t mtpLiveTotal = 0, mtpLiveSamples = 0, mtpLiveCycles = 0;
+  bool mtpSampledDraft = mtpSwitchFromEnvironment("SPLASH_MTP_SAMPLED_DRAFT");
   bool mtpDraftOneRow = mtpSwitchFromEnvironment("SPLASH_MTP_DRAFT_ONE_ROW");
   bool mtpDraftLog = mtpSwitchFromEnvironment("SPLASH_MTP_DRAFT_LOG");
   MetalBuffer mtpDraftTileCounts;
@@ -2151,6 +2152,8 @@ struct Runtime::Impl {
       buffers.proposals = d(DecodeTensor::ProposedTokens);
       buffers.candidates = d(DecodeTensor::Candidates);
       buffers.draftConfidence = d(DecodeTensor::DraftConfidence);
+      buffers.draftProbabilities = d(DecodeTensor::ProposalProbs);
+      buffers.draftUniforms = d(DecodeTensor::SamplingUniforms);
       buffers.proposalsPerLane = kDraftProposalTokens;
       buffers.candidatesPerProposal = SPLASH_DRAFT_CANDIDATES;
       uint32_t steps = 1;
@@ -2170,6 +2173,11 @@ struct Runtime::Impl {
       QwenTargetMtpDraft draft;
       draft.steps = steps;
       draft.oneRow = mtpDraftOneRow;
+      if (mtpSampledDraft)
+        for (uint32_t lane = 0; lane < lanes; ++lane) {
+          draft.policies[lane] = samplingPolicy(*entries[lane]);
+          if (draft.policies[lane].samples()) draft.sampledMask |= 1u << lane;
+        }
       if (mtpDraftLog) {
         if (!mtpDraftTileCounts)
           mtpDraftTileCounts = backend.allocateBuffer(kDraftProposalTokens * sizeof(uint32_t), BufferStorage::Shared,

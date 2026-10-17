@@ -623,12 +623,20 @@ void Qwen4ExpTarget::addMtpDraft(metal::CommandGraph &graph, QwenTargetVerifyBuf
                                         buffers.draftContextInfo, lanes, laneRows, vocabulary,
                                         kQwen4DraftContextTokens, buffers.draftContextLogitsSlot,
                                         buffers.proposalsPerLane, buffers.candidatesPerProposal, j - 1,
-                                        j == draft.steps);
+                                        j == draft.steps, draft.sampledMask);
       } else {
         ops::Qwen4::addMtpArgmax(graph, buffers.logits, buffers.proposals, buffers.candidates, buffers.draftConfidence, lanes, laneRows,
                                  vocabulary, buffers.proposalsPerLane, buffers.candidatesPerProposal, j - 1,
-                                 j == draft.steps, draftHead ? draftHead->tokens : metal::MetalBuffer{});
+                                 j == draft.steps, draftHead ? draftHead->tokens : metal::MetalBuffer{}, draft.sampledMask);
       }
+      if (draft.sampledMask)
+        ops::Qwen4::addMtpSampled(graph,
+            {buffers.logits, buffers.proposals, buffers.candidates, buffers.draftProbabilities, buffers.draftUniforms,
+             draftHead ? draftHead->tokens : metal::MetalBuffer{}, buffers.draftContextLogits,
+             buffers.draftContextTokens, buffers.draftContextInfo},
+            lanes, laneRows, vocabulary, buffers.proposalsPerLane, buffers.candidatesPerProposal, j - 1,
+            j == draft.steps, draft.sampledMask, std::span(draft.policies).first(lanes),
+            context ? kQwen4DraftContextTokens : 0, buffers.draftContextLogitsSlot);
       if (draft.prefetchEvent && j == draft.prefetchStep) {
         // The proposals so far, two halfwords each, as the listener reads
         // them; nothing later in the cycle writes the copy.

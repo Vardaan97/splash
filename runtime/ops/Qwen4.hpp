@@ -17,6 +17,15 @@
 
 namespace splash::ops {
 
+struct SamplingPolicy;
+
+struct MtpSamplingBuffers final {
+  metal::MetalBuffer logits, proposals, candidates, probabilities, uniforms;
+  metal::MetalBuffer tokens, contextLogits, contextTokens, lanesInfo;
+};
+
+
+
 // Where a layer's QSA index sits for a dispatch's lanes: lane l's pooled
 // keys through index table tables[l], an entry per logical page
 // (SplashKvPage), `offset` bytes into each entry's extent (metal/abi/
@@ -117,7 +126,7 @@ struct Qwen4 final {
   static void addMtpArgmax(metal::CommandGraph &graph, metal::MetalBuffer logits, metal::MetalBuffer proposals,
                            metal::MetalBuffer candidates, metal::MetalBuffer confidence, uint32_t lanes, uint32_t laneRows, uint32_t vocabulary,
                            uint32_t proposalsPerLane, uint32_t candidatesPerProposal, uint32_t row, bool last,
-                           metal::MetalBuffer tokens = {});
+                           metal::MetalBuffer tokens = {}, uint32_t sampledMask = 0);
   // The same over the draft vocabulary (`tokens`, `vocabulary` logits) and,
   // beside it, each lane's context rows: `contextLogits` (logitsSlot floats
   // per lane, `capacity` per row), the state lanes' `contextTokens`
@@ -128,7 +137,15 @@ struct Qwen4 final {
                                   metal::MetalBuffer contextLogits, metal::MetalBuffer contextTokens,
                                   metal::MetalBuffer lanesInfo, uint32_t lanes, uint32_t laneRows,
                                   uint32_t vocabulary, uint32_t capacity, uint32_t logitsSlot,
-                                  uint32_t proposalsPerLane, uint32_t candidatesPerProposal, uint32_t row, bool last);
+                                  uint32_t proposalsPerLane, uint32_t candidatesPerProposal, uint32_t row, bool last,
+                                  uint32_t sampledMask = 0);
+  // Top-16 of the same logits as argmax, drawn at each sampled lane's
+  // temperature with its top-k, top-p and min-p within those candidates.
+  // The target's penalties and support may differ; acceptance reads this q.
+  static void addMtpSampled(metal::CommandGraph &graph, MtpSamplingBuffers buffers, uint32_t lanes,
+                            uint32_t laneRows, uint32_t vocabulary, uint32_t proposals, uint32_t candidates,
+                            uint32_t row, bool last, uint32_t sampledMask, std::span<const SamplingPolicy> policies,
+                            uint32_t contextCapacity = 0, uint32_t contextSlot = 0);
   // Rows of `source` (one quantized tensor) copied to rows of `target` (one
   // of the same format and width): `count` (source row, destination row)
   // uint32 pairs in `pairs`.

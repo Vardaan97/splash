@@ -117,10 +117,21 @@ struct Qwen4MtpParams {
   // and state lane.
   uint32_t context_capacity;
   uint32_t context_slot;
+  // Argmax skips these lanes when a sampled draft dispatch owns them.
   uint32_t pad[3];
 };
 
 static_assert(sizeof(Qwen4MtpParams) == 64, "Qwen4 MTP parameters are 64 bytes on both sides");
+
+// Policies for the opt-in top-16 draft. mtp.pad[0] names its sampled lanes.
+struct Qwen4MtpSampleParams {
+  Qwen4MtpParams mtp;
+  float temperature[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t top_k[SPLASH_MAXIMUM_BATCH_WIDTH];
+  float top_p[SPLASH_MAXIMUM_BATCH_WIDTH];
+  float min_p[SPLASH_MAXIMUM_BATCH_WIDTH];
+};
+static_assert(sizeof(Qwen4MtpSampleParams) == 128, "MTP sample parameters are 128 bytes on both sides");
 
 struct Qwen4MtpContextLane {
   uint32_t count;
