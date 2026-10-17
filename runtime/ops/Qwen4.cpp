@@ -183,10 +183,10 @@ void Qwen4::addMtpInput(metal::CommandGraph &graph, metal::MetalBuffer embedding
 }
 
 void Qwen4::addMtpWiden(metal::CommandGraph &graph, metal::MetalBuffer projected, metal::MetalBuffer streams,
-                        HyperShape shape, uint32_t rows) {
+                        HyperShape shape, uint32_t rows, uint32_t stride) {
   requireShape(shape);
-  if (!rows) throw std::invalid_argument("invalid MTP widen");
-  const Qwen4MtpParams params{rows, shape.hidden, shape.streams, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {0, 0, 0}};
+  if (!rows || stride < rows) throw std::invalid_argument("invalid MTP widen");
+  const Qwen4MtpParams params{rows, shape.hidden, shape.streams, stride, 0, 0, 0, 0, 0, 0, 0, 0, 0, {0, 0, 0}};
   graph.add("qwen4_mtp_widen", {std::move(projected), std::move(streams)}, params,
             {groups(rows * shape.width()), 1, 1}, {kThreads, 1, 1});
 }
