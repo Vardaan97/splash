@@ -368,6 +368,14 @@ struct QwenTargetMtpDraft final {
   // Whether the steps draft from the draft vocabulary and the lanes' context
   // rows (QwenTarget::hasMtpDraftVocabulary) rather than the whole head.
   bool draftVocabulary = false;
+  // With `prefetchEvent`, step `prefetchStep` copies each lane's proposals so
+  // far to `prefetchTokens` (proposalsPerLane uint32 per lane) and signals
+  // the event to `prefetchValue`: a streamed PLE table reads the rows those
+  // proposals' verify will gather ahead while the later steps run.
+  metal::SharedEvent prefetchEvent;
+  uint64_t prefetchValue = 0;
+  uint32_t prefetchStep = 0;
+  metal::MetalBuffer prefetchTokens;
 };
 
 // The bytes of a target's own step scratch beside the runtime's arenas, a
