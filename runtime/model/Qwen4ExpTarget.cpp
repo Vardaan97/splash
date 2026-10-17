@@ -2,8 +2,8 @@
 
 #include "metal/abi/Qwen4.h"
 #include "metal/abi/Sampling.h"
-#include "model/Qwen4Exp.hpp"
 #include "model/MtpTuning.hpp"
+#include "model/Qwen4Exp.hpp"
 #include "model/Qwen4DraftVocabulary.hpp"
 #include "model/SparseRowStore.hpp"
 #include "ops/Embedding.hpp"
@@ -657,12 +657,12 @@ void Qwen4ExpTarget::addMtpDraft(metal::CommandGraph &graph, QwenTargetVerifyBuf
                                   sizeof(Qwen4MtpContextLane));
             addDecodeProjection(graph, h.branch, buffers.draftContextHeads[lane], contextLogits, 1, buffers.linearScratch);
           }
-          const auto proposal = [&](metal::MetalBuffer buffer, uint32_t count) {
+          const auto laneBuffer = [&](metal::MetalBuffer buffer, uint32_t count) {
             return backend_.view(buffer, uint64_t{lane} * count * sizeof(uint32_t), uint64_t{count} * sizeof(uint32_t));
           };
-          const auto proposed = proposal(buffers.proposals, buffers.proposalsPerLane);
-          const auto candidates = proposal(buffers.candidates, buffers.proposalsPerLane * buffers.candidatesPerProposal);
-          const auto confidence = proposal(buffers.draftConfidence, buffers.proposalsPerLane);
+          const auto proposed = laneBuffer(buffers.proposals, buffers.proposalsPerLane);
+          const auto candidates = laneBuffer(buffers.candidates, buffers.proposalsPerLane * buffers.candidatesPerProposal);
+          const auto confidence = laneBuffer(buffers.draftConfidence, buffers.proposalsPerLane);
           const auto tokens = mapped ? draftHead->tokens : metal::MetalBuffer{};
           const bool last = j == draft.laneSteps[lane];
           const uint32_t sampled = (draft.sampledMask >> lane) & 1u;
@@ -675,44 +675,44 @@ void Qwen4ExpTarget::addMtpDraft(metal::CommandGraph &graph, QwenTargetVerifyBuf
                 buffers.proposalsPerLane, buffers.candidatesPerProposal, j - 1, last, tokens, sampled);
           if (sampled)
             ops::Qwen4::addMtpSampled(graph,
-                {logits, proposed, candidates, proposal(buffers.draftProbabilities, buffers.proposalsPerLane * buffers.candidatesPerProposal),
-                 proposal(buffers.draftUniforms, SPLASH_SAMPLING_UNIFORMS), tokens, contextLogits, buffers.draftContextTokens, info},
+                {logits, proposed, candidates, laneBuffer(buffers.draftProbabilities, buffers.proposalsPerLane * buffers.candidatesPerProposal),
+                 laneBuffer(buffers.draftUniforms, SPLASH_SAMPLING_UNIFORMS), tokens, contextLogits, buffers.draftContextTokens, info},
                 1, laneRows, vocab, buffers.proposalsPerLane, buffers.candidatesPerProposal, j - 1, last, 1,
                 std::span(draft.policies).subspan(lane, 1), laneContext ? kQwen4DraftContextTokens : 0,
                 buffers.draftContextLogitsSlot);
         }
       } else {
-      if (context) {
-        const uint32_t hidden = geometry_.hiddenSize;
-        for (uint32_t lane = 0; lane < lanes; ++lane)
-          if (buffers.draftContextCounts[lane]) {
-            ops::RowCopy::add(graph, buffers.finalHidden, {lane * laneRows, hidden, 0}, h.branch, {0, hidden, 0},
-                              laneRows, hidden);
-            addDecodeProjection(graph, h.branch, buffers.draftContextHeads[lane],
-                                backend_.view(buffers.draftContextLogits,
-                                              uint64_t{lane} * buffers.draftContextLogitsSlot * sizeof(float),
-                                              uint64_t{buffers.draftContextLogitsSlot} * sizeof(float)),
-                                1, buffers.linearScratch);
-          }
-        ops::Qwen4::addMtpArgmaxContext(graph, buffers.logits, buffers.proposals, buffers.candidates, buffers.draftConfidence,
-                                        draftHead->tokens, buffers.draftContextLogits, buffers.draftContextTokens,
-                                        buffers.draftContextInfo, lanes, laneRows, vocabulary,
-                                        kQwen4DraftContextTokens, buffers.draftContextLogitsSlot,
-                                        buffers.proposalsPerLane, buffers.candidatesPerProposal, j - 1,
-                                        j == draft.steps, draft.sampledMask);
-      } else {
-        ops::Qwen4::addMtpArgmax(graph, buffers.logits, buffers.proposals, buffers.candidates, buffers.draftConfidence, lanes, laneRows,
-                                 vocabulary, buffers.proposalsPerLane, buffers.candidatesPerProposal, j - 1,
-                                 j == draft.steps, draftHead ? draftHead->tokens : metal::MetalBuffer{}, draft.sampledMask);
-      }
-      if (draft.sampledMask)
-        ops::Qwen4::addMtpSampled(graph,
-            {buffers.logits, buffers.proposals, buffers.candidates, buffers.draftProbabilities, buffers.draftUniforms,
-             draftHead ? draftHead->tokens : metal::MetalBuffer{}, buffers.draftContextLogits,
-             buffers.draftContextTokens, buffers.draftContextInfo},
-            lanes, laneRows, vocabulary, buffers.proposalsPerLane, buffers.candidatesPerProposal, j - 1,
-            j == draft.steps, draft.sampledMask, std::span(draft.policies).first(lanes),
-            context ? kQwen4DraftContextTokens : 0, buffers.draftContextLogitsSlot);
+        if (context) {
+          const uint32_t hidden = geometry_.hiddenSize;
+          for (uint32_t lane = 0; lane < lanes; ++lane)
+            if (buffers.draftContextCounts[lane]) {
+              ops::RowCopy::add(graph, buffers.finalHidden, {lane * laneRows, hidden, 0}, h.branch, {0, hidden, 0},
+                                laneRows, hidden);
+              addDecodeProjection(graph, h.branch, buffers.draftContextHeads[lane],
+                                  backend_.view(buffers.draftContextLogits,
+                                                uint64_t{lane} * buffers.draftContextLogitsSlot * sizeof(float),
+                                                uint64_t{buffers.draftContextLogitsSlot} * sizeof(float)),
+                                  1, buffers.linearScratch);
+            }
+          ops::Qwen4::addMtpArgmaxContext(graph, buffers.logits, buffers.proposals, buffers.candidates, buffers.draftConfidence,
+                                          draftHead->tokens, buffers.draftContextLogits, buffers.draftContextTokens,
+                                          buffers.draftContextInfo, lanes, laneRows, vocabulary,
+                                          kQwen4DraftContextTokens, buffers.draftContextLogitsSlot,
+                                          buffers.proposalsPerLane, buffers.candidatesPerProposal, j - 1,
+                                          j == draft.steps, draft.sampledMask);
+        } else {
+          ops::Qwen4::addMtpArgmax(graph, buffers.logits, buffers.proposals, buffers.candidates, buffers.draftConfidence, lanes, laneRows,
+                                   vocabulary, buffers.proposalsPerLane, buffers.candidatesPerProposal, j - 1,
+                                   j == draft.steps, draftHead ? draftHead->tokens : metal::MetalBuffer{}, draft.sampledMask);
+        }
+        if (draft.sampledMask)
+          ops::Qwen4::addMtpSampled(graph,
+              {buffers.logits, buffers.proposals, buffers.candidates, buffers.draftProbabilities, buffers.draftUniforms,
+               draftHead ? draftHead->tokens : metal::MetalBuffer{}, buffers.draftContextLogits,
+               buffers.draftContextTokens, buffers.draftContextInfo},
+              lanes, laneRows, vocabulary, buffers.proposalsPerLane, buffers.candidatesPerProposal, j - 1,
+              j == draft.steps, draft.sampledMask, std::span(draft.policies).first(lanes),
+              context ? kQwen4DraftContextTokens : 0, buffers.draftContextLogitsSlot);
       }
       if (draft.prefetchEvent && j == draft.prefetchStep) {
         // The proposals so far, two halfwords each, as the listener reads
@@ -724,9 +724,9 @@ void Qwen4ExpTarget::addMtpDraft(metal::CommandGraph &graph, QwenTargetVerifyBuf
       if (j < draft.steps)
         for (uint32_t lane = 0; lane < lanes; ++lane)
           if (!draft.perLane || j < draft.laneSteps[lane])
-          ops::Qwen4::addMtpCarry(graph, rowsOf<float>(h.mtpStreams, lane * laneRows, j, width),
-                                  rowsOf<float>(h.mtpHistory, lane * laneRows + j - 1, 1, width), {},
-                                  hyperShape(geometry_), j);
+            ops::Qwen4::addMtpCarry(graph, rowsOf<float>(h.mtpStreams, lane * laneRows, j, width),
+                                    rowsOf<float>(h.mtpHistory, lane * laneRows + j - 1, 1, width), {},
+                                    hyperShape(geometry_), j);
     }
   }
 }

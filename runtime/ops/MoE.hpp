@@ -275,7 +275,9 @@ struct MoE final {
   // routed work, each in its own scratch.
   // With `firstRow`, a decode plan's lanes route their rows before it to no
   // expert, and with `lastRow` those from it on neither (MoeGroupParams::
-  // first_row, last_row); those rows' outputs are not theirs.
+  // first_row, last_row); those rows' outputs are not theirs. A per-lane
+  // bound equal to firstRow is an empty range. preserveTileKind keeps the
+  // arithmetic of routing the tail, without executing its experts.
   static void add(metal::CommandGraph &graph, const MoeBuffers &buffers,
                   const BlockMoeWeights &weights, const MoePlan &plan, uint32_t firstRow = 0,
                   uint32_t lastRow = 0, std::span<const uint32_t> lastRows = {}, bool preserveTileKind = false);
