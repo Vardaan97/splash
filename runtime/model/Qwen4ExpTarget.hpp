@@ -114,7 +114,8 @@ private:
   void addMtpPrefill(PrefillStep &step) const;
   void addMtpVerify(VerifyStep &step, metal::MetalBuffer embedding, metal::MetalBuffer history,
                     uint32_t limit, bool full, uint32_t firstRow = 0, const Qwen4DraftHead *draftHead = nullptr, uint32_t lastRow = 0,
-                    bool preserveTileKind = false, std::span<const uint32_t> lastRows = {}, bool splitHead = false) const;
+                    bool preserveTileKind = false, std::span<const uint32_t> lastRows = {}, bool splitHead = false,
+                    std::span<const uint32_t> laneSteps = {}) const;
   [[nodiscard]] metal::MetalBuffer mtpCarried(const metal::MetalBuffer &auxiliary) const;
   const Qwen4ExpWeights &weights_;
   // The step scratch and the inputs the target makes of a step's tokens.

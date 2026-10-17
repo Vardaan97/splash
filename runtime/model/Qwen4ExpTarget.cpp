@@ -525,7 +525,8 @@ metal::MetalBuffer Qwen4ExpTarget::mtpCarried(const metal::MetalBuffer &auxiliar
 void Qwen4ExpTarget::addMtpVerify(VerifyStep &step, metal::MetalBuffer embedding,
                                    metal::MetalBuffer history, uint32_t limit, bool full, uint32_t firstRow,
                                    const Qwen4DraftHead *draftHead, uint32_t lastRow, bool preserveTileKind,
-                                   std::span<const uint32_t> lastRows, bool splitHead) const {
+                                   std::span<const uint32_t> lastRows, bool splitHead,
+                                   std::span<const uint32_t> laneSteps) const {
   constexpr uint32_t laneRows = kVerifyRows;
   const Qwen4MtpWeights &mtp = *weights_.mtp;
   const QwenTargetVerifyBuffers &b = step.buffers;
@@ -537,7 +538,8 @@ void Qwen4ExpTarget::addMtpVerify(VerifyStep &step, metal::MetalBuffer embedding
     ops::Qwen4::addMtpInput(step.graph, rowsOf<uint16_t>(embedding, lane * laneRows, laneRows, hidden),
                             mtpCarried(b.auxiliary[lane]),
                             rowsOf<float>(history, lane * laneRows, laneRows, width), mtp.embedNorm,
-                            mtp.hiddenNorm, h.mtpInput, hs, laneRows, limit, lane * laneRows, stride);
+                            mtp.hiddenNorm, h.mtpInput, hs, laneRows,
+                            laneSteps.empty() ? limit : std::min(limit, laneSteps[lane]), lane * laneRows, stride);
   // The eh projection of each stream's rows, then the fp32 streams.
   for (uint32_t s = 0; s < hs.streams; ++s)
     addDecodeProjection(step.graph, rowsOf<uint16_t>(h.mtpInput, s * stride, stride, 2 * hidden),
@@ -621,7 +623,8 @@ void Qwen4ExpTarget::addMtpDraft(metal::CommandGraph &graph, QwenTargetVerifyBuf
       const auto lastRows = mtpDraftLaneRows(std::span(draft.laneSteps).first(lanes), j, draft.oneRow);
       addMtpVerify(step, buffers.hidden[1], h.mtpHistory, j, true, j - 1, draftHead,
                    draft.oneRow ? j : 0, draft.oneRow,
-                   draft.perLane ? std::span<const uint32_t>(lastRows) : std::span<const uint32_t>{}, splitHead);
+                   draft.perLane ? std::span<const uint32_t>(lastRows) : std::span<const uint32_t>{}, splitHead,
+                   draft.perLane ? std::span<const uint32_t>(draft.laneSteps).first(lanes) : std::span<const uint32_t>{});
       if (draft.tileCounts)
         ops::RowCopy::add(graph, buffers.moe.tileCount, {0, 2, 0}, draft.tileCounts, {j - 1, 2, 0}, 1, 2);
       if (draft.perLane) {
