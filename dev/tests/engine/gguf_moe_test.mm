@@ -443,6 +443,7 @@ bool columnTile(const MoeTileDescriptor *tiles, uint32_t t) {
 
 // The byte every grouped route and grouped input holds before a run.
 constexpr uint8_t kCanary = 0xa5;
+uint64_t oneRowCompared = 0, oneRowLegacyKinds = 0, oneRowLegacyOutputs = 0;
 
 bool untouched(const void *data, uint64_t bytes) {
   const auto *begin = static_cast<const uint8_t *>(data);
@@ -728,6 +729,20 @@ void checkLiveRows(MetalBackend &backend, const Model &m, Buffers &b, const MoeP
     static_cast<void>(backend.submitCommandAsync(baseline.dispatches()).wait());
     reference.column = columnRoutes(b.moe.scratch, plan);
     std::memcpy(reference.output.data(), b.moe.output.contents(), reference.output.size() * 2);
+    CommandGraph legacy;
+    MoE::add(legacy, b.moe, m.weights, plan, firstRow, lastRow);
+    static_cast<void>(backend.submitCommandAsync(legacy.dispatches()).wait());
+    const auto legacyKinds = columnRoutes(b.moe.scratch, plan);
+    const auto *legacyOutput = static_cast<const uint16_t *>(b.moe.output.contents());
+    for (uint32_t row = 0; row < rows; ++row) {
+      if (!live(row)) continue;
+      ++oneRowCompared;
+      const uint64_t route = uint64_t{row} * kRoutes, offset = uint64_t{row} * kHidden;
+      oneRowLegacyKinds += !std::equal(legacyKinds.begin() + route, legacyKinds.begin() + route + kRoutes,
+                                      reference.column.begin() + route);
+      oneRowLegacyOutputs += !std::equal(legacyOutput + offset, legacyOutput + offset + kHidden,
+                                        reference.output.begin() + offset);
+    }
   }
   std::memset(b.moe.output.contents(), 0, b.moe.output.sizeBytes());
   CommandGraph graph;
@@ -1060,6 +1075,10 @@ int main(int argc, const char *argv[]) {
         std::cerr << "gguf_moe_test: " << failures << " failures\n";
         return 1;
       }
+      require(oneRowCompared > 0 && oneRowLegacyKinds > 0 && oneRowLegacyOutputs > 0,
+              "ONE_ROW fixture did not reproduce occupancy-dependent arithmetic");
+      std::cout << "ONE_ROW: " << oneRowCompared << " consumed rows bitwise and GPU proposals identical; legacy "
+                << oneRowLegacyKinds << " tile-kind changes, " << oneRowLegacyOutputs << " changed outputs\n";
       std::cout << "gguf_moe_test: PASS\n";
     } catch (const std::exception &error) {
       std::cerr << "FAIL: unexpected exception: " << error.what() << '\n';

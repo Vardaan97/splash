@@ -241,7 +241,7 @@ void workspaceBounds() {
   const auto moe = plans.moeDecodeWorkspacePerLane(routedShape);
   require(moe.groupedInputBytes == 2129920 && moe.expertOutputBytes == 2129920 &&
               moe.expertIntermediateBytes == 532480 && moe.groupedRoutesBytes == 2080 &&
-              moe.tileDescriptorsBytes == 520 && moe.tileCountBytes == 28,
+              moe.tileDescriptorsBytes == 780 && moe.tileCountBytes == 28,
           "MoE decode workspace per lane changed");
   require(plans.gateUpWorkspace(gateUp(matrices[0])) == 1114112 &&
               plans.gateUpWorkspace(gateUp(matrices[1])) == 393216,
