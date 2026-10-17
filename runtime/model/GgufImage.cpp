@@ -491,6 +491,8 @@ struct Qwen4ExpGguf final {
     expect("attention.indexer.head_count", g.indexerHeads);
     expect("attention.indexer.key_length", g.indexerHeadDimension);
     expect("attention.indexer.top_k", g.indexerTokens());
+    // The MTP-only GGUF has no PLE embedding or metadata.
+    if (!g.hasPle()) return;
     expect("ple.ngram_size", g.pleNgram);
     expect("ple.heads_per_ngram", g.pleHeadsPerNgram);
     expect("ple.conv_kernel", g.pleConvolutionTaps);
@@ -508,9 +510,11 @@ struct Qwen4ExpGguf final {
     for (uint32_t layer = 0; ratiosMatch && layer < g.layers; ++layer)
       ratiosMatch = (*ratios)[layer] == (g.isFullAttentionLayer(layer) ? g.indexerBlockTokens : 0);
     if (!ratiosMatch) mismatched += "attention.compress_ratios";
-    const auto layers = file.numericArray(arch + ".ple.layers");
-    if (!layers || layers->size() != 1 || (*layers)[0] != g.pleLayer)
-      mismatched += (mismatched.empty() ? "" : ", ") + std::string("ple.layers");
+    if (g.hasPle()) {
+      const auto layers = file.numericArray(arch + ".ple.layers");
+      if (!layers || layers->size() != 1 || (*layers)[0] != g.pleLayer)
+        mismatched += (mismatched.empty() ? "" : ", ") + std::string("ple.layers");
+    }
     if (!mismatched.empty()) throw GgufError("GGUF metadata does not match the target: " + mismatched);
   }
 

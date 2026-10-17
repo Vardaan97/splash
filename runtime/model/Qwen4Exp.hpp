@@ -109,15 +109,18 @@ struct Qwen4ExpLayout final : QwenHybridLayout {
     layout.attentionLayers += mtpLayers;
     return layout;
   }
+  [[nodiscard]] constexpr uint64_t indexerPendingBytes() const noexcept {
+    return uint64_t{attentionLayerCount() + mtpLayers} * (indexerBlockTokens - 1) * indexerHeadDimension * sizeof(uint16_t);
+  }
   // With the MTP head, each state also carries the fp32 streams of the
   // position before the next one the head reads (QwenTarget::mtpCarried),
-  // after the PLE history.
+  // after the PLE history and QSA pending keys.
   [[nodiscard]] constexpr uint64_t mtpCarriedBytes() const noexcept {
     return mtpLayers ? uint64_t{streamWidth()} * sizeof(float) : 0;
   }
   [[nodiscard]] constexpr GdnStateLayout gdnStateLayout() const noexcept {
     GdnStateLayout layout = QwenHybridLayout::gdnStateLayout();
-    layout.auxiliaryBytes = pleHistoryBytes() + mtpCarriedBytes();
+    layout.auxiliaryBytes = pleHistoryBytes() + indexerPendingBytes() + mtpCarriedBytes();
     return layout;
   }
   bool operator==(const Qwen4ExpLayout &) const = default;

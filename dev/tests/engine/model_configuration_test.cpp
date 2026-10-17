@@ -152,7 +152,7 @@ void testFamilies(const std::filesystem::path &fixtures) {
   require(mtpLayout && !mtpDescriptor.hasDraft() && mtpLayout->mtpLayers == 1 && mtpDescriptor.valid() &&
               mtpDescriptor.targetKvLayout.attentionLayers == flash.kvLayout().attentionLayers + 1 &&
               mtpDescriptor.stateLayout.target.auxiliaryBytes ==
-                  flash.pleHistoryBytes() + uint64_t{flash.streamWidth()} * sizeof(float) &&
+                  flash.pleHistoryBytes() + mtpLayout->indexerPendingBytes() + uint64_t{flash.streamWidth()} * sizeof(float) &&
               mtpDescriptor.draft == model::nullDraftLayout(flash.hiddenSize, flash.vocabularySize) &&
               mtpDescriptor.draft.targetLayerCount == 1,
           "a Flash-Next root drafting with its MTP head made another descriptor");
