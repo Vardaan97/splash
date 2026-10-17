@@ -129,6 +129,32 @@ struct Qwen4StreamMeanParams {
 static_assert(sizeof(Qwen4StreamMeanParams) == 24,
               "Qwen4 stream mean parameters are 24 bytes on both sides");
 
+// The MTP head (model/Qwen4Exp.hpp Qwen4MtpWeights) over a lane's verify
+// rows. Row r of a lane pairs the residual streams of position r - 1 (row 0:
+// the lane's carried streams, else history row r - 1) with the embedding of
+// its token; rows from `limit` on repeat row limit - 1. qwen4_mtp_tokens
+// builds a draft step's tokens: row r the anchor (r = 0) or proposal r - 1.
+// qwen4_mtp_argmax writes the argmax of each lane's row `row` as its
+// proposal `row` (and, on the last step, every later one) and its first
+// sparse candidate. qwen4_mtp_carry keeps one row of streams: row
+// retained - 1 (a GPU count) or, without one, row limit - 1.
+struct Qwen4MtpParams {
+  uint32_t rows;
+  uint32_t hidden;
+  uint32_t streams;
+  uint32_t lane_rows;
+  uint32_t limit;
+  uint32_t vocabulary;
+  uint32_t proposals;  // proposals per lane
+  uint32_t candidates; // sparse candidates per proposal
+  uint32_t row;        // argmax: the row; input: the first output row
+  uint32_t last;       // argmax: whether to fill the later proposals
+  uint32_t counted;    // carry: whether `retained` is bound
+  uint32_t pad;
+};
+
+static_assert(sizeof(Qwen4MtpParams) == 48, "Qwen4 MTP parameters are 48 bytes on both sides");
+
 // The PLE rows (the n-gram hash, model/Qwen4Exp.hpp) of each lane's
 // SPLASH_TARGET_VERIFY_ROWS verify rows on the GPU, from the rows' tokens and
 // the ngram - 1 tokens before a lane's first row, nearest first

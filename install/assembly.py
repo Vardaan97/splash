@@ -27,7 +27,11 @@ The paths an assembly links, and what reads each:
                          from the GGUF (server.py --tokenizer)
   draft/config.json, draft/<name>.safetensors
                          the DFlash2 checkpoint (ModelDescriptor.mm,
-                         DraftCheckpoint.cpp)
+                         DraftCheckpoint.cpp); none for a model that drafts
+                         with its MTP head
+  mtp/<name>.gguf        Qwen3.8-Flash-Next's MTP head (GgufTarget.cpp
+                         GgufMtpLoader), which drafts in place of a DFlash2
+                         checkpoint
   vision/<shard>         the MLX shards holding vision_tower.*
                          (VisionLoader.cpp, through SafetensorsCheckpoint.mm)
   vision/mmproj.gguf     the GGUF vision projector (VisionLoader.cpp)
@@ -181,7 +185,7 @@ def _well_formed(record):
         and record["vision_format"] in VISION_FORMATS
         and (not gguf_target or models.is_hex_digest(record["metadata"], 64))
         and isinstance(sources, dict)
-        and set(sources) == {"target", "draft"}
+        and set(sources) in ({"target"}, {"target", "draft"})
         and all(
             isinstance(source, dict)
             and set(source) == {"repo", "revision"}

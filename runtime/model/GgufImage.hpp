@@ -247,6 +247,14 @@ void requireMetadata(const GgufMetadata &metadata, std::string_view architecture
 [[nodiscard]] std::vector<Image> planImages(const GgufFile &file, std::string_view architecture,
                                             const QwenTargetDimensions &geometry, PlanOptions options = {});
 
+// The image (mtp.bin) of Qwen3.8-Flash-Next's MTP head from its own GGUF
+// (model/Qwen4Exp.hpp Qwen4MtpWeights): its one full-attention block
+// (blk.<layers>, the block's tensors as a target layer's, its experts never
+// streamed), then the nextn tensors, eh_proj, enorm, hnorm and the head's
+// mix. The geometry is the target's; the head's GGUF declares its metadata
+// without the PLE embedding, and its one nextn layer.
+[[nodiscard]] Image planMtpImage(const GgufFile &file, const QwenTargetDimensions &geometry);
+
 // Where the GGUF holds the rows of the tensor `name`, a table of `columns`
 // values a row whose image copies its native rows as stored (a family's
 // table), for reading them from the file. Throws GgufError for a tensor of a

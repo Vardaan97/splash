@@ -78,6 +78,16 @@ model::ModelDescriptor inspect(const SourceModel &model) {
   return model::inspectModelRoot(root.path());
 }
 
+// The descriptor inspection makes of model's assembly with mtp/ in place of
+// draft/ (`mtp`), or with neither.
+model::ModelDescriptor inspectWithoutDraft(const SourceModel &model, bool mtp) {
+  const test::TemporaryDirectory root("splash-source-model");
+  if (mtp) std::filesystem::create_directory(root.path() / "mtp");
+  test::writeFile(root.path() / "model.json", model.record);
+  test::writeFile(root.path() / "config.json", model.config);
+  return model::inspectModelRoot(root.path());
+}
+
 void refuses(const SourceModel &model, std::string_view error, const std::string &message) {
   rejects([&] { static_cast<void>(inspect(model)); }, error, message);
 }
@@ -122,6 +132,30 @@ void testFamilies(const std::filesystem::path &fixtures) {
               flash.pleHistoryBytes() && !denseDescriptor.targetKvLayout.indexDimension &&
               !denseDescriptor.stateLayout.target.auxiliaryBytes,
           "a family's cache layouts do not hold what it adds");
+  // A Flash-Next root with mtp/ in place of draft/ drafts with its MTP head:
+  // no DFlash2 draft runs (the draft layout is the placeholder), the head's
+  // KV follows the trunk's attention layers and each state carries the
+  // head's streams after the PLE history. A root with both decodes with the
+  // DFlash2 draft; one with neither, or another family's with mtp/, is
+  // refused.
+  const SourceModel flashGguf =
+      mlxModel(fixtures, "qwen3.8-flash-next").with(&SourceModel::record, R"("mlx-affine")", R"("gguf")");
+  const model::ModelDescriptor mtpDescriptor = inspectWithoutDraft(flashGguf, true);
+  const auto *mtpLayout = std::get_if<model::Qwen4ExpLayout>(&mtpDescriptor.target);
+  require(mtpLayout && !mtpDescriptor.hasDraft() && mtpLayout->mtpLayers == 1 && mtpDescriptor.valid() &&
+              mtpDescriptor.targetKvLayout.attentionLayers == flash.kvLayout().attentionLayers + 1 &&
+              mtpDescriptor.stateLayout.target.auxiliaryBytes ==
+                  flash.pleHistoryBytes() + uint64_t{flash.streamWidth()} * sizeof(float) &&
+              mtpDescriptor.draft == model::nullDraftLayout(flash.hiddenSize, flash.vocabularySize) &&
+              mtpDescriptor.draft.targetLayerCount == 1,
+          "a Flash-Next root drafting with its MTP head made another descriptor");
+  require(flashDescriptor.hasDraft() && std::get<model::Qwen4ExpLayout>(flashDescriptor.target).mtpLayers == 0 &&
+              flashDescriptor.targetKvLayout.attentionLayers == flash.kvLayout().attentionLayers,
+          "a Flash-Next root with a DFlash2 draft loads its MTP head");
+  rejects([&] { static_cast<void>(inspectWithoutDraft(flashGguf, false)); }, "holds no draft/",
+          "a root without a draft or an MTP head was accepted");
+  rejects([&] { static_cast<void>(inspectWithoutDraft(dense, true)); }, "has no MTP head",
+          "a family without an MTP head accepted mtp/ in place of its draft");
   // A draft states its own layers, intermediate size, rotary base and the
   // target layers it reads.
   constexpr std::array<uint32_t, 6> ownLayers{5, 19, 33, 47, 61, 63};

@@ -642,6 +642,70 @@ void checkPleTable(const std::filesystem::path &directory) {
   check(names(plan(path, g), {"ple.layers"}), "planner refuses a GGUF that declares another PLE layer");
 }
 
+// Qwen3.8-Flash-Next's MTP head from its own GGUF (gguf::planMtpImage): one
+// image of the head's block (blk.<layers>, as a full-attention layer's with
+// its indexer) and the nextn tensors, from a GGUF that declares the target's
+// metadata without the PLE embedding and one nextn layer; a GGUF without
+// that layer is refused.
+void checkMtpHead(const std::filesystem::path &directory) {
+  const model::QwenTargetDimensions g = qwen4ExpGeometry();
+  // The head's GGUF: block_count = the target's layers + 1, no PLE keys.
+  model::QwenTargetDimensions declared = g;
+  declared.layers = g.layers + 1;
+  declared.pleNgram = 0;
+  TensorTypes types = qwen4ExpTypes();
+  for (const char *name : {"hc_attn_down.weight", "hc_attn_up.weight", "hc_ffn_down.weight", "hc_ffn_up.weight",
+                           "nextn.eh_proj.weight", "nextn.hc_head_down.weight", "nextn.hc_head_up.weight"})
+    types[name] = kQ8_0;
+  const std::string p = "blk." + std::to_string(g.layers) + ".";
+  std::vector<Tensor> tensors;
+  for (Tensor &tensor : targetTensors(declared, types))
+    if (tensor.name.starts_with(p)) tensors.push_back(std::move(tensor));
+  const auto add = [&](const std::string &name, std::vector<uint64_t> dims) {
+    const uint32_t type = typeOf(types, name);
+    const model::GgmlTypeTraits &traits = *model::ggmlTypeTraits(type);
+    uint64_t elements = 1;
+    for (uint64_t dim : dims) elements *= dim;
+    tensors.push_back(
+        {name, std::move(dims), type, test_gguf::Bytes(elements / traits.blockElements * traits.blockBytes)});
+  };
+  add(p + "nextn.eh_proj.weight", {2ull * g.hiddenSize, g.hiddenSize});
+  add(p + "nextn.enorm.weight", {g.hiddenSize});
+  add(p + "nextn.hnorm.weight", {g.streamWidth()});
+  add(p + "nextn.hc_head_norm.weight", {g.streamWidth()});
+  add(p + "nextn.hc_head_down.weight", {g.streamWidth(), g.hyperRank});
+  add(p + "nextn.hc_head_up.weight", {g.hyperRank, g.streamWidth()});
+  const auto path = directory / "mtp.gguf";
+  const auto planned = [&](bool nextn) -> Plan {
+    std::vector<test_gguf::Key> keys = metadata(declared);
+    if (nextn) keys.push_back(test_gguf::uint32Key("qwen4exp.nextn_predict_layers", 1));
+    splash::test::writeFile(path, test_gguf::file(keys, tensors));
+    try {
+      model::WeightSource source(path);
+      const model::GgufFile gguf(source);
+      return {{model::gguf::planMtpImage(gguf, g)}, std::nullopt};
+    } catch (const model::GgufError &error) {
+      return {{}, error.what()};
+    }
+  };
+  const Plan head = planned(true);
+  check(!head.error, "planner plans the MTP head's GGUF" + (head.error ? ": " + *head.error : ""));
+  if (head.error) return;
+  const model::gguf::Image &image = head.images.front();
+  check(image.name == "mtp.bin" && image.layer == g.layers && !image.experts && !image.streamedRows &&
+            repackOf(image, p + "attn_q.weight") && repackOf(image, p + "attn_output.weight") &&
+            copyOf(image, p + "indexer.q_proj.weight") && copyOf(image, p + "indexer.k_norm.weight") &&
+            repackOf(image, p + "ffn_gate.weight") && repackOf(image, p + "nextn.eh_proj.weight") &&
+            copyOf(image, p + "nextn.enorm.weight") && copyOf(image, p + "nextn.hnorm.weight") &&
+            copyOf(image, p + "nextn.hc_head_norm.weight") && repackOf(image, p + "nextn.hc_head_down.weight") &&
+            repackOf(image, p + "nextn.hc_head_up.weight") && repackOf(image, p + "hc_attn_down.weight") &&
+            copyOf(image, p + "hc_ffn_inject.weight"),
+        "planner plans the MTP head's block, indexer and nextn tensors in one image");
+  const Plan plain = planned(false);
+  check(plain.error && plain.error->find("nextn") != std::string::npos,
+        "planner refuses an MTP GGUF without its nextn layer");
+}
+
 } // namespace
 
 int main() {
@@ -655,6 +719,7 @@ int main() {
     guarded("planner on a streamed PLE table", [&] { checkPleTableRows(directory.path()); });
     guarded("planner on Flash-Next hyper-connections", [&] { checkHyperConnections(directory.path()); });
     guarded("planner on Flash-Next's PLE table", [&] { checkPleTable(directory.path()); });
+    guarded("planner on Flash-Next's MTP head", [&] { checkMtpHead(directory.path()); });
     std::printf("%s (%d failures)\n", failures ? "GGUF planner tests FAILED" : "GGUF planner tests passed", failures);
     return failures ? 1 : 0;
   }

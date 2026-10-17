@@ -62,6 +62,8 @@ bool floatRowType(uint32_t type) { return floatProjectionType(type) || type == g
 // The header type of the image of a table a family adds (planImages), beside
 // the layers' 0 and 1 (GDN and full attention) and the head's 2.
 constexpr uint32_t kTableImageType = 3;
+// The header type of the image of Qwen3.8-Flash-Next's MTP head (planMtpImage).
+constexpr uint32_t kMtpImageType = 4;
 
 // A repack of a [rows, columns] tensor in format, of no image section yet;
 // throws unless the shape is whole plane tiles.
@@ -750,6 +752,41 @@ std::vector<Image> planImages(const GgufFile &file, std::string_view architectur
       architecture, [&](auto family) { return familyImages<decltype(family)>(file, geometry, options); });
   if (file.rotation()) requireRotation(file, geometry, images);
   return images;
+}
+
+Image planMtpImage(const GgufFile &file, const QwenTargetDimensions &target) {
+  // The head's GGUF declares the target's metadata without its PLE
+  // embedding, and its one nextn layer after the target's layers.
+  QwenTargetDimensions g = target;
+  g.pleNgram = 0;
+  const std::string_view architecture = Qwen4ExpGguf::architecture;
+  if (!g.hyperConnected() || !g.hasIndexer()) throw GgufError("only Qwen3.8-Flash-Next has an MTP head");
+  if (file.metadata().unsignedValue(std::string(architecture) + ".nextn_predict_layers") != 1)
+    throw GgufError("the MTP GGUF must hold one nextn layer");
+  requireMetadata(file.metadata(), architecture, g);
+  Qwen4ExpGguf::arrays(file, g);
+  if (file.rotation()) throw GgufError("the MTP head of a rotated GGUF is unsupported");
+  std::vector<std::string> problems;
+  const std::string p = prefix(g.layers);
+  Builder b(file, g, problems, "mtp.bin", g.layers, kMtpImageType);
+  hyperImage(b, g, p + "hc_attn", true);
+  mixerImage(b, g, p, true);
+  b.floatTensor(p + "indexer.q_proj.weight", uint64_t{g.indexerHeads} * g.indexerHeadDimension, g.hiddenSize);
+  b.floatTensor(p + "indexer.k_proj.weight", g.indexerHeadDimension, g.hiddenSize);
+  b.floatNorm(p + "indexer.q_norm.weight", g.indexerHeadDimension);
+  b.floatNorm(p + "indexer.k_norm.weight", g.indexerHeadDimension);
+  hyperImage(b, g, p + "hc_ffn", true);
+  ffnImage(b, g, p);
+  b.quantized(p + "nextn.eh_proj.weight", g.hiddenSize, 2ull * g.hiddenSize);
+  b.floatNorm(p + "nextn.enorm.weight", g.hiddenSize);
+  b.floatNorm(p + "nextn.hnorm.weight", g.streamWidth());
+  hyperImage(b, g, p + "nextn.hc_head", false);
+  if (!problems.empty()) {
+    std::string names;
+    for (const std::string &problem : problems) names += (names.empty() ? "" : ", ") + problem;
+    throw GgufError("MTP GGUF tensors this build cannot load: " + names);
+  }
+  return b.finish();
 }
 
 StreamedRows tableRows(const GgufFile &file, const std::string &name, uint64_t columns) {

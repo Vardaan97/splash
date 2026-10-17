@@ -33,7 +33,10 @@ class SparseRowStore;
 // maskWords words per row, and the block lists of the attention's tiles of rows (listStride
 // entries each, ops::AttentionBlocks) with their counts. A streamed PLE
 // table's step also stages each distinct row it gathers once (pleStaging)
-// and each row id's row there (pleSlots).
+// and each row id's row there (pleSlots). With the MTP head, its inputs of
+// the rows (stream-major bf16 rows of [e ; h_s]), its fp32 streams, a draft
+// step's tokens and, at decode, the streams each step keeps of the row it
+// drafted from (mtpHistory).
 struct Qwen4Scratch final {
   metal::MetalBuffer streams;
   metal::MetalBuffer normalized;
@@ -56,6 +59,10 @@ struct Qwen4Scratch final {
   metal::MetalBuffer qsaMask;
   metal::MetalBuffer qsaLists;
   metal::MetalBuffer qsaListCounts;
+  metal::MetalBuffer mtpInput;
+  metal::MetalBuffer mtpStreams;
+  metal::MetalBuffer mtpTokens;
+  metal::MetalBuffer mtpHistory;
   uint32_t scoreRows = 0;
   uint32_t scoreStride = 0;
   uint32_t maskWords = 0;

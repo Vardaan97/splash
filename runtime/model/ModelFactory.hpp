@@ -45,6 +45,7 @@ struct LoadedModel final {
   // The memory of every image the weights below are views of.
   std::shared_ptr<WeightImages> images;
   TargetWeights target;
+  // Its layout alone for a model without a DFlash2 draft (hasDraft).
   DFlashDraftWeights draft;
   QwenVisionWeights vision;
   std::string manifestFingerprintSha256;
@@ -52,6 +53,9 @@ struct LoadedModel final {
   [[nodiscard]] const std::string &name() const noexcept {
     return descriptor.name;
   }
+  // Whether a DFlash2 draft loaded and runs (ModelDescriptor::hasDraft);
+  // otherwise the target drafts with its own head.
+  [[nodiscard]] bool hasDraft() const noexcept { return descriptor.hasDraft(); }
   [[nodiscard]] kv::Layout targetKvLayout(kv::Format format) const noexcept {
     auto layout = descriptor.targetKvLayout;
     layout.format = format;

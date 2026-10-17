@@ -204,6 +204,29 @@ void testNeuralEngine() {
           "--ane did not reach the arguments as given");
 }
 
+// A model directory holds draft/ or, for a model drafting with its MTP head
+// (Qwen3.8-Flash-Next from a GGUF), mtp/ beside target/; one with neither
+// is refused, as is mtp/ for a family without the head.
+void testModelDirectoryRoles() {
+  const ModelDirectory model;
+  std::filesystem::remove_all(model.path() / "draft");
+  rejects([&] { static_cast<void>(parse(model, {"auto", "auto"})); }, "target/ and draft/ directories",
+          "a model directory without draft/ or mtp/ was accepted");
+  std::filesystem::create_directory(model.path() / "mtp");
+  rejects([&] { static_cast<void>(parse(model, {"auto", "auto"})); }, "has no MTP head",
+          "a family without an MTP head accepted mtp/ in place of its draft");
+  const test::TemporaryDirectory flash{"splash-native-arguments-flash"};
+  for (const char *directory : {"target", "mtp"})
+    std::filesystem::create_directory(flash.path() / directory);
+  test::writeFile(flash.path() / "model.json",
+                  R"({"version":1,"model":"unsloth/Qwen3.8-Flash-Next-GGUF:UD-Q4_K_XL",)"
+                  R"("target_format":"gguf","vision_format":"none"})");
+  std::filesystem::copy_file(modelConfigs / "qwen3.8-flash-next" / "config.json", flash.path() / "config.json");
+  const NativeArguments parsed = parseCommand({"serve-native", flash.path().string(), "auto", "auto"});
+  require(parsed.modelRoot == std::filesystem::canonical(flash.path()) && !parsed.model.hasDraft(),
+          "a Flash-Next directory with mtp/ in place of draft/ was refused");
+}
+
 // A command line the server never writes is refused with what is wrong.
 void testRefusals() {
   const ModelDirectory model;
@@ -309,6 +332,7 @@ int main(int argc, char **argv) {
     testServerCommandLines(argv[1]);
     testNeuralEngine();
     testRefusals();
+    testModelDirectoryRoles();
     std::cout << "native arguments tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

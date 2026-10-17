@@ -69,6 +69,10 @@ struct MoeExperts final {
 };
 [[nodiscard]] MoeExperts openMoeExperts(metal::MetalBackend &backend, const QwenTargetFiles &files,
                                         const QwenTargetDimensions &target);
+// Experts that stay resident whatever the target's stream: the identity
+// table of `experts` slots (Qwen3.8-Flash-Next's MTP head, whose block's
+// experts load with its image).
+[[nodiscard]] MoeExperts residentMoeExperts(metal::MetalBackend &backend, uint32_t experts);
 
 // A MoE block's sections in image order: its router, its routed experts'
 // gate, up and down (none when they stream), its shared expert's gate, up

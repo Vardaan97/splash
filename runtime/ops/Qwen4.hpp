@@ -129,6 +129,31 @@ struct Qwen4 final {
   static void addPleHash(metal::CommandGraph &graph, metal::MetalBuffer tokens, metal::MetalBuffer before,
                          metal::MetalBuffer indices, const Qwen4PleHashParams &params, uint32_t heads);
 
+  // The MTP head (metal/abi/Qwen4.h Qwen4MtpParams). A draft step's tokens:
+  // each lane's anchor and its first limit - 1 proposals, then repeats.
+  static void addMtpTokens(metal::CommandGraph &graph, metal::MetalBuffer anchors, metal::MetalBuffer proposals,
+                           metal::MetalBuffer tokens, uint32_t lanes, uint32_t laneRows, uint32_t proposalsPerLane,
+                           uint32_t limit);
+  // One lane's (or sequence's) `rows` eh-projection inputs, rows rowOffset..
+  // of each stream's `totalRows` rows of `output`.
+  static void addMtpInput(metal::CommandGraph &graph, metal::MetalBuffer embedding, metal::MetalBuffer carried,
+                          metal::MetalBuffer history, const NormWeights &embedNorm, const NormWeights &hiddenNorm,
+                          metal::MetalBuffer output, HyperShape shape, uint32_t rows, uint32_t limit,
+                          uint32_t rowOffset, uint32_t totalRows);
+  // fp32 streams [rows][streams][hidden] from the eh projection's
+  // stream-major bf16 rows [streams][rows][hidden].
+  static void addMtpWiden(metal::CommandGraph &graph, metal::MetalBuffer projected, metal::MetalBuffer streams,
+                          HyperShape shape, uint32_t rows);
+  // Each lane's argmax of its logits row `row` (`vocabulary` logits per row)
+  // as its proposal `row` and, `last`, every later one.
+  static void addMtpArgmax(metal::CommandGraph &graph, metal::MetalBuffer logits, metal::MetalBuffer proposals,
+                           metal::MetalBuffer candidates, uint32_t lanes, uint32_t laneRows, uint32_t vocabulary,
+                           uint32_t proposalsPerLane, uint32_t candidatesPerProposal, uint32_t row, bool last);
+  // Row retained - 1 of `streams` (retained a GPU count) or, without
+  // `retained`, row `rows` - 1.
+  static void addMtpCarry(metal::CommandGraph &graph, metal::MetalBuffer streams, metal::MetalBuffer carried,
+                          metal::MetalBuffer retained, HyperShape shape, uint32_t rows);
+
   // The history after the first `rows` rows of one sequence's prefill (a
   // state captured inside its command).
   static void addPleHistory(metal::CommandGraph &graph, metal::MetalBuffer convolutionInput,
