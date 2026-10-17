@@ -37,10 +37,12 @@ static_assert(sizeof(MoeRouteParams) == 16,
 struct MoeTileDescriptor {
   uint32_t expert;
   uint32_t rows;
+  // Optional untrimmed occupancy: retain the reference tile arithmetic.
+  uint32_t reference_rows;
 };
 
-static_assert(sizeof(MoeTileDescriptor) == 8,
-              "MoE tile descriptors are 8 bytes on both sides");
+static_assert(sizeof(MoeTileDescriptor) == 12,
+              "MoE tile descriptors are 12 bytes on both sides");
 
 // The staged GGUF expert passes (kernels/shared/moe_gguf.metal) run an
 // expert's only tile of at most this many live rows on the column tile, which
@@ -68,10 +70,11 @@ struct MoeGroupParams {
   uint32_t last_row;
   // A nonzero lane bound overrides last_row; zero uses the scalar bound.
   uint32_t last_rows[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t preserve_tile_kind;
 };
 
-static_assert(sizeof(MoeGroupParams) == 52,
-              "MoE grouping parameters are 52 bytes on both sides");
+static_assert(sizeof(MoeGroupParams) == 56,
+              "MoE grouping parameters are 56 bytes on both sides");
 
 // What the grouping writes besides the tiles: their count, which every pass
 // over them reads first, and the grids (column tiles, tiles, 1) of the

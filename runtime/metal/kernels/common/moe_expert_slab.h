@@ -25,6 +25,7 @@ inline uint moe_matmul_rows(uint rows, uint tile_rows) {
 // would also depend on that order (an expert of nine routes in an 8-row tile
 // and a 1-row tile).
 inline bool moe_column_tile(device const MoeTileDescriptor *tiles, uint t) {
+  if (tiles[t].reference_rows) return tiles[t].reference_rows <= MOE_GGUF_COLUMN_ROWS;
   return tiles[t].rows <= MOE_GGUF_COLUMN_ROWS && (t == 0 || tiles[t - 1].expert != tiles[t].expert);
 }
 // The rows of tile t that the staged expert passes read.

@@ -161,6 +161,14 @@ inline void moe_group_routes_phase(
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
   uint count = atomic_load_explicit(&counts[thread_index], memory_order_relaxed);
+  // ONE_ROW retains the arithmetic chosen before dropping the tail. Only
+  // selection is needed for those rows; their experts need not execute.
+  uint reference_rows = 0;
+  if (params.preserve_tile_kind)
+    for (uint route = 0; route < routes; ++route)
+      if (route % routes_per_row != params.top_k &&
+          route / routes_per_row % params.lane_rows >= params.first_row && selected[route] == thread_index)
+        ++reference_rows;
   uint expert_tiles = (count + params.tile_rows - 1) / params.tile_rows;
   uint prefix = simd_prefix_exclusive_sum(expert_tiles);
   if (simd_lane == 31)
@@ -174,7 +182,7 @@ inline void moe_group_routes_phase(
     routed_tiles = tile_offset + expert_tiles;
   for (uint tile = 0; tile < expert_tiles; ++tile) {
     tiles[tile_offset + tile] = MoeTileDescriptor{
-        thread_index, min(params.tile_rows, count - tile * params.tile_rows)};
+        thread_index, min(params.tile_rows, count - tile * params.tile_rows), reference_rows};
   }
   if (expert_tiles) {
     const uint last = tile_offset + expert_tiles - 1;
@@ -210,7 +218,7 @@ inline void moe_group_routes_phase(
   for (uint tile = thread_index; tile < shared_tiles; tile += Slots) {
     tiles[routed_tiles + tile] = MoeTileDescriptor{
         params.experts,
-        min(params.tile_rows, params.rows - tile * params.tile_rows)};
+        min(params.tile_rows, params.rows - tile * params.tile_rows), 0};
   }
   for (uint row = thread_index; row < shared_rows; row += Slots) {
     if (row < params.rows) {

@@ -436,6 +436,7 @@ std::vector<ComputeDispatch> fullGridsTwoPasses(const CommandGraph &graph, const
 // Whether the staged expert passes run tile t on the column tile (moe_column_tile in
 // kernels/common/moe_expert_slab.h): at most MOE_GGUF_COLUMN_ROWS live rows, its expert's only tile.
 bool columnTile(const MoeTileDescriptor *tiles, uint32_t t) {
+  if (tiles[t].reference_rows) return tiles[t].reference_rows <= MOE_GGUF_COLUMN_ROWS;
   return tiles[t].rows <= MOE_GGUF_COLUMN_ROWS && (t == 0 || tiles[t - 1].expert != tiles[t].expert);
 }
 
@@ -711,7 +712,7 @@ MoeRun runPlan(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan 
 // dropped row's absence can move an expert's live rows between tiles).
 void checkLiveRows(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan &plan, uint32_t firstRow,
                    uint32_t lastRow, const MoeRun &full, const std::string &label,
-                   std::span<const uint32_t> lastRows = {}) {
+                   std::span<const uint32_t> lastRows = {}, bool preserveTileKind = false) {
   const uint32_t rows = plan.rows(), tileRows = plan.tileRows();
   const auto live = [&](uint32_t row) {
     const uint32_t r = row % SPLASH_TARGET_VERIFY_ROWS;
@@ -719,10 +720,18 @@ void checkLiveRows(MetalBackend &backend, const Model &m, Buffers &b, const MoeP
     return r >= firstRow && (!end || r < end);
   };
   allocate(backend, b, plan);
+  MoeRun reference = full;
+  if (preserveTileKind) {
+    CommandGraph baseline;
+    MoE::add(baseline, b.moe, m.weights, plan, firstRow);
+    static_cast<void>(backend.submitCommandAsync(baseline.dispatches()).wait());
+    reference.column = columnRoutes(b.moe.scratch, plan);
+    std::memcpy(reference.output.data(), b.moe.output.contents(), reference.output.size() * 2);
+  }
   std::memset(b.moe.output.contents(), 0, b.moe.output.sizeBytes());
   CommandGraph graph;
-  if (lastRows.empty()) MoE::add(graph, b.moe, m.weights, plan, firstRow, lastRow);
-  else MoE::add(graph, b.moe, m.weights, plan, std::span<const uint32_t, 4>(lastRows.data(), 4));
+  if (lastRows.empty()) MoE::add(graph, b.moe, m.weights, plan, firstRow, lastRow, {}, preserveTileKind);
+  else MoE::add(graph, b.moe, m.weights, plan, firstRow, lastRow, lastRows, preserveTileKind);
   static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
   const auto *routeRows = static_cast<const uint32_t *>(b.moe.scratch.routeRows.contents());
   const auto *groupedRoutes = static_cast<const uint32_t *>(b.moe.scratch.groupedRoutes.contents());
@@ -745,9 +754,11 @@ void checkLiveRows(MetalBackend &backend, const Model &m, Buffers &b, const MoeP
   for (uint32_t row = 0; row < rows; ++row) {
     if (!live(row)) continue;
     const auto routes = [&](const MoeRun &r) { return r.column.begin() + uint64_t{row} * kRoutes; };
-    if (!std::equal(routes(run), routes(run) + kRoutes, routes(full))) continue;
+    if (preserveTileKind)
+      require(std::equal(routes(run), routes(run) + kRoutes, routes(reference)), label + ": reference tile kinds changed");
+    if (!std::equal(routes(run), routes(run) + kRoutes, routes(reference))) continue;
     require(std::equal(run.output.begin() + uint64_t{row} * kHidden, run.output.begin() + uint64_t{row + 1} * kHidden,
-                       full.output.begin() + uint64_t{row} * kHidden),
+                       reference.output.begin() + uint64_t{row} * kHidden),
             label + ": row " + std::to_string(row) + " differs from the run that routes every row");
   }
 }
@@ -895,10 +906,12 @@ int moe(MetalBackend &backend) {
                               std::to_string(lastRow ? lastRow : SPLASH_TARGET_VERIFY_ROWS));
           for (uint32_t row = 0; row < SPLASH_TARGET_VERIFY_ROWS - 1; ++row)
             checkLiveRows(backend, m, b, plan, row, row + 1, run,
-                          label + " draft row " + std::to_string(row));
+                          label + " draft row " + std::to_string(row), {}, true);
           if (lanes == 4) {
             const std::array<uint32_t, 4> cuts{1, 3, 6, 0};
             checkLiveRows(backend, m, b, plan, 0, 0, run, label + " per-lane bounds", cuts);
+            const std::array<uint32_t, 4> exhausted{2, 4, 2, 0};
+            checkLiveRows(backend, m, b, plan, 2, 0, run, label + " exhausted lanes", exhausted);
             const std::array<uint32_t, 4> invalid{1, 3, 9, 0};
             CommandGraph rejected;
             bool refused = false;
