@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <stdexcept>
+#include <string_view>
 
 namespace splash::engine {
 
@@ -72,5 +73,10 @@ struct NativeArguments final {
 // refuses.
 [[nodiscard]] NativeArguments parseNativeArguments(int argc,
                                                    const char *const *argv);
+
+// SPLASH_GDN_CHECKPOINT_TOKENS, read once when serving starts
+// (EngineConfig::retainedCheckpointTokens): 0, or a multiple of the prefill
+// chunk of at least two chunks.
+[[nodiscard]] uint32_t parseRetainedCheckpointTokens(std::string_view value);
 
 } // namespace splash::engine

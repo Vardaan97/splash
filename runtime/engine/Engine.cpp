@@ -68,6 +68,10 @@ Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
     throw std::invalid_argument("the engine needs the governor's growth pause and serving mark");
   if (!std::isfinite(config_.decodeShare) || config_.decodeShare < 0.0)
     throw std::invalid_argument("decode share must be nonnegative and finite");
+  if (config_.retainedCheckpointTokens &&
+      (config_.retainedCheckpointTokens < 2 * model::ExecutionLimits::prefillTokenBudget ||
+       config_.retainedCheckpointTokens % model::ExecutionLimits::prefillTokenBudget))
+    throw std::invalid_argument("retained checkpoint interval must be zero or a multiple of 2048 at least 4096");
 }
 
 void Engine::submit(EngineRequest value) {
@@ -1016,6 +1020,13 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
   for (const uint32_t checkpoint : plannedCheckpoints(
            stateBoundary, latestReplayBoundary, config_.prefillCheckpointTokens)) {
     addStateBoundary(active, stateBoundary, checkpoint, true, true);
+  }
+  // The retained grid's points, captured as the rolling checkpoints are
+  // (a point both name is upgraded to a kept one), with every target's state
+  // of the row (Qwen3.8-Flash-Next's auxiliary state included).
+  for (const uint32_t checkpoint : retainedCheckpoints(
+           stateBoundary, latestReplayBoundary, config_.retainedCheckpointTokens)) {
+    addStateBoundary(active, stateBoundary, checkpoint, false, true);
   }
   if (junctionBoundary >= stateBoundary + kMinimumJunctionGain)
     addStateBoundary(active, stateBoundary, junctionBoundary, false, true);
