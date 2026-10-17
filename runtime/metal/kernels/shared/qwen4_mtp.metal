@@ -86,7 +86,7 @@ kernel void qwen4_mtp_widen(device const bfloat *projected [[buffer(0)]],
   const uint width = p.streams * p.hidden;
   if (index >= p.rows * width) return;
   const uint row = index / width, c = index % width, s = c / p.hidden, d = c % p.hidden;
-  streams[index] = float(projected[(ulong(s) * p.rows + row) * p.hidden + d]);
+  streams[index] = float(projected[(ulong(s) * p.lane_rows + row) * p.hidden + d]);
 }
 
 // One threadgroup per lane: the argmax of the lane's logits row p.row, over
