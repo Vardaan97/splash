@@ -981,7 +981,7 @@ void mtpTest(MetalBackend &backend) {
   const auto projected = bf16s(randoms(rng, rows * width, 1.0f));
   MetalBuffer widened = scratch(backend, rows * width * 4);
   CommandGraph widen;
-  ops::Qwen4::addMtpWiden(widen, upload(backend, projected), widened, shape, rows);
+  ops::Qwen4::addMtpWiden(widen, upload(backend, projected), widened, shape, rows, rows);
   run(backend, widen);
   const auto w = download<float>(widened, rows * width);
   bool okWiden = true;
