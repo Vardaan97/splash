@@ -9,6 +9,7 @@
 #include "model/QwenState.hpp"
 #include "model/QwenTarget.hpp"
 #include "model/RuntimeArenas.hpp"
+#include "model/SparseRowStore.hpp"
 
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/ExecutionGeometry.h"
@@ -31,6 +32,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <limits>
 #include <list>
 #include <numeric>
@@ -476,6 +478,92 @@ struct Runtime::Impl {
     return !value || std::string_view(value) != "0";
   }();
   Qwen4DraftContextCache<kLaneCount> draftContextCache;
+  // Qwen3.8-Flash-Next's PLE table when it streams from its file
+  // (--ple-memory): the verify's host step stages the rows of its rows'
+  // n-grams, those of the anchor and the proposals the MTP head drafts. The
+  // anchor's are read ahead as the cycle is encoded and, halfway through
+  // the draft, the proposals so far are copied out and an event signalled
+  // (QwenTargetMtpDraft::prefetchEvent), on which a listener hashes their
+  // rows and reads them ahead while the later steps and the trunk run
+  // (SparseRowStore::prefetch, a hint the stage reads past). Unless
+  // SPLASH_PLE_PREFETCH=0.
+  SparseRowStore *pleStore = nullptr;
+  bool plePrefetch = [] {
+    const char *value = std::getenv("SPLASH_PLE_PREFETCH");
+    return !value || std::string_view(value) != "0";
+  }();
+  metal::SharedEvent plePrefetchEvent;
+  uint64_t plePrefetchValue = 0;
+  MetalBuffer plePrefetchTokens;
+  // The listener of the last cycle's signal, whose callback reads
+  // plePrefetchTokens: the next cycle's copy waits for it, as does the end.
+  std::future<void> plePrefetched;
+  void waitPlePrefetch() {
+    if (plePrefetched.valid()) plePrefetched.get();
+  }
+  // The PLE rows of `tokens` from `position` on of a lane whose tokens
+  // before them are `history`.
+  void plePrefetchRows(uint64_t position, std::span<const uint32_t> tokens, std::span<const uint32_t> history,
+                       std::vector<uint32_t> &ids) const {
+    const size_t base = ids.size();
+    ids.resize(base + tokens.size() * geometry.target.pleHeads());
+    qwen4PleRows(*targetModel->qwen4(), position, tokens, history, ids.data() + base);
+  }
+  // Reads ahead the anchors' rows now and arms the listener for the
+  // proposals of the draft's step `step` of the lanes' cycle.
+  void armPlePrefetch(QwenTargetMtpDraft &draft, std::span<Request *const> entries,
+                      std::span<const ModelBatchItem> items, uint32_t step) {
+    waitPlePrefetch();
+    const uint32_t lanes = static_cast<uint32_t>(entries.size());
+    std::vector<uint32_t> ids;
+    for (uint32_t lane = 0; lane < lanes; ++lane)
+      plePrefetchRows(items[lane].logicalPosition, {&*entries[lane]->pendingToken, 1}, entries[lane]->tokens, ids);
+    pleStore->prefetch(ids);
+    if (!plePrefetchEvent) {
+      plePrefetchEvent = backend.newSharedEvent();
+      plePrefetchTokens = backend.allocateBuffer(uint64_t{kLaneCount} * kDraftProposalTokens * sizeof(uint32_t),
+                                                 BufferStorage::Shared, "ple-prefetch-proposals");
+    }
+    draft.prefetchEvent = plePrefetchEvent;
+    draft.prefetchValue = ++plePrefetchValue;
+    draft.prefetchStep = step;
+    draft.prefetchTokens = plePrefetchTokens;
+    // Each lane's position and the tokens its proposals' n-grams reach
+    // back to (its anchor included), which the listener hashes with the
+    // proposals it finds in the copy.
+    struct Lane final {
+      uint64_t position;
+      std::vector<uint32_t> history;
+    };
+    std::vector<Lane> laneInputs;
+    const size_t reach = geometry.target.pleNgram;
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+      const Request &entry = *entries[lane];
+      const uint64_t position = items[lane].logicalPosition;
+      std::vector<uint32_t> history(entry.tokens.begin() + std::min<size_t>(entry.tokens.size(), position) -
+                                        std::min<size_t>(position, reach),
+                                    entry.tokens.begin() + std::min<size_t>(entry.tokens.size(), position));
+      history.push_back(*entry.pendingToken);
+      laneInputs.push_back({position + 1, std::move(history)});
+    }
+    auto done = std::make_shared<std::promise<void>>();
+    plePrefetched = done->get_future();
+    plePrefetchEvent.notify(
+        draft.prefetchValue,
+        [this, lanes, step, laneInputs = std::move(laneInputs), tokens = plePrefetchTokens, done]() noexcept {
+          try {
+            std::vector<uint32_t> ids;
+            const auto *proposals = static_cast<const uint32_t *>(tokens.contents());
+            for (uint32_t lane = 0; lane < lanes; ++lane)
+              plePrefetchRows(laneInputs[lane].position, {proposals + lane * kDraftProposalTokens, step},
+                              laneInputs[lane].history, ids);
+            pleStore->prefetch(ids);
+          } catch (...) {
+            // A hint: the stage reads what it lacks.
+          }
+          done->set_value();
+        });
+  }
   [[nodiscard]] bool useDraftVocabulary(std::span<Request *const> entries) const {
     return targetModel->hasMtpDraftVocabulary() && std::ranges::all_of(entries, [this](const Request *entry) {
       return entry->draftContext.useVocabulary(mtpVocabularyWarmStart, mtpVocabularyGate);
@@ -526,6 +614,8 @@ struct Runtime::Impl {
     }
   }
   ops::AneFfn *aneFfn;
+  // The prefetch listener reads buffers of this.
+  ~Impl() { waitPlePrefetch(); }
   explicit Impl(RuntimeContext value)
       : backend(value.backend),
         model(value.model),
@@ -545,6 +635,7 @@ struct Runtime::Impl {
                        ? std::make_unique<DFlashDraft>(value.model.draft, value.backend, operators)
                        : nullptr),
         aneFfn(value.aneFfn) {
+    pleStore = value.model.streamedTable();
     if (states.layout() != model.stateLayout(states.layout().target.format) ||
         kvPages.layout() != model.targetKvLayout(kvPages.layout().format)) {
       throw std::invalid_argument(
@@ -2046,8 +2137,11 @@ struct Runtime::Impl {
                                            kQwen4DraftContextTokens, targetModel->qwen4()->layout.mtpDraftTokens);
       const bool draftVocabulary = useDraftVocabulary(entries.first(lanes));
       if (draftVocabulary) bindDraftContext(buffers, entries.first(lanes));
-      targetModel->addMtpDraft(graph, std::move(buffers), kvPages, std::span(chunks).first(lanes), lanes,
-                              {steps, draftVocabulary});
+      QwenTargetMtpDraft draft;
+      draft.steps = steps;
+      draft.draftVocabulary = draftVocabulary;
+      if (plePrefetch && pleStore && steps > 1) armPlePrefetch(draft, entries.first(lanes), items, (steps + 1) / 2);
+      targetModel->addMtpDraft(graph, std::move(buffers), kvPages, std::span(chunks).first(lanes), lanes, draft);
       return;
     }
     targetModel->addVerify(graph, std::move(buffers), kvPages,
