@@ -481,6 +481,16 @@ void PagedAttention::addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
   graph.add(std::string(plan.reducePipeline), std::move(reduce), attention, plan.reduceGroups);
 }
 
+uint32_t PagedAttention::prefillBlockListCount(uint32_t rows) noexcept {
+  return kv::prefillAttentionTiles(rows);
+}
+
+void PagedAttention::addPrefillBlockLists(metal::CommandGraph &graph, const metal::MetalBuffer &mask,
+                                         uint32_t maskWords, std::span<const BlockListRows> sequences,
+                                         const AttentionBlocks &blocks) {
+  addBlockLists(graph, mask, maskWords, sequences, kv::kPrefillAttentionTileRows, blocks);
+}
+
 void PagedAttention::addBlockLists(metal::CommandGraph &graph, const metal::MetalBuffer &mask, uint32_t maskWords,
                                    std::span<const BlockListRows> sequences, uint32_t tileRows,
                                    const AttentionBlocks &blocks) {

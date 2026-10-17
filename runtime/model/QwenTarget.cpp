@@ -551,11 +551,11 @@ metal::MetalBuffer QwenTarget::addPrefillAttention(PrefillStep &step, const Qwen
                                qsaRows(index));
       blocks[index] = {h.qsaLists, h.qsaListCounts, h.listStride, lists};
       sparseRows.push_back({sequence.rowBegin, sequence.rows, firstPositions[index], lists});
-      lists += kv::prefillAttentionTiles(sequence.rows);
+      lists += ops::PagedAttention::prefillBlockListCount(sequence.rows);
     }
     if (!sparseRows.empty())
-      ops::PagedAttention::addBlockLists(step.graph, h.qsaMask, h.maskWords, sparseRows,
-                                         kv::kPrefillAttentionTileRows, {h.qsaLists, h.qsaListCounts, h.listStride, 0});
+      ops::PagedAttention::addPrefillBlockLists(step.graph, h.qsaMask, h.maskWords, sparseRows,
+                                                {h.qsaLists, h.qsaListCounts, h.listStride, 0});
   }
   for (size_t index = 0; index < step.sequences.size(); ++index) {
     const QwenTargetPrefillSequence &sequence = step.sequences[index];

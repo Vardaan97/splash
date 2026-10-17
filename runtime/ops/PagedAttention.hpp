@@ -284,6 +284,11 @@ public:
                         PagedVerifyBuffers buffers,
                         std::span<const kv::ChunkedPrefillParams> chunks,
                         const VerifyAttentionPlan &plan, AttentionBlocks blocks = {});
+  // Prefill block-list allocation and encoding use the operator's tile size.
+  [[nodiscard]] static uint32_t prefillBlockListCount(uint32_t rows) noexcept;
+  static void addPrefillBlockLists(metal::CommandGraph &graph, const metal::MetalBuffer &mask,
+                                  uint32_t maskWords, std::span<const BlockListRows> sequences,
+                                  const AttentionBlocks &blocks);
   // One dispatch of the block lists of up to a batch of sequences of query
   // rows, whose block masks are rows of `mask`, `maskWords` words each
   // (metal/abi/PagedAttention.h) that cover each sequence's history: each
