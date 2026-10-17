@@ -254,6 +254,15 @@ default.
   a histogram in milliseconds: `p50`, `p95` and `p99` (within a factor of
   two), `max`, `total` and `samples`.
 
+With Qwen3.8-Flash-Next drafting with its MTP head, a verify's host step
+stages the rows of the anchor and the drafted proposals, which the CPU does
+not know until the draft ran. The runtime reads the anchor's rows ahead as it
+encodes the cycle and, halfway through the draft's steps, the GPU copies the
+proposals so far out and signals an event on which a listener hashes their
+rows and reads them ahead (`SparseRowStore::prefetch`, a hint) while the
+later steps and the trunk run, so the host step finds most of them cached
+(`Runtime::Impl::armPlePrefetch`). `SPLASH_PLE_PREFETCH=0` turns it off.
+
 ### Streamed experts
 
 With `--expert-memory SIZE`, such as `--expert-memory 16G`, a MoE target's
