@@ -73,6 +73,10 @@ MoeExperts openMoeExperts(metal::MetalBackend &backend, const QwenTargetFiles &f
       files);
 }
 
+MoeExperts residentMoeExperts(metal::MetalBackend &backend, uint32_t experts) {
+  return {.resident = residentExpertSlots(backend, experts), .experts = experts};
+}
+
 ops::BlockMoeWeights readMoeBlock(WeightFile &file, const MoeExperts &experts, uint32_t block) {
   ops::BlockMoeWeights ffn;
   ffn.router = readQuantizedSegment(file, "router");

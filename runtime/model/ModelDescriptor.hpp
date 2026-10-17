@@ -40,6 +40,12 @@ struct ModelDescriptor final {
   // Container selection belongs to loading; runtime dispatch follows each weight.
   TargetSource targetSource{};
   VisionSource visionSource{};
+  // Whether a DFlash2 draft loads and runs. False for a model root without
+  // draft/ whose family drafts with its own head instead
+  // (Qwen3.8-Flash-Next's MTP head, from mtp/): `draft` is then the
+  // placeholder nullDraftLayout, which keeps the composite state's
+  // bookkeeping that of a draft.
+  bool draftModel = true;
   // The SHA-256 of the record that names the digest of every source file,
   // an assembly's model.json, which the installer verifies at every start
   // (inspectModelRoot): what every image is written from
@@ -57,8 +63,16 @@ struct ModelDescriptor final {
   [[nodiscard]] std::string_view family() const noexcept {
     return std::visit([](const auto &layout) { return layout.family; }, target);
   }
+  [[nodiscard]] bool hasDraft() const noexcept { return draftModel; }
   [[nodiscard]] bool valid() const noexcept;
 };
+
+// The draft layout of a target that decodes without a DFlash2 draft: no
+// draft loads or runs, but the engine's composite state keeps a one-layer
+// ring of one head of 8 values (a few tens of KiB per lane) and reads the
+// target's first layer, so that the state and cache bookkeeping stay those
+// of a draft.
+[[nodiscard]] DFlashDraftLayout nullDraftLayout(uint32_t hiddenSize, uint32_t vocabularySize);
 
 // Derives the capabilities and cache layouts the engine consumes from the
 // concrete target and draft layouts.

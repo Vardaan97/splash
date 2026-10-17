@@ -729,6 +729,53 @@ MoeRun runPlan(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan 
   return result;
 }
 
+// A decode plan's run whose lanes route their rows before `firstRow`, and
+// from `lastRow` on when it is set, to no expert (MoE::add firstRow, an MTP
+// draft step's rows that repeat a step before; lastRow, a verify's rows past
+// the proposals the head drafted): the tiles hold no route of such a row,
+// each of their routed routes reads the row's shared expert row, and every
+// live row's output is `full`'s where its routes ran the same tile kinds (a
+// dropped row's absence can move an expert's live rows between tiles).
+void checkLiveRows(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan &plan, uint32_t firstRow,
+                   uint32_t lastRow, const MoeRun &full, const std::string &label) {
+  const uint32_t rows = plan.rows(), tileRows = plan.tileRows();
+  const auto live = [&](uint32_t row) {
+    const uint32_t r = row % SPLASH_TARGET_VERIFY_ROWS;
+    return r >= firstRow && (!lastRow || r < lastRow);
+  };
+  allocate(backend, b, plan);
+  std::memset(b.moe.output.contents(), 0, b.moe.output.sizeBytes());
+  CommandGraph graph;
+  MoE::add(graph, b.moe, m.weights, plan, firstRow, lastRow);
+  static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+  const auto *routeRows = static_cast<const uint32_t *>(b.moe.scratch.routeRows.contents());
+  const auto *groupedRoutes = static_cast<const uint32_t *>(b.moe.scratch.groupedRoutes.contents());
+  const auto *tiles = static_cast<const MoeTileDescriptor *>(b.moe.scratch.tileDescriptors.contents());
+  const uint32_t tileCount = static_cast<const MoeTileCount *>(b.moe.scratch.tileCount.contents())->tiles;
+  uint32_t routedTiles = 0;
+  while (routedTiles < tileCount && tiles[routedTiles].expert != kExperts) ++routedTiles;
+  for (uint32_t tile = 0; tile < routedTiles; ++tile)
+    for (uint32_t row = 0; row < tiles[tile].rows; ++row)
+      require(live(groupedRoutes[uint64_t{tile} * tileRows + row] / kRoutes),
+              label + ": a tile holds a route of a row that routes to no expert");
+  for (uint32_t route = 0; route < rows * kRoutes; ++route) {
+    const uint32_t row = route / kRoutes;
+    if (!live(row) && route % kRoutes != kTopK)
+      require(routeRows[route] == routedTiles * tileRows + row,
+              label + ": a dropped route does not read its row's shared expert row");
+  }
+  MoeRun run{std::vector<uint16_t>(uint64_t{rows} * kHidden), columnRoutes(b.moe.scratch, plan)};
+  std::memcpy(run.output.data(), b.moe.output.contents(), run.output.size() * 2);
+  for (uint32_t row = 0; row < rows; ++row) {
+    if (!live(row)) continue;
+    const auto routes = [&](const MoeRun &r) { return r.column.begin() + uint64_t{row} * kRoutes; };
+    if (!std::equal(routes(run), routes(run) + kRoutes, routes(full))) continue;
+    require(std::equal(run.output.begin() + uint64_t{row} * kHidden, run.output.begin() + uint64_t{row + 1} * kHidden,
+                       full.output.begin() + uint64_t{row} * kHidden),
+            label + ": row " + std::to_string(row) + " differs from the run that routes every row");
+  }
+}
+
 // Each buffer a register decode plan and a staged 32-row prefill plan reach,
 // at its extent and one element short, and each weight: the planes of every
 // expert tensor, whose rows fill whole tiles, in units of a row's group of
@@ -864,7 +911,13 @@ int moe(MetalBackend &backend) {
               runPlan(backend, m, b, plan, tile == MoeGgufTile::Staged, products, stats, label);
           // A row's result depends on its own routes and the tile kinds they
           // run only, not on the rows it is batched with (the tile rows of one
-          // expert are independent).
+          // expert are independent), nor on the rows before or after it that
+          // route to no expert.
+          const std::pair<uint32_t, uint32_t> ranges[] = {{1, 0}, {4, 0}, {7, 0}, {0, 2}, {0, 5}, {1, 4}};
+          for (const auto &[firstRow, lastRow] : ranges)
+            checkLiveRows(backend, m, b, plan, firstRow, lastRow, run,
+                          label + " rows " + std::to_string(firstRow) + ".." +
+                              std::to_string(lastRow ? lastRow : SPLASH_TARGET_VERIFY_ROWS));
           if (widest.output.empty()) {
             Stats repeat;
             failures += compareRepeat(

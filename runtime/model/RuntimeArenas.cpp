@@ -111,11 +111,14 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
                          kRaggedAttentionRows *
                          geometry.target.attentionHeadDimension));
   // The split partials and counters and the rotated rows of the largest
-  // prefill plan, the draft's context projections' too.
+  // prefill plan, the draft's context projections' too when a DFlash2 draft
+  // runs.
   const auto &draft = geometry.draft;
   std::vector<ops::ProjectionShape> prefillProjections = geometry.target.prefillProjections;
-  prefillProjections.push_back({draft.hiddenSize, draft.targetHiddenSize()});
-  prefillProjections.push_back({draft.contextKvSize(), draft.hiddenSize});
+  if (geometry.hasDraft) {
+    prefillProjections.push_back({draft.hiddenSize, draft.targetHiddenSize()});
+    prefillProjections.push_back({draft.contextKvSize(), draft.hiddenSize});
+  }
   for (const auto &projection : prefillProjections) {
     const ops::LinearScratchSize linear = operators.linear().prefillScratchSize(projection);
     put(PrefillTensor::LinearPartials, linear.partials);
@@ -174,8 +177,9 @@ std::array<uint64_t, decodeTensorCount>
 decodeTensorBytes(const RuntimeGeometry &geometry,
                   const ops::ExecutionPlans &operators) {
   std::array<uint64_t, decodeTensorCount> result{};
-  const auto draftWorkspace =
-      operators.draftAttentionWorkspacePerLane(geometry.draft.attentionShape());
+  const auto draftWorkspace = geometry.hasDraft
+                                  ? operators.draftAttentionWorkspacePerLane(geometry.draft.attentionShape())
+                                  : ops::DraftAttentionWorkspace{};
   const auto samplingWorkspace = ops::Sampling::workspace(kDecodeRows);
   const auto selectorWorkspace = ops::DraftSelector::workspace(kDraftProposalTokens);
   auto put = [&](DecodeTensor tensor, uint64_t bytes) {
@@ -323,6 +327,7 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
   ops::LinearScratchSize result;
   // Includes the vocabulary head shared with the draft.
   for (const auto &p : geometry.target.decodeProjections) result.include(operators.linear().decodeScratchSize(p));
+  if (!geometry.hasDraft) return result;
   for (const ops::ProjectionShape shape : {ops::ProjectionShape{d.dynamicSize, d.hiddenSize},
        {d.qkvSize, d.hiddenSize}, {d.contextKvSize(), d.hiddenSize},
        {d.hiddenSize, d.attentionSize},

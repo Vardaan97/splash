@@ -6,6 +6,8 @@
 #include "model/VisionLoader.hpp"
 
 #include <functional>
+#include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
@@ -41,18 +43,31 @@ QwenVisionWeights loadVisionWeights(metal::MetalBackend &backend, WeightImages &
 namespace {
 
 TargetWeights readTarget(metal::MetalBackend &backend, const Qwen3_8Layout &layout,
-                         const QwenTargetFiles &files) {
+                         const QwenTargetFiles &files, GgufMtpLoader *) {
   return loadQwen3_8Weights(backend, layout, files);
 }
 
 TargetWeights readTarget(metal::MetalBackend &backend, const Qwen3_6MoeLayout &layout,
-                         const QwenTargetFiles &files) {
+                         const QwenTargetFiles &files, GgufMtpLoader *) {
   return loadQwen3_6MoeWeights(backend, layout, files);
 }
 
 TargetWeights readTarget(metal::MetalBackend &backend, const Qwen4ExpLayout &layout,
-                         const QwenTargetFiles &files) {
-  return loadQwen4ExpWeights(backend, layout, files);
+                         const QwenTargetFiles &files, GgufMtpLoader *mtp) {
+  return loadQwen4ExpWeights(backend, layout, files, mtp);
+}
+
+// The one GGUF of Qwen3.8-Flash-Next's MTP head, in mtp/ beside target/.
+std::filesystem::path findMtpGguf(const std::filesystem::path &root) {
+  const auto files = findTargetGgufs(root / "mtp");
+  if (files.size() != 1) throw std::invalid_argument("mtp/ must hold one GGUF");
+  return files.front();
+}
+
+// The MTP head a descriptor's target drafts with, or null.
+const Qwen4ExpLayout *mtpLayout(const ModelDescriptor &descriptor) {
+  const auto *qwen4 = std::get_if<Qwen4ExpLayout>(&descriptor.target);
+  return qwen4 && qwen4->mtpLayers ? qwen4 : nullptr;
 }
 
 // The rows of a family's streamed table that a step stages and prefetches
@@ -88,7 +103,12 @@ LoadedModel loadModel(metal::MetalBackend &backend,
   // Every source's metadata is checked before the first image is written:
   // the vision tower's and the draft's here, the target's by its loader.
   const auto vision = planVisionLoader(root, result.descriptor);
-  DraftCheckpointLoader draft(backend, images, root / "draft", result.descriptor.draft);
+  std::optional<DraftCheckpointLoader> draft;
+  if (result.descriptor.hasDraft()) draft.emplace(backend, images, root / "draft", result.descriptor.draft);
+  // Qwen3.8-Flash-Next's MTP head, from mtp/ beside target/.
+  std::unique_ptr<GgufMtpLoader> mtp;
+  if (const Qwen4ExpLayout *qwen4 = mtpLayout(result.descriptor))
+    mtp = std::make_unique<GgufMtpLoader>(backend, images, findMtpGguf(root), *qwen4);
   // The weights that stream from their files read on one set of readers.
   const auto readers = options.streamedTableBytes || options.expertMemoryBytes
                            ? std::make_shared<WeightReaders>(kWeightReaders)
@@ -100,7 +120,7 @@ LoadedModel loadModel(metal::MetalBackend &backend,
         switch (result.descriptor.targetSource) {
         case TargetSource::Safetensors: {
           SafetensorsTargetLoader loader(backend, images, directory, layout, experts);
-          return readTarget(backend, layout, std::ref(loader));
+          return readTarget(backend, layout, std::ref(loader), mtp.get());
         }
         case TargetSource::Gguf: {
           // A streamed table's store: its memory and readers here, the rows
@@ -110,13 +130,14 @@ LoadedModel loadModel(metal::MetalBackend &backend,
           table.readers = readers;
           GgufTargetLoader loader(backend, images, findTargetGgufs(directory), layout.ggufArchitecture, layout, table,
                                   experts);
-          return readTarget(backend, layout, std::ref(loader));
+          return readTarget(backend, layout, std::ref(loader), mtp.get());
         }
         }
         throw std::invalid_argument("unknown target source");
       },
       result.descriptor.target);
-  result.draft = loadDFlashDraftWeights(backend, draft, result.descriptor.draft);
+  if (draft) result.draft = loadDFlashDraftWeights(backend, *draft, result.descriptor.draft);
+  else result.draft.layout = result.descriptor.draft;
   result.vision = loadVisionWeights(backend, images, vision.get());
 
   std::vector<WeightFileRecord> records(result.targetFiles().begin(),
@@ -166,7 +187,11 @@ uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescript
   if (plan.streamExperts &&
       std::visit([](const auto &layout) { return layout.ffnKind == QwenFfnKind::SparseMoe; }, descriptor.target))
     bytes += options.expertMemoryBytes;
-  bytes += draftImageBytes(root / "draft", descriptor.draft);
+  if (descriptor.hasDraft()) bytes += draftImageBytes(root / "draft", descriptor.draft);
+  if (const Qwen4ExpLayout *qwen4 = mtpLayout(descriptor)) {
+    const OpenGguf mtp({findMtpGguf(root)});
+    bytes += gguf::planMtpImage(mtp.file(), *qwen4).bytes;
+  }
   if (descriptor.hasVision())
     bytes += visionImageBytes(descriptor.vision);
   return bytes;

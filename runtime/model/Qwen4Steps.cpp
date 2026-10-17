@@ -118,6 +118,14 @@ std::vector<Tensor> tensors(const QwenTargetGeometry &g, uint64_t pleRowBytes, b
        bytesFor<uint32_t>(uint64_t{kLanes} * listStride(g)), false},
       {&Qwen4Scratch::qsaListCounts, bytesFor<uint32_t>(1), bytesFor<uint32_t>(kLanes), false},
   };
+  // The MTP head's rows: one set for a prefill command, whose chunks run
+  // the head one after the other, and a decode step's.
+  if (g.mtpLayers) {
+    result.push_back({&Qwen4Scratch::mtpInput, bytesFor<uint16_t>(2 * g.streamWidth()), 0, false});
+    result.push_back({&Qwen4Scratch::mtpStreams, bytesFor<float>(g.streamWidth()), 0, false});
+    result.push_back({&Qwen4Scratch::mtpTokens, bytesFor<uint32_t>(1), 0, false});
+    result.push_back({&Qwen4Scratch::mtpHistory, bytesFor<float>(g.streamWidth()), 0, false});
+  }
   // A streamed table's step stages up to every row id's row, each distinct
   // one once, and each id's slot.
   if (pleRowBytes) {

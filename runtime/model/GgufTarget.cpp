@@ -95,4 +95,20 @@ WeightFile GgufTargetLoader::head() { return open(planned_->layers); }
 
 WeightFile GgufTargetLoader::embedding() { return open(planned_->layers + 1); }
 
+GgufMtpLoader::GgufMtpLoader(metal::MetalBackend &backend, WeightImages &images, const std::filesystem::path &path,
+                             const QwenTargetDimensions &geometry)
+    : backend_(backend), images_(images), planned_(std::make_shared<Planned>(path)) {
+  planned_->image = gguf::planMtpImage(planned_->source.file(), geometry);
+}
+
+WeightFile GgufMtpLoader::open() {
+  const gguf::Image &plan = planned_->image;
+  return images_.load({"mtp/" + plan.name, plan.magic, plan.layer, plan.type, plan.bytes,
+                       [&backend = backend_, planned = planned_](std::span<uint8_t>,
+                                                                 const metal::MetalBuffer &buffer) {
+                         writeGgufImage(backend, buffer, planned->image);
+                         planned->source.checkUnchanged();
+                       }});
+}
+
 } // namespace splash::model

@@ -91,4 +91,26 @@ private:
   std::shared_ptr<Planned> planned_;
 };
 
+// Qwen3.8-Flash-Next's MTP head, the one GGUF in the model root's mtp/
+// (install/upstream.py select_mtp): its image, written and read as a
+// target's (gguf::planMtpImage).
+class GgufMtpLoader final {
+public:
+  GgufMtpLoader(metal::MetalBackend &backend, WeightImages &images, const std::filesystem::path &path,
+                const QwenTargetDimensions &geometry);
+  GgufMtpLoader(const GgufMtpLoader &) = delete;
+  GgufMtpLoader &operator=(const GgufMtpLoader &) = delete;
+  [[nodiscard]] WeightFile open();
+
+private:
+  struct Planned {
+    explicit Planned(const std::filesystem::path &path) : source({path}) {}
+    OpenGguf source;
+    gguf::Image image;
+  };
+  metal::MetalBackend &backend_;
+  WeightImages &images_;
+  std::shared_ptr<Planned> planned_;
+};
+
 } // namespace splash::model
