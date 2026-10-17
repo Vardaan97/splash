@@ -1,6 +1,7 @@
 #include "ModelFactory.hpp"
 #include "model/DraftCheckpoint.hpp"
 #include "model/GgufTarget.hpp"
+#include "model/Qwen4DraftVocabulary.hpp"
 #include "model/QwenTargetLoader.hpp"
 #include "model/SafetensorsTarget.hpp"
 #include "model/VisionLoader.hpp"
@@ -8,8 +9,10 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 namespace splash::model {
@@ -75,6 +78,12 @@ const Qwen4ExpLayout *mtpLayout(const ModelDescriptor &descriptor) {
 SparseRowStoreOptions tableRows(const Qwen3_8Layout &) { return {}; }
 SparseRowStoreOptions tableRows(const Qwen3_6MoeLayout &) { return {}; }
 SparseRowStoreOptions tableRows(const Qwen4ExpLayout &layout) { return streamedTableRows(layout); }
+// The draft vocabulary a target's MTP head drafts from: none but for a
+// Qwen3.8-Flash-Next layout that names one.
+template <class Layout> std::span<const uint32_t> draftTokens(const Layout &layout) {
+  if constexpr (std::is_same_v<Layout, Qwen4ExpLayout>) return qwen4DraftVocabulary(layout.mtpDraftTokens);
+  else return {};
+}
 
 // The sum of `bytes` over the images of the GGUF target in root's target/,
 // planned for a layout of `architecture` and `geometry`.
@@ -129,7 +138,7 @@ LoadedModel loadModel(metal::MetalBackend &backend,
           table.cacheBytes = options.streamedTableBytes;
           table.readers = readers;
           GgufTargetLoader loader(backend, images, findTargetGgufs(directory), layout.ggufArchitecture, layout, table,
-                                  experts);
+                                  experts, draftTokens(layout));
           return readTarget(backend, layout, std::ref(loader), mtp.get());
         }
         }
@@ -191,6 +200,10 @@ uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescript
   if (const Qwen4ExpLayout *qwen4 = mtpLayout(descriptor)) {
     const OpenGguf mtp({findMtpGguf(root)});
     bytes += gguf::planMtpImage(mtp.file(), *qwen4).bytes;
+    if (qwen4->mtpDraftTokens) {
+      const OpenGguf target(findTargetGgufs(root / "target"));
+      bytes += gguf::planDraftHeadImage(target.file(), *qwen4, draftTokens(*qwen4)).bytes;
+    }
   }
   if (descriptor.hasVision())
     bytes += visionImageBytes(descriptor.vision);

@@ -6,7 +6,9 @@
 #include "model/StateLayout.hpp"
 #include "model/WeightLayout.hpp"
 
+#include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <optional>
 #include <sstream>
@@ -64,6 +66,9 @@ bool floatRowType(uint32_t type) { return floatProjectionType(type) || type == g
 constexpr uint32_t kTableImageType = 3;
 // The header type of the image of Qwen3.8-Flash-Next's MTP head (planMtpImage).
 constexpr uint32_t kMtpImageType = 4;
+// The header type of the image of the rows of the head an MTP head drafts
+// from (planDraftHeadImage).
+constexpr uint32_t kDraftHeadImageType = 5;
 
 // A repack of a [rows, columns] tensor in format, of no image section yet;
 // throws unless the shape is whole plane tiles.
@@ -108,6 +113,37 @@ public:
     Repack repack = image_.planes(format, rows, columns, name);
     repack.sources.push_back(tensorRows(*tensor, rows, ggufRowBytes(kQuantFormats[format], columns), order));
     image_.repack(std::move(repack));
+  }
+
+  // Rows `selected` (ascending) of quantized rows [N, K], repacked into
+  // planes in that order and padded with zero rows to whole plane tiles;
+  // then the selected rows' indices (uint32 each).
+  void quantizedRows(const std::string &name, uint64_t rows, uint64_t columns, std::span<const uint32_t> selected) {
+    const GgufTensor *tensor = find(name, quantizedType);
+    if (!tensor) return;
+    if (tensor->rows() != rows || tensor->columns() != columns) throw GgufError("unexpected shape for " + name);
+    if (selected.empty() || !std::is_sorted(selected.begin(), selected.end()) ||
+        std::adjacent_find(selected.begin(), selected.end()) != selected.end() || selected.back() >= rows)
+      throw GgufError("the selected rows of " + name + " are not ascending rows of it");
+    const uint32_t format = imageFormat(tensor->type);
+    const uint64_t rowBytes = ggufRowBytes(kQuantFormats[format], columns);
+    const uint64_t tiled = (selected.size() + QUANT_TILE_ROWS - 1) / QUANT_TILE_ROWS * QUANT_TILE_ROWS;
+    Repack repack = image_.planes(format, tiled, columns, name);
+    const TensorRows all = tensorRows(*tensor, rows, rowBytes);
+    // A source per run of consecutive rows.
+    for (size_t first = 0; first < selected.size();) {
+      size_t end = first + 1;
+      while (end < selected.size() && selected[end] == selected[end - 1] + 1) ++end;
+      TensorRows run = all;
+      run.first = selected[first];
+      run.rows = end - first;
+      repack.sources.push_back(std::move(run));
+      first = end;
+    }
+    image_.repack(std::move(repack));
+    std::vector<uint8_t> indices(selected.size_bytes());
+    std::memcpy(indices.data(), selected.data(), indices.size());
+    image_.fill(std::move(indices));
   }
 
   // Rows [N, K] as quantized() repacks them, but of a BF16 or F16 tensor
@@ -676,6 +712,11 @@ Repack ImageBuilder::planes(uint32_t format, uint64_t rows, uint64_t columns, co
 
 void ImageBuilder::repack(Repack repack) { image_.repacks.push_back(std::move(repack)); }
 
+void ImageBuilder::fill(std::vector<uint8_t> bytes) {
+  const uint64_t offset = section(bytes.size());
+  image_.fills.push_back({offset, std::move(bytes)});
+}
+
 Repack ImageBuilder::expertPlanes(uint32_t format, uint64_t rows, uint64_t columns, const std::string &name) {
   if (!streamExperts_) return planes(format, rows, columns, name);
   // The sections planes() would lay out, the descriptor's and the planes',
@@ -761,6 +802,16 @@ std::vector<Image> planImages(const GgufFile &file, std::string_view architectur
       architecture, [&](auto family) { return familyImages<decltype(family)>(file, geometry, options); });
   if (file.rotation()) requireRotation(file, geometry, images);
   return images;
+}
+
+Image planDraftHeadImage(const GgufFile &file, const QwenTargetDimensions &geometry,
+                         std::span<const uint32_t> tokens) {
+  if (file.rotation()) throw GgufError("the draft head of a rotated GGUF is unsupported");
+  std::vector<std::string> problems;
+  Builder b(file, geometry, problems, "draft-head.bin", geometry.layers, kDraftHeadImageType);
+  b.quantizedRows("output.weight", geometry.vocabularySize, geometry.hiddenSize, tokens);
+  if (!problems.empty()) throw GgufError("GGUF tensors this build cannot load: " + problems.front());
+  return b.finish();
 }
 
 Image planMtpImage(const GgufFile &file, const QwenTargetDimensions &target) {

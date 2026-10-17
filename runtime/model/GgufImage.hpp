@@ -217,6 +217,8 @@ public:
   // sources the caller adds before repack() takes it.
   [[nodiscard]] Repack planes(uint32_t format, uint64_t rows, uint64_t columns, const std::string &name);
   void repack(Repack repack);
+  // `bytes` as they are, in a section of their own.
+  void fill(std::vector<uint8_t> bytes);
   // A layer's routed experts' projection of experts * N rows, gate, up and
   // down in this order: as planes() and repack() lay out a tensor, or, when
   // the builder streams experts, a repack of no image section, which
@@ -261,6 +263,13 @@ void requireMetadata(const GgufMetadata &metadata, std::string_view architecture
 // mix. The geometry is the target's; the head's GGUF declares its metadata
 // without the PLE embedding, and its one nextn layer.
 [[nodiscard]] Image planMtpImage(const GgufFile &file, const QwenTargetDimensions &geometry);
+
+// The head the MTP head drafts from when it drafts from a draft vocabulary
+// (draft-head.bin, Qwen4ExpLayout::mtpDraftTokens): the rows of the target's
+// output.weight of `tokens` (ascending), repacked as the head's are, padded
+// to whole plane tiles, then the tokens (uint32 each).
+[[nodiscard]] Image planDraftHeadImage(const GgufFile &file, const QwenTargetDimensions &geometry,
+                                       std::span<const uint32_t> tokens);
 
 // Where the GGUF holds the rows of the tensor `name`, a table of `columns`
 // values a row whose image copies its native rows as stored (a family's

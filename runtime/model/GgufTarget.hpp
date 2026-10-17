@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string_view>
 #include <vector>
 
@@ -41,10 +42,12 @@ public:
   // through it (streamTable()) instead of loading (table()). With expert
   // memory (experts.memoryBytes), a MoE target's routed experts stream
   // (streamedExperts()) instead of loading with their layers.
+  // With `draftTokens`, also the head an MTP head drafts from of them
+  // (gguf::planDraftHeadImage, draftHead()).
   GgufTargetLoader(metal::MetalBackend &backend, WeightImages &images,
                    const std::vector<std::filesystem::path> &paths, std::string_view architecture,
                    const QwenTargetDimensions &geometry, SparseRowStoreOptions table = {},
-                   ExpertStoreOptions experts = {});
+                   ExpertStoreOptions experts = {}, std::span<const uint32_t> draftTokens = {});
   GgufTargetLoader(const GgufTargetLoader &) = delete;
   GgufTargetLoader &operator=(const GgufTargetLoader &) = delete;
 
@@ -58,6 +61,8 @@ public:
   // The streamed table, its store reading the open file the metadata was
   // parsed from; none when the table loads.
   [[nodiscard]] std::optional<StreamedTable> streamTable() const;
+  // The draft head the loader was asked for (draftTokens).
+  [[nodiscard]] WeightFile draftHead();
   // The GGUF's header, for what a family reads beside its images (Flash-Next's
   // PLE hash).
   [[nodiscard]] const GgufFile &file() const noexcept { return planned_->source.file(); }
@@ -76,9 +81,10 @@ private:
     explicit Planned(const std::vector<std::filesystem::path> &paths) : source(paths) {}
     OpenGguf source;
     // Each layer's image, then the head's, the embedding's and a table's
-    // (gguf::planImages).
+    // (gguf::planImages), then a draft head's.
     std::vector<gguf::Image> images;
     uint32_t layers = 0;
+    std::optional<size_t> draftHead;
     SparseRowStoreOptions table;
     ExpertStoreOptions experts;
   };
