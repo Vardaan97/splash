@@ -623,6 +623,13 @@ void Qwen4ExpTarget::addMtpDraft(metal::CommandGraph &graph, QwenTargetVerifyBuf
                                  vocabulary, buffers.proposalsPerLane, buffers.candidatesPerProposal, j - 1,
                                  j == draft.steps, draftHead ? draftHead->tokens : metal::MetalBuffer{});
       }
+      if (draft.prefetchEvent && j == draft.prefetchStep) {
+        // The proposals so far, two halfwords each, as the listener reads
+        // them; nothing later in the cycle writes the copy.
+        ops::RowCopy::add(graph, buffers.proposals, {0, 2 * buffers.proposalsPerLane, 0}, draft.prefetchTokens,
+                          {0, 2 * buffers.proposalsPerLane, 0}, lanes, 2 * j);
+        graph.signal(draft.prefetchEvent, draft.prefetchValue);
+      }
       if (j < draft.steps)
         for (uint32_t lane = 0; lane < lanes; ++lane)
           ops::Qwen4::addMtpCarry(graph, rowsOf<float>(h.mtpStreams, lane * laneRows, j, width),
