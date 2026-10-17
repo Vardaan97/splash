@@ -1103,7 +1103,7 @@ struct MetalBackend::Impl {
             id<MTLCommandQueue> checkQueue = [device newCommandQueue];
             if (!checkQueue) fail("unable to create Metal command queue");
             const auto *seen = reinterpret_cast<const uint32_t *>(
-                static_cast<const uint8_t *>(hostStepReleases.contents) + kHostStepSeenOffset);
+                static_cast<const uint8_t *>([hostStepReleaseBuffer() contents]) + kHostStepSeenOffset);
             // A spin that starts after its release sees it at its first load
             // and shows nothing, so a late one runs again, released later.
             for (const auto delay : {std::chrono::milliseconds(2), std::chrono::milliseconds(20),
