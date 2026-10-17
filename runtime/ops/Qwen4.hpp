@@ -37,7 +37,7 @@ struct QsaIndex final {
   // fp32 streams [rows][streams][hidden] from the eh projection's
   // stream-major bf16 rows [streams][rows][hidden].
   static void addMtpWiden(metal::CommandGraph &graph, metal::MetalBuffer projected, metal::MetalBuffer streams,
-                          HyperShape shape, uint32_t rows);
+                          HyperShape shape, uint32_t rows, uint32_t stride);
   // Each lane's argmax of its logits row `row` (`vocabulary` logits per row)
   // as its proposal `row` and, `last`, every later one. With `tokens`, the
   // logits are a draft vocabulary's, ascending token ids of which `tokens`
