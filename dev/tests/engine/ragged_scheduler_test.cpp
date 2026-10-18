@@ -63,14 +63,14 @@ void awaitFirstMask(engine::Scheduler &scheduler, uint64_t id) {
 
 void testDeterministicAlignment() {
   for (bool on : {false, true}) {
-    Scheduler scheduler(0.0, on ? ops::DeterminismPolicy::parse("align") : ops::DeterminismPolicy{});
+    Scheduler scheduler(0.0, std::numeric_limits<uint64_t>::max(), on ? ops::DeterminismPolicy::parse("align") : ops::DeterminismPolicy{});
     scheduler.submit(request(1, 65)); scheduler.resourcesReady(1, 0);
     scheduler.submit(request(2, 4097)); scheduler.resourcesReady(2, 0);
     const auto plan = *scheduler.next({});
     require(plan.items.size() == 2 && plan.items[0].tokenCount == 65 &&
                 plan.items[1].tokenCount == (on ? 1976U : 1983U),
             "non-final chunk alignment or final tail changed");
-    Scheduler tiny(0.0, on ? ops::DeterminismPolicy::parse("align") : ops::DeterminismPolicy{});
+    Scheduler tiny(0.0, std::numeric_limits<uint64_t>::max(), on ? ops::DeterminismPolicy::parse("align") : ops::DeterminismPolicy{});
     tiny.submit(request(1, 2041)); tiny.resourcesReady(1, 0);
     tiny.submit(request(2, 4097)); tiny.resourcesReady(2, 0);
     const auto skipped = *tiny.next({});

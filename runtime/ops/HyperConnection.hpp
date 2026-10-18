@@ -11,6 +11,7 @@
 #include "metal/abi/HyperConnection.h"
 #include "ops/Normalization.hpp"
 #include "ops/RowCopy.hpp"
+#include "ops/Determinism.hpp"
 
 #include <cstdint>
 
@@ -36,7 +37,7 @@ struct HyperConnection final {
   static PreparedInput addNorm(metal::CommandGraph &graph, metal::MetalBuffer streams, const NormWeights &norm,
                                metal::MetalBuffer inject, metal::MetalBuffer normalized, metal::MetalBuffer weights,
                                HyperShape shape, uint32_t rows, LinearScratch scratch = {},
-                               LinearInput layout = LinearInput::Plain);
+                               LinearInput layout = LinearInput::Plain, DeterminismPolicy policy = {});
   // silu(low / streams) in place or, with a table layout, into the table
   // alone, leaving `low` as it was.
   static PreparedInput addLow(metal::CommandGraph &graph, metal::MetalBuffer low, HyperShape shape, uint32_t rows,

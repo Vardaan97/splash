@@ -1247,6 +1247,14 @@ void identityVerifyRows(MetalBackend &backend, const GdnShape &shape) {
   uint32_t differentRows = 0, differentStates = 0;
   for (uint32_t k = 0; k < kRows; ++k) {
     Fixture full(backend, shape, 1, true), split(backend, shape, 1, true);
+    // The executor initializes both cell parities' padding. The generic
+    // fixture fills the input cell's padding randomly to catch stray reads.
+    for (auto *fixture : {&full, &split})
+      for (uint32_t layer = 0; layer < kLayers; ++layer) {
+        const uint64_t used = uint64_t{kCarried} * shape.convolutionDimension * 2;
+        std::memset(static_cast<uint8_t *>(fixture->current[0].contents()) + layer * fixture->cell.convLayerBytes + used,
+                    0, fixture->cell.convLayerBytes - used);
+      }
     const auto step = [&](Fixture &f) {
       CommandGraph graph; encodeDecode(f, graph, "T5 identity");
       (void)backend.submitCommandAsync(graph.dispatches()).wait();

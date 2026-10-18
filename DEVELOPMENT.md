@@ -3213,7 +3213,7 @@ and any `SPLASH_TOKEN`.
 selects individual parts for diagnosis. Startup reports the canonical parts in its log and
 `/status` at `identity.deterministic`, and requires fp32 recurrent state and `--disable-ane`.
 The policy pins trunk expert tile kinds, dense decode width, short prefill K partitions,
-float tiles and attention partitions, and aligns non-final prefill chunks. It targets batch,
+float projection and hyper-connection norm tiles and attention partitions, and aligns non-final prefill chunks. It targets batch,
 draft and prompt-cache invariance for Flash-Next on Apple9/Apple10 with int8 or bf16 KV
 in the dense QSA regime (up to 2048 tokens); verify partitions remain position-invariant
 up to 32K tokens. Sparse QSA unions, reuse inside previously generated history, sampled
