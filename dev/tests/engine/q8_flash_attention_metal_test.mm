@@ -15,6 +15,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -567,8 +568,13 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
   return {copyOf(output), copyOf(partials), copyOf(statistics)};
 }
 
-// The case's rows as the one query tile of a prefill chunk.
-Dispatch dispatchPrefill(id<MTLDevice> device, id<MTLCommandQueue> queue,
+// A prefill encoding can share its command with another sequence.
+struct EncodedPrefill {
+  id<MTLBuffer> output, partials, statistics;
+  Dispatch read() const { return {copyOf(output), copyOf(partials), copyOf(statistics)}; }
+};
+
+EncodedPrefill encodePrefill(id<MTLDevice> device, id<MTLCommandBuffer> command,
                          id<MTLComputePipelineState> split,
                          id<MTLComputePipelineState> reduce, const Case &data) {
   const Shape shape = data.shape;
@@ -585,7 +591,6 @@ Dispatch dispatchPrefill(id<MTLDevice> device, id<MTLCommandQueue> queue,
   PrefillAttentionParams params = data.params;
   params.block_stride = blocks.stride;
   params.block_list = blocks.stride ? kQsaJunkLists : 0;
-  id<MTLCommandBuffer> command = [queue commandBuffer];
   id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
   [encoder setComputePipelineState:split];
   [encoder setBuffer:data.queries offset:0 atIndex:0];
@@ -615,8 +620,15 @@ Dispatch dispatchPrefill(id<MTLDevice> device, id<MTLCommandQueue> queue,
   [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads, shape.fusedRows(), tiles)
           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   [encoder endEncoding];
+  return {output, partials, statistics};
+}
+
+Dispatch dispatchPrefill(id<MTLDevice> device, id<MTLCommandQueue> queue,
+                         id<MTLComputePipelineState> split, id<MTLComputePipelineState> reduce, const Case &data) {
+  id<MTLCommandBuffer> command = [queue commandBuffer];
+  const auto result = encodePrefill(device, command, split, reduce, data);
   finish(command);
-  return {copyOf(output), copyOf(partials), copyOf(statistics)};
+  return result.read();
 }
 
 // The BF16 quality gate measures Q8 quantization fidelity on the synthetic
@@ -943,9 +955,20 @@ void identityAttention(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLLi
     };
     const auto whole = prefillCase(0, total);
     const auto wholeOutput = dispatchPrefill(device, queue, pipelines.prefillSplit, pipelines.prefillReduce, whole);
-    const std::vector<std::vector<uint32_t>> cuts{
+    std::vector<std::vector<uint32_t>> cuts{
         {32, 1068}, {736, 17, 347}, {8, 24, 72, 256, 16, 512, 212},
         {1, 7, 33, 73, 129, 17, 300, 540}};
+    std::mt19937 rng(0x1d4);
+    for (bool aligned : {true, false}) {
+      std::vector<uint32_t> chunks;
+      uint32_t remaining = total;
+      while (remaining) {
+        const uint32_t draw = static_cast<uint32_t>(rng());
+        const uint32_t take = std::min(remaining, aligned ? 8u * (1u + draw % 32) : 1u + draw % 255);
+        chunks.push_back(take); remaining -= take;
+      }
+      cuts.push_back(std::move(chunks));
+    }
     for (const auto &chunks : cuts) {
       uint32_t start = 0;
       for (uint32_t rows : chunks) {
@@ -958,6 +981,19 @@ void identityAttention(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLLi
         start += rows;
       }
       require(start == total, "identity prefill cuts do not cover the sequence");
+    }
+    {
+      const auto data = prefillCase(736, 17), peer = prefillCase(400, 53);
+      id<MTLCommandBuffer> command = [queue commandBuffer];
+      const auto own = encodePrefill(device, command, pipelines.prefillSplit, pipelines.prefillReduce, data);
+      const auto other = encodePrefill(device, command, pipelines.prefillSplit, pipelines.prefillReduce, peer);
+      finish(command);
+      const auto result = own.read();
+      for (uint32_t r = 0; r < data.params.rows; ++r) {
+        ++compared;
+        differentPrefill += row(data, result, r) != row(whole, wholeOutput, 736 + r);
+      }
+      require(!other.read().output.empty(), "co-batched prefill peer did not run");
     }
     for (uint32_t position : {40U, 191U, 192U, 193U, 255U, 256U, 500U, 1000U, 2047U, 8191U, 32760U}) {
       std::vector<uint8_t> reference;
