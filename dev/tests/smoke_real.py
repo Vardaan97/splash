@@ -124,6 +124,8 @@ class RealServer:
             command.extend(("--max-memory", arguments.max_memory))
         if arguments.max_cache_disk is not None:
             command.extend(("--max-cache-disk", arguments.max_cache_disk))
+        if arguments.expert_memory is not None:
+            command.extend(("--expert-memory", arguments.expert_memory))
         if arguments.yarn_factor is not None:
             command.extend(("--yarn-factor", str(arguments.yarn_factor)))
         if cache_dir is not None:
@@ -1690,6 +1692,11 @@ def add_server_arguments(parser):
     parser.add_argument("--max-context", type=int)
     parser.add_argument("--max-memory")
     parser.add_argument("--max-cache-disk")
+    parser.add_argument(
+        "--expert-memory",
+        help="serve a MoE model's routed experts from RAM slots of this size in "
+        "all, reading the others from the SSD (splash serve --expert-memory)",
+    )
     parser.add_argument(
         "--yarn-factor",
         type=serve_options.parse_yarn_factor,
