@@ -8018,6 +8018,7 @@ void testUnwritableTierKeepsRequestsResident() {
                                .indexPageBytes = 24'576,
                                .slotBytes = 425'984,
                                .residentKvBytes = uint64_t{1} << 40,
+                               .residentTokens = 262'144,
                                .densePages = 64,
                                .windowPages = 64,
                                .groupPages = 256}};
@@ -8038,20 +8039,25 @@ void testUnwritableTierKeepsRequestsResident() {
 // them; and a dense history and a tail window of a page each. With
 // `always`, every request spills (--kv-spill always); otherwise a request
 // spills where its projection does not fit `residentKvBytes` of resident KV
-// (1,000 pages by default) beside the other lanes' (SpillGeometry). The
-// tier's transfers land as the fixture ticks on, and decode runs to each
-// request's output limit.
+// (1,000 pages by default) beside the other lanes' (SpillGeometry). One that
+// cannot spill may start Resident within `residentTokens` alone, by default
+// the tokens of resident KV's pages. The tier's transfers land as the
+// fixture ticks on, and decode runs to each request's output limit.
 struct Spilling {
   // The pages of an extent, of a type of its own for a call to name.
   struct Extent final {
     uint32_t pages;
   };
   explicit Spilling(uint32_t slots, bool always = true, uint64_t residentKvBytes = 100'000,
-                    Extent extent = {4})
+                    uint32_t residentTokens = 0, Extent extent = {4})
       : storage(256, 100, extent.pages, 10),
         budget(std::make_shared<model::DiskBudget>(uint64_t{slots} * 100)),
         cache(pool, &tier, budget, CacheSpillPolicy{1, 1}),
-        engine(config(always, residentKvBytes, &paused, &serving), cache, model, events) {
+        engine(config(always, residentKvBytes,
+                      residentTokens ? residentTokens
+                                     : static_cast<uint32_t>(residentKvBytes / 100 * KvCache::pageTokens),
+                      &paused, &serving),
+               cache, model, events) {
     tier.budget = budget;
     tier.transferLimit = 1024;
     require(static_cast<bool>(pool.fillRunway(kv::PageForm::Index)),
@@ -8060,8 +8066,8 @@ struct Spilling {
     model.decodeFinishes = false;
   }
 
-  static EngineConfig config(bool always, uint64_t residentKvBytes, const bool *paused,
-                             bool *serving) {
+  static EngineConfig config(bool always, uint64_t residentKvBytes, uint32_t residentTokens,
+                             const bool *paused, bool *serving) {
     EngineConfig result = test::engineConfig();
     result.growthPaused = [paused] { return *paused; };
     result.serving = [serving](bool value) { return std::exchange(*serving, value); };
@@ -8072,6 +8078,7 @@ struct Spilling {
                                  .indexPageBytes = 10,
                                  .slotBytes = 100,
                                  .residentKvBytes = residentKvBytes,
+                                 .residentTokens = residentTokens,
                                  .densePages = 1,
                                  .windowPages = 1,
                                  .groupPages = 4}};
@@ -8350,6 +8357,28 @@ void testShortQuotaBoundsWaitsOrRefusesASpillStart() {
   }
 }
 
+// A start that cannot spill, the tier closed or the quota short of it,
+// starts Resident where its projection fits in memory alone, as it would
+// without the SSD cache: within the resident context, beyond the resident
+// KV the plan leaves beside the readers of spilled KV, which it does not use.
+void testAStartThatCannotSpillStartsResidentWithinTheResidentContext() {
+  for (const bool closed : {true, false}) {
+    // Resident KV beside other lanes holds 20 pages, one request alone 50.
+    Spilling spill(8, false, 20 * 100, 50 * KvCache::pageTokens);
+    spill.tier.writableFile = !closed;
+    // 40 pages of prompt and 64 tokens of output project 43 pages; the 8
+    // slots of the quota cannot hold them.
+    spill.engine.submit(Spilling::prompt(1, 1, 40, 64));
+    spill.runUntilIdle();
+    const SpillRequestsSnapshot counts = spill.engine.snapshot().spill;
+    require(spill.events.completedCount == 1 && spill.events.usage.at(1).second == 64 &&
+                counts.resident == 1 && counts.spill == 0 && counts.refusedClosed == 0 &&
+                counts.refusedQuota == 0 && spill.tier.writes.empty(),
+            closed ? "a start that fits the resident context was refused while the tier took no writes"
+                   : "a start that fits the resident context was refused for a short quota");
+  }
+}
+
 // On a target whose prefill groups save only a spilling lane's reads, its
 // experts loaded whole, a Spill request's long prompt runs as groups and a
 // Resident one's as chunks, as without the SSD cache: a request that arrives
@@ -8587,7 +8616,7 @@ void testDecodeLeavesOutALaneRefusedItsHotFloor() {
 void testARefusedDecodeTakesThePrefillLanesMemory() {
   for (const bool writesInFlight : {false, true}) {
     // With writes in flight, extents of 64 pages, which the requests share.
-    Spilling spill(1024, true, 100'000, Spilling::Extent{writesInFlight ? 64u : 4u});
+    Spilling spill(1024, true, 100'000, 0, Spilling::Extent{writesInFlight ? 64u : 4u});
     // Lane 3's floor fits only while the prompt's lane is not resident.
     spill.model.spilledReadsRoom = [&](uint64_t id) {
       const auto prompt = spill.model.requests.find(2);
@@ -8652,7 +8681,7 @@ void testARefusedDecodeTakesThePrefillLanesMemory() {
 // back, not after each leaf.
 void testRefusedModelMemoryTakesWhatGivesMemoryBack() {
   // Extents of 64 pages, which the requests share.
-  Spilling spill(1024, true, 100'000, Spilling::Extent{64});
+  Spilling spill(1024, true, 100'000, 0, Spilling::Extent{64});
   // An earlier conversation leaves its spilled chain cached, its pages
   // holding their index.
   const std::vector<uint32_t> earlier(40 * KvCache::pageTokens + 1, 1);
@@ -8691,7 +8720,7 @@ void testALoneLaneWaitsForTheChainANeighbourLeft() {
   for (const bool restored : {true, false}) {
     // Extents of 16 pages, which the requests share. Every state goes
     // straight to the SSD.
-    Spilling spill(1024, true, 100'000, Spilling::Extent{16});
+    Spilling spill(1024, true, 100'000, 0, Spilling::Extent{16});
     spill.model.deniedReservations = std::numeric_limits<uint32_t>::max();
     spill.model.stateTier = std::make_shared<OffloadControl>();
     spill.model.stateTier->ready = true;
@@ -11470,6 +11499,7 @@ int main() {
     testConversionSpillsAHistoryWithCopies();
     testAStartThatConvertsCountsNoConversion();
     testShortQuotaBoundsWaitsOrRefusesASpillStart();
+    testAStartThatCannotSpillStartsResidentWithinTheResidentContext();
     testOnlySpillingLanesRunPrefillGroups();
     testALaneThatConvertsAtItsPrefillRunsItAloneAndWhole();
     testSpilledFullExtentsLeaveOnceNoPromptGrows();
