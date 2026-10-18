@@ -335,6 +335,10 @@ Scheduler::planPrefill(std::vector<PrefillRequestView> ready) const {
       rows /= 2;
     if (!plan.items.empty() && exceeds(rows))
       break;
+    const uint32_t remaining = view.request->spec.prefillTokens - view.promptProcessed;
+    if (policy_.align && rows < remaining)
+      rows -= rows % SPLASH_PREFILL_ATTENTION_TILE_ROWS;
+    if (!rows) continue;
     pairs += attentionPairs(view.promptProcessed, rows);
     plan.items.push_back(
         {view.request->spec.id, rows, view.promptProcessed});
