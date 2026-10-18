@@ -976,16 +976,24 @@ int routingLoads(MetalBackend &backend) {
   return failures;
 }
 
-// Full routing geometry with all experts mapped to one resident weight slot;
-// occupancy, routing and shared tiles still use all 512 expert identities.
+// Full routing and weight geometry, without the fp64 fixture's dequantized
+// copies: each expert has independent synthetic weights in its own slot.
 void identityMoe(MetalBackend &backend, splash::ops::DeterminismPolicy policy) {
   constexpr uint32_t hidden = 2560, intermediate = 640, experts = 512, top = 10, total = 2048;
   const MoeShape shape{hidden, experts, top, intermediate};
-  Model m = makeModel(backend, {hidden, 1, 1, intermediate}, Q4K, true);
-  m.router = floating(backend, experts, hidden, 0.05f);
-  m.weights.router = m.router.segment;
-  const std::vector<uint32_t> slots(experts, 0);
-  m.weights.slotTable = upload(backend, slots.data(), slots.size() * 4, "identity-slots");
+  const auto quantizedWeights = [&](Fmt format, uint32_t rows, uint32_t columns) {
+    const auto native = makeNative(format, rows, columns, rng);
+    const auto packed = repack(format, native, rows, columns, nullptr);
+    return planeSegment(backend, format, packed, rows, columns);
+  };
+  BlockMoeWeights weights;
+  weights.router = floating(backend, experts, hidden, 0.05f).segment;
+  weights.sharedScalarGate = floating(backend, 1, hidden, 0.05f).segment;
+  weights.gate = {quantizedWeights(Q4K, experts * intermediate, hidden), quantizedWeights(Q4K, intermediate, hidden)};
+  weights.up = {quantizedWeights(Q4K, experts * intermediate, hidden), quantizedWeights(Q4K, intermediate, hidden)};
+  weights.down = {quantizedWeights(Q80, experts * hidden, intermediate), quantizedWeights(Q80, hidden, intermediate)};
+  weights.slotTable = splash::model::residentExpertSlots(backend, experts);
+  weights.slots = experts;
   auto caps = backend.capabilities(); caps.appleGpuFamily = 10; caps.gpuCoreCount = 40;
   const splash::ops::ExecutionPlans plans(caps, policy);
   const auto x = activations(uint64_t{total} * hidden), residual = activations(uint64_t{total} * hidden);
@@ -1004,7 +1012,7 @@ void identityMoe(MetalBackend &backend, splash::ops::DeterminismPolicy policy) {
     b.moe.output = zeros(backend, uint64_t{order.size()} * hidden * 2, "identity-output");
     allocate(backend, b, plan);
     CommandGraph graph;
-    MoE::add(graph, b.moe, m.weights, plan, first, last, ends, policy.moe ? 2u : 0u);
+    MoE::add(graph, b.moe, weights, plan, first, last, ends, policy.moe ? 2u : 0u);
     (void)backend.submitCommandAsync(graph.dispatches()).wait();
     const auto *tiles = static_cast<const MoeTileDescriptor *>(b.moe.scratch.tileDescriptors.contents());
     const uint32_t count = *static_cast<const uint32_t *>(b.moe.scratch.tileCount.contents());
