@@ -3177,6 +3177,10 @@ void requireSpilledKvMatchesResident(metal::MetalBackend &backend, const model::
   const uint32_t lanePages = (tokens + kDecodeTokens) / kv::kPageTokens + 2;
   SpillRuntime spill(backend, model, operators, admission, format, stateFormat, options, lanePages);
   model::Runtime &runtime = spill.runtime();
+  // A MoE target's verify rows follow the cycles before them (model::VerifyBudget):
+  // the second run would verify other rows than the first, whose MoE results
+  // differ by rounding. Every run here verifies every row.
+  runtime.verifyEveryRow(true);
   // Each prompt's commands: the first, then the runtime's groups, at least
   // one of them past pages that spilled.
   std::array<std::vector<uint32_t>, 4> ends;

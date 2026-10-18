@@ -641,8 +641,10 @@ runDecodeThroughput(engine::Engine &engine, Driver &driver,
       decodeOutputTokens > completedTokens) {
     throw std::runtime_error("decode throughput work accounting is invalid");
   }
-  if (draftedTokens != uint64_t{width} * decodeBatches *
-                           model::ExecutionLimits::draftProposalTokens ||
+  // A cycle counts the proposals each lane verified: seven, or fewer once the
+  // lane's output budget leaves less than its block to retain.
+  if (draftedTokens > uint64_t{width} * decodeBatches *
+                          model::ExecutionLimits::draftProposalTokens ||
       acceptedDraftTokens > draftedTokens) {
     throw std::runtime_error("decode throughput DFlash accounting is invalid");
   }
@@ -987,6 +989,11 @@ int main(int argc, char **argv) {
     const double ranAneFfnShare = resources->aneFfnShare();
     const uint32_t ranAneFfnMinimumRows = resources->aneFfnMinimumRows();
     auto *executor = &bootstrap->modelRuntime();
+    // A MoE target's verify rows follow the wall times and acceptance of the
+    // cycles before them (model::VerifyBudget), so its outputs would not
+    // repeat from round to round: every cycle here verifies every row, as a
+    // dense target's does, and the times measure the backend, not the budget.
+    dynamic_cast<model::Runtime &>(*executor).verifyEveryRow(true);
     const auto &cacheIdentity = resources->cacheIdentity();
     const std::string identity =
         "{\"model_root\":" + json::quote(modelRoot) +

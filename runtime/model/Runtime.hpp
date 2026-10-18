@@ -25,6 +25,12 @@ public:
   // Direct native-oracle entry point. Production admission uses
   // begin() and installs its cache-aware plan explicitly.
   void beginColdRequest(const ModelRequest &request, uint32_t stateLane);
+  // For the native oracle and the backend benchmark: whether a MoE target's
+  // cycles verify every row of their blocks, as a dense target's do, instead
+  // of the rows model::VerifyBudget picks. Those follow the wall times and
+  // acceptance of the cycles before, so two runs of one schedule could verify
+  // other rows, whose MoE results differ by rounding.
+  void verifyEveryRow(bool every) noexcept;
   // For the native oracle: the rows a resident request's latest decode step
   // retained, which its GDN cell holds only once its next step folds them in
   // (QwenLaneMetadata::pendingRows). They are every GDN layer's tape rows
