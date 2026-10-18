@@ -7864,6 +7864,72 @@ void testRetainedGridAtFullWindowWithARefusedCapture() {
   }
 }
 
+// The retained-grid policy does not need model buffers to exercise a long
+// window: enumerate every point, refuse one capture, evict another, and edit
+// on either side of a retained boundary before replaying its suffix.
+void testRetainedGridAtMillionTokenWindow() {
+  constexpr uint32_t window = 1'010'000, grid = 16384;
+  const auto points = engine::retainedCheckpoints(0, window, grid);
+  require(points.size() == 61, "the million-token grid has the wrong number of points");
+  for (uint32_t i = 0; i < points.size(); ++i)
+    require(points[i] == (i + 1) * grid, "the million-token grid skipped a point");
+  for (const bool refuse : {false, true}) {
+    test::TestKvStorage storage(65536, 4096, 4);
+    KvPool pool(storage, 0);
+    engine::Cache resources(pool, nullptr, nullptr);
+    Executor executor(1);
+    if (refuse) executor.denyReservationAt = 2 * grid;
+    Events events;
+    auto config = test::engineConfig({.maxContext = window});
+    config.retainedCheckpointTokens = grid;
+    engine::Engine engine(config, resources, executor, events);
+    guardReleases(storage, engine);
+    double now = 1;
+    const auto finish = [&] {
+      for (uint32_t tick = 0; tick < 10000 && !idle(engine); ++tick)
+        static_cast<void>(engine.tick(now++));
+      require(idle(engine), "the million-token grid prefill did not finish");
+    };
+    std::vector<uint32_t> prompt(window - 1, 41);
+    engine.submit(request(820, prompt));
+    finish();
+    require(events.failedCount == 0 && executor.prefillRows == prompt.size(),
+            "the million-token grid lost prompt rows");
+    for (const uint32_t point : points) {
+      const uint32_t actual = resources.lookup(std::span(prompt).first(point + 1), {}).resumeBoundary();
+      // A refused reservation can reclaim preceding states while trying to
+      // make room. They may fall back to sequence start; never past the edit.
+      require(refuse && point <= 2 * grid ? actual <= grid && actual < 2 * grid : actual == point,
+              "the million-token grid restored past a refused or missing point");
+    }
+    const auto states = resources.snapshot().stateCache;
+    require(states.entries <= points.size() + 2 && states.bytes <= (points.size() + 2) * executor.stateBytes,
+            "the million-token grid retained more than its grid and endpoint states");
+    constexpr uint32_t evicted = 30 * grid;
+    auto held = resources.lookup(std::span(prompt).first(evicted + 1), {});
+    const uint64_t block = held.state->kvBlock();
+    const CompositeState *state = held.state->state().get();
+    held = {};
+    resources.discardState(block, state);
+    require(resources.lookup(std::span(prompt).first(evicted + 1), {}).resumeBoundary() == evicted - grid,
+            "an evicted long-window grid point did not fall back to its predecessor");
+    constexpr uint32_t boundary = 40 * grid;
+    for (const uint32_t edit : {boundary - 1, boundary + 1}) {
+      auto edited = prompt;
+      std::fill(edited.begin() + edit, edited.end(), 42);
+      require(resources.lookup(edited, {}).resumeBoundary() == (edit / grid) * grid,
+              "an edit beside a long-window grid point restored the wrong prefix");
+    }
+    std::fill(prompt.begin() + boundary + 1, prompt.end(), 42);
+    const uint64_t before = executor.prefillRows;
+    engine.submit(request(821, prompt));
+    finish();
+    require(events.failedCount == 0 && events.starts.back() == boundary &&
+                executor.prefillRows - before == prompt.size() - boundary,
+            "a long-window grid replay lost or repeated its admitted suffix");
+  }
+}
+
 void testCheckpointsSkipNearResumeAndReplayBoundaries() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
@@ -10487,6 +10553,7 @@ int main() {
     testDefaultCheckpointRestoresLatestCommittedPrefix();
     testRetainedGridSurvivesGrowingTurnsAndDeepEdits();
     testRetainedGridAtFullWindowWithARefusedCapture();
+    testRetainedGridAtMillionTokenWindow();
     testCheckpointsSkipNearResumeAndReplayBoundaries();
     testDecodeShareValidation();
     testIncompleteConfigIsRefused();
