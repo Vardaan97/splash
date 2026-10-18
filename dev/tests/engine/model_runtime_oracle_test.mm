@@ -352,7 +352,9 @@ ModelStepResult prefillChunk(model::Runtime &executor, uint64_t requestId,
         withRevision({requestId, logicalPosition, tokenCount, pageTable});
     item.inputTokens = inputTokens;
     for (const uint32_t boundary : capturedAt) {
-      std::shared_ptr<StateReservation> reservation = executor.reserveState(requestId, boundary);
+      metal::AllocationFailure refusal;
+      std::shared_ptr<StateReservation> reservation =
+          executor.reserveState(requestId, boundary, refusal);
       require(reservation != nullptr, "the buffers of a state to capture were refused");
       item.stateCaptures.push_back({boundary, std::move(reservation)});
     }
@@ -1509,7 +1511,8 @@ void requirePrefillPassesMatchWhole(model::Runtime &executor, const kv::PageStor
       ModelBatchItem item = withRevision({id, 0, rows, pageTable});
       item.inputTokens = tokens.first(rows);
       for (const uint32_t boundary : capturedAt) {
-        std::shared_ptr<StateReservation> reservation = executor.reserveState(id, boundary);
+        metal::AllocationFailure refusal;
+        std::shared_ptr<StateReservation> reservation = executor.reserveState(id, boundary, refusal);
         require(reservation != nullptr, "the buffers of a state to capture were refused");
         item.stateCaptures.push_back({boundary, std::move(reservation)});
       }
@@ -1597,7 +1600,8 @@ void requireCapturesOutliveTheirItems(model::Runtime &executor,
     ModelBatchItem item = withRevision({id, 0, tokens, pages});
     item.inputTokens = prompt;
     for (const uint32_t boundary : boundaries) {
-      item.stateCaptures.push_back({boundary, executor.reserveState(id, boundary)});
+      metal::AllocationFailure refusal;
+      item.stateCaptures.push_back({boundary, executor.reserveState(id, boundary, refusal)});
       require(item.stateCaptures.back().reservation != nullptr,
               "the buffers of a state to capture were refused");
     }
