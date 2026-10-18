@@ -70,6 +70,7 @@ struct MoeGroupParams {
   uint32_t last_row;
   // A nonzero lane bound overrides last_row; zero uses the scalar bound.
   uint32_t last_rows[SPLASH_MAXIMUM_BATCH_WIDTH];
+  // 0: occupancy choice, 1: ONE_ROW reference occupancy, 2: staged everywhere.
   uint32_t preserve_tile_kind;
 };
 

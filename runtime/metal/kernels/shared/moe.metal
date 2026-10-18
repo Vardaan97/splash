@@ -163,8 +163,8 @@ inline void moe_group_routes_phase(
   uint count = atomic_load_explicit(&counts[thread_index], memory_order_relaxed);
   // ONE_ROW retains the arithmetic chosen before dropping the tail. Only
   // selection is needed for those rows; their experts need not execute.
-  uint reference_rows = 0;
-  if (params.preserve_tile_kind)
+  uint reference_rows = params.preserve_tile_kind == 2 ? 0xffffffffu : 0;
+  if (params.preserve_tile_kind == 1)
     for (uint route = 0; route < routes; ++route) {
       const uint row = route / routes_per_row;
       const uint lane = row / params.lane_rows;
@@ -225,7 +225,8 @@ inline void moe_group_routes_phase(
   for (uint tile = thread_index; tile < shared_tiles; tile += Slots) {
     tiles[routed_tiles + tile] = MoeTileDescriptor{
         params.experts,
-        min(params.tile_rows, params.rows - tile * params.tile_rows), 0};
+        min(params.tile_rows, params.rows - tile * params.tile_rows),
+        params.preserve_tile_kind == 2 ? 0xffffffffu : 0};
   }
   for (uint row = thread_index; row < shared_rows; row += Slots) {
     if (row < params.rows) {

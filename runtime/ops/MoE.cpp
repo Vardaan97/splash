@@ -171,13 +171,13 @@ namespace {
 // A step's grouping into tiles, which its expert passes read: the gate and up
 // passes' column tiles of a staged GGUF plan that runs them in one pass are
 // its staged columns.
-MoeGroupParams groupParams(const MoePlan &plan, uint32_t firstRow = 0, uint32_t lastRow = 0, std::span<const uint32_t> lastRows = {}, bool preserveTileKind = false) {
+MoeGroupParams groupParams(const MoePlan &plan, uint32_t firstRow = 0, uint32_t lastRow = 0, std::span<const uint32_t> lastRows = {}, uint32_t preserveTileKind = false) {
   const MoeShape shape = plan.shape();
   const bool oneGateUp = oneGateUpPass(plan);
   MoeGroupParams params{plan.rows(), shape.expertsPerToken, plan.tileRows(), shape.experts,
           shape.expertIntermediateSize / (oneGateUp ? GGUF_STAGED_COLUMNS : GGUF_TILE_COLUMNS),
-          shape.hiddenSize / GGUF_TILE_COLUMNS, (firstRow || lastRow || !lastRows.empty() || preserveTileKind) ? SPLASH_TARGET_VERIFY_ROWS : 0u, firstRow,
-          lastRow, {}, preserveTileKind ? 1u : 0u};
+          shape.hiddenSize / GGUF_TILE_COLUMNS, (firstRow || lastRow || !lastRows.empty() || preserveTileKind == 1) ? SPLASH_TARGET_VERIFY_ROWS : 0u, firstRow,
+          lastRow, {}, preserveTileKind};
   std::copy(lastRows.begin(), lastRows.end(), params.last_rows);
   return params;
 }
@@ -186,7 +186,7 @@ MoeGroupParams groupParams(const MoePlan &plan, uint32_t firstRow = 0, uint32_t 
 
 void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
               const BlockMoeWeights &weights, const MoePlan &plan, uint32_t firstRow, uint32_t lastRow,
-              std::span<const uint32_t> lastRows, bool preserveTileKind) {
+              std::span<const uint32_t> lastRows, uint32_t preserveTileKind) {
   addRouting(graph, buffers, weights, plan, firstRow, lastRow, lastRows, preserveTileKind);
   if (weights.stream) {
     const MoeLoadPart part{&buffers, &plan};
@@ -197,7 +197,7 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
 
 void MoE::addRouting(metal::CommandGraph &graph, const MoeBuffers &buffers,
                      const BlockMoeWeights &weights, const MoePlan &plan, uint32_t firstRow, uint32_t lastRow,
-              std::span<const uint32_t> lastRows, bool preserveTileKind) {
+              std::span<const uint32_t> lastRows, uint32_t preserveTileKind) {
   const MoeShape shape = plan.shape();
   const uint32_t rows = plan.rows();
   validate(weights, shape);
