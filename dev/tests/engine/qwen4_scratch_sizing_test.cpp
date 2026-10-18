@@ -25,7 +25,7 @@ int main() {
   static_assert(uint32_t(262144 * factor) == 524282);
   window(uint32_t(262144 * factor));
   for (uint32_t residue = 0; residue < 128; ++residue) {
-    const double fractionalFactor = double(524288 + residue) / 262144;
+    const double fractionalFactor = double(524416 + residue) / 262144;
     window(uint32_t(262144 * fractionalFactor));
   }
   window(262144);
