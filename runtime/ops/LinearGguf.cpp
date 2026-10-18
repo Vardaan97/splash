@@ -337,10 +337,15 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
   // runs it on narrow grids (apple10Registers).
   const bool spreads = spreadsStagedDecode(family_, gpuCores_),
              onePass = spreads && w.epilogue == LinearEpilogue::GateUp && oneFormat(projections);
+  auto choice = w;
+  if (policy_.dense) choice.rows = kMaximumDecodeTileRows;
+  // Format-less storage planning must cover the wide staged choice for
+  // sub-four-bit formats, including a three-lane tile's padded fourth lane.
+  const bool reserveStages = policy_.dense && projections.empty() && !fourBits;
   if (registerFormats && everyQuantizedSegment(projections, registerTileTakes) &&
       (family_ == GpuFamilyClass::Apple9
-           ? !apple9Stages(w, projections)
-           : apple10Registers(w.rows, onePass ? 2 * n : n, gpuCores_,
+           ? !(reserveStages || apple9Stages(choice, projections))
+           : apple10Registers(choice.rows, onePass ? 2 * n : n, gpuCores_,
                               fourBits && everyQuantizedSegment(projections, fourBitsPerWeight))))
     return registerDecode(n, k, gpuCores_);
   // Decode tiles walking K in lockstep all fetch the same slice of the input
