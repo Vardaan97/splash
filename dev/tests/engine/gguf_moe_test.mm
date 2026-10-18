@@ -1054,6 +1054,8 @@ void identityMoe(MetalBackend &backend, splash::ops::DeterminismPolicy policy) {
         compare(execute(plan, indices, first, last), widest, indices, first, last);
     const std::array<uint32_t, 4> ends{1, 3, 5, 8};
     compare(execute(plan, indices, 0, 0, ends), widest, indices, 0, 0, ends);
+    const std::array<uint32_t, 4> exhausted{2, 3, 5, 8};
+    compare(execute(plan, indices, 2, 0, exhausted), widest, indices, 2, 0, exhausted);
     std::reverse(indices.begin(), indices.end());
     compare(execute(plan, indices), widest, indices);
   }
