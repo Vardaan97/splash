@@ -1,6 +1,7 @@
 #include "engine/NativeArguments.hpp"
 
 #include <charconv>
+#include <cstdlib>
 #include <cmath>
 #include <limits>
 #include <optional>
@@ -188,6 +189,14 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
                        std::to_string(result.model.capabilities.maximumContextTokens) + "]");
   }
   result.maxMemoryBytes = parseMaxMemory(argv[4]);
+  try {
+    const char *value = std::getenv("SPLASH_DETERMINISTIC");
+    result.determinism = ops::DeterminismPolicy::parse(value ? value : "");
+    result.determinism.requireCompatible(result.stateFormat == ops::GdnStateFormat::Float32,
+                                         result.neuralEngine);
+  } catch (const std::invalid_argument &error) {
+    throw UsageError(error.what());
+  }
   return result;
 }
 

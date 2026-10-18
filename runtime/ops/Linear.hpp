@@ -4,6 +4,7 @@
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 #include "ops/Weights.hpp"
+#include "ops/Determinism.hpp"
 
 #include <algorithm>
 #include <array>
@@ -224,7 +225,7 @@ enum class GpuFamilyClass : uint8_t { Apple9, Apple10 };
 // family class, core count and workload tile counts.
 class Linear final {
 public:
-  explicit Linear(const DeviceCapabilities &device) noexcept;
+  explicit Linear(const DeviceCapabilities &device, DeterminismPolicy policy = {}) noexcept;
 
   [[nodiscard]] LinearPlan plan(LinearWorkload workload) const;
   // The plan of `workload` for the projection, into its destination type; a gate/up plan also runs `gate`.
@@ -302,6 +303,7 @@ private:
                        const Projection *gate) const;
   void addGgufFloatSegments(metal::CommandGraph &graph, const LinearBuffers &buffers,
                             const Projection &projection, const LinearPlan &plan) const;
+  DeterminismPolicy policy_;
   GpuFamilyClass family_;
   uint32_t gpuCores_ = 0;
 };

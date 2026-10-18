@@ -1,6 +1,7 @@
 #pragma once
 
 #include "engine/Types.hpp"
+#include "ops/Determinism.hpp"
 #include "model/Model.hpp"
 
 #include <array>
@@ -70,8 +71,9 @@ public:
   // A prefill command's attention computes at most maximumAttentionPairs
   // query-key pairs (attentionPairs): its lanes' rows halve until they fit.
   explicit Scheduler(double decodeShare,
-                     uint64_t maximumAttentionPairs = std::numeric_limits<uint64_t>::max()) noexcept
-      : decodeShare_(decodeShare), maximumAttentionPairs_(maximumAttentionPairs) {}
+                     uint64_t maximumAttentionPairs = std::numeric_limits<uint64_t>::max(),
+                     ops::DeterminismPolicy policy = {}) noexcept
+      : policy_(policy), decodeShare_(decodeShare), maximumAttentionPairs_(maximumAttentionPairs) {}
 
   // The query-key pairs the attention of `rows` prompt rows from `position`
   // computes: each row attends to its history and itself, so the pairs, and
@@ -175,6 +177,7 @@ private:
   // A prefill command's estimated cost: fixed, plus per row.
   double prefillFixedMilliseconds_ = 0.0;
   double prefillMillisecondsPerToken_ = 0.0;
+  ops::DeterminismPolicy policy_;
   double decodeShare_;
   uint64_t maximumAttentionPairs_;
   // Decode time that prefill still owes the lanes that decoded beside it

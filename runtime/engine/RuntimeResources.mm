@@ -284,6 +284,7 @@ std::string persistentCacheNamespace(const RuntimeCacheIdentity &identity,
             // Dimension-major values add nothing, so dense layouts keep the
             // caches they wrote.
             << (kv.valuesTokenMajor ? " values-token-major" : "");
+  if (identity.determinism.enabled()) canonical << " deterministic " << identity.determinism.parts();
   // A block index's pooled keys (kv::Layout::indexDimension), bf16, one a
   // block of SPLASH_ATTENTION_BLOCK_TOKENS tokens. A change to how a block's
   // key is pooled, normalized or rotated changes this line.
@@ -358,6 +359,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         "host memory and volume probes, build id, and a merge-aligned image patch "
         "limit no larger than the protocol's are required");
   }
+  config.determinism.requireCompatible(config.stateFormat == ops::GdnStateFormat::Float32,
+                                        config.aneFfn.enabled);
   std::unique_ptr<metal::MetalBackend> backend;
   try {
     backend = std::make_unique<metal::MetalBackend>(config.metallibPath.string(),
@@ -535,7 +538,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
 
   // One plan owner is used both before allocation and during encoding. The
   // engine lends it to model execution without inspecting its plans.
-  ops::ExecutionPlans operators(device);
+  ops::ExecutionPlans operators(device, config.determinism);
   model::ModelMemoryPlan modelMemoryPlan;
   try {
     modelMemoryPlan = model::plannedRuntimeMemory(loaded, operators, config.kvFormat,
@@ -607,6 +610,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         loaded.manifestFingerprintSha256,
         loaded.targetManifestFingerprint(), config.buildId,
         loaded.targetKvLayout(config.kvFormat), loaded.descriptor.ropeScaling);
+    cacheIdentity.determinism = config.determinism;
   } catch (const std::exception &error) {
     throw RuntimeResourcesError(RuntimeResourceStage::ModelLoading,
                                 error.what(),

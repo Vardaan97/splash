@@ -337,6 +337,21 @@ int main(int argc, char **argv) {
   }
   modelConfigs = argv[2];
   try {
+    using ops::DeterminismPolicy;
+    for (const char *value : {"", "0"})
+      require(!DeterminismPolicy::parse(value).enabled(), "determinism defaults off");
+    for (const char *value : {"1", "all", "align,attention,float,prefill,dense,moe"})
+      require(DeterminismPolicy::parse(value).parts() == "moe,dense,prefill,float,attention,align",
+              "determinism canonical parts");
+    for (const char *value : {"moe", "dense", "prefill", "float", "attention", "align"})
+      require(DeterminismPolicy::parse(value).parts() == value, "determinism ablation");
+    for (const char *value : {"unknown", "moe,", ",dense", "0,moe", "all,dense", " dense"})
+      rejects([&] { (void)DeterminismPolicy::parse(value); }, "SPLASH_DETERMINISTIC", "unknown determinism part");
+    const auto all = DeterminismPolicy::parse("1");
+    all.requireCompatible(true, false);
+    rejects([&] { all.requireCompatible(false, false); }, "--state-format fp32", "determinism refuses bf16 state");
+    rejects([&] { all.requireCompatible(true, true); }, "--disable-ane", "determinism refuses ANE FFN");
+    DeterminismPolicy{}.requireCompatible(false, true);
     testServerCommandLines(argv[1]);
     testNeuralEngine();
     testRefusals();

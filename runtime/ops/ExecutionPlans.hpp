@@ -13,7 +13,8 @@ namespace splash::ops {
 // object and production models borrow it; it never changes after creation.
 class ExecutionPlans final {
 public:
-  explicit ExecutionPlans(const DeviceCapabilities &device);
+  explicit ExecutionPlans(const DeviceCapabilities &device, DeterminismPolicy policy = {});
+  [[nodiscard]] DeterminismPolicy determinism() const noexcept { return policy_; }
   [[nodiscard]] const Linear &linear() const noexcept { return linear_; }
 
   [[nodiscard]] PrefillAttentionPlan prefillAttention(
@@ -45,6 +46,7 @@ private:
   // The device's configuration of a MoE plan of `rows` rows in `phase`.
   [[nodiscard]] MoeConfig moeConfig(MoeShape shape, uint32_t rows, MoePhase phase) const;
 
+  DeterminismPolicy policy_;
   Linear linear_;
   GpuFamilyClass family_;
 };

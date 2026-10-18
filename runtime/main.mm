@@ -206,6 +206,10 @@ bootstrapConfig(const engine::NativeArguments &arguments) {
     config.resources.cacheRoot = caches / "prefix-cache";
   config.resources.kvFormat = arguments.kvFormat;
   config.resources.stateFormat = arguments.stateFormat;
+  config.resources.determinism = arguments.determinism;
+  config.nativeLoop.engine.determinism = arguments.determinism;
+  if (arguments.determinism.enabled())
+    logLine("Deterministic mode: ", arguments.determinism.parts());
   config.resources.maximumImagePatches = arguments.maxImagePatches;
   config.resources.idleReleaseSeconds = arguments.idleReleaseSeconds;
   config.resources.aneFfn.enabled = arguments.neuralEngine;

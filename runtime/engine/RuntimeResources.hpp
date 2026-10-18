@@ -57,6 +57,7 @@ struct RuntimeCacheIdentity {
   model::RopeScaling ropeScaling;
   // The target model's manifest.
   std::string targetModelSha256;
+  ops::DeterminismPolicy determinism;
 };
 
 [[nodiscard]] RuntimeCacheIdentity
@@ -97,6 +98,7 @@ struct CacheDiskQuota final {
 };
 
 struct RuntimeResourcesConfig {
+  ops::DeterminismPolicy determinism;
   kv::Format kvFormat = kv::Format::Int8;
   ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
   std::filesystem::path metallibPath;
