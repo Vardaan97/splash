@@ -276,6 +276,15 @@ void testCleanRuntimeStatus(const char *goldenPath) {
   require(yarnStatus.find("\"block_tokens\":32,\"rope_scaling\":{\"type\":\"yarn\",\"factor\":2.5,"
                           "\"original_context_tokens\":262144}}") != std::string::npos,
           "the cache identity did not report YaRN");
+  auto tokenMajorIdentity = identity;
+  tokenMajorIdentity.kvLayout.valuesTokenMajor = true;
+  const auto tokenMajorStatus = runtimeStatusJson(memoryPlan, engine, metal, warmup, audit(memoryPlan),
+                        metrics, executorTelemetry, tokenMajorIdentity, governor, true,
+                        {}, {}, {}, {}, {}, {});
+  require(tokenMajorStatus.find("\"dtype\":\"q8s8_f32_scale_per_token_head_k_token_major_v_token_major\"") !=
+                  std::string::npos &&
+              tokenMajorStatus.find("\"value_layout\":\"token_major\"") != std::string::npos,
+          "token-major values were reported dimension-major");
   require(json.find("\"schema_version\":6") != std::string::npos &&
               json.find("\"ready\":true") != std::string::npos,
           "status readiness/schema is wrong");
