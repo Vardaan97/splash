@@ -621,7 +621,7 @@ void Linear::addGgufFloatSegments(metal::CommandGraph &graph, const LinearBuffer
 // core for both of its float projections on the 16- and 20-core M5 Pro.
 FloatTile Linear::ggufFloatTile(uint32_t rows, uint32_t outputSize) const noexcept {
   const uint64_t tiles = uint64_t{(rows + 63) / 64} * ((outputSize + 31) / 32);
-  return family_ == GpuFamilyClass::Apple10 && rows >= 16 && 2 * tiles >= uint64_t{3} * gpuCores_
+  return !policy_.floatTile && family_ == GpuFamilyClass::Apple10 && rows >= 16 && 2 * tiles >= uint64_t{3} * gpuCores_
              ? FloatTile::NeuralAccelerator
              : FloatTile::Simdgroup;
 }
