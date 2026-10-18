@@ -32,6 +32,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <future>
@@ -549,8 +550,10 @@ struct Runtime::Impl {
               plePrefetchRows(laneInputs[lane].position, {proposals + lane * kDraftProposalTokens, step},
                               laneInputs[lane].history, ids);
             pleStore->prefetch(ids);
+          } catch (const std::exception &error) {
+            std::fprintf(stderr, "PLE draft prefetch hint failed: %s\n", error.what());
           } catch (...) {
-            // A hint: the stage reads what it lacks.
+            std::fprintf(stderr, "PLE draft prefetch hint failed: unknown exception\n");
           }
           done->set_value();
         });
