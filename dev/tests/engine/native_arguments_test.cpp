@@ -207,6 +207,27 @@ void testNeuralEngine() {
           "--ane did not reach the arguments as given");
 }
 
+void testDeterministicArguments() {
+  const ModelDirectory model;
+  constexpr const char *name = "SPLASH_DETERMINISTIC";
+  const char *old = std::getenv(name);
+  const std::optional<std::string> saved = old ? std::optional<std::string>(old) : std::nullopt;
+  setenv(name, "all", 1);
+  require(parse(model, {"auto", "auto", "--ane", "off"}).determinism.parts() ==
+              "moe,dense,prefill,float,attention,align", "startup lost deterministic policy");
+  rejects([&] { (void)parse(model, {"auto", "auto", "--ane", "off", "--state-format", "bf16"}); },
+          "--state-format fp32", "startup accepted deterministic bf16 state");
+  rejects([&] { (void)parse(model, {"auto", "auto"}); },
+          "--disable-ane", "startup accepted deterministic ANE FFN");
+  setenv(name, "invalid", 1);
+  rejects([&] { (void)parse(model, {"auto", "auto", "--ane", "off"}); },
+          "SPLASH_DETERMINISTIC", "startup ignored an unknown deterministic part");
+  setenv(name, "0", 1);
+  require(!parse(model, {"auto", "auto", "--state-format", "bf16"}).determinism.enabled(),
+          "default policy changed startup compatibility");
+  if (saved) setenv(name, saved->c_str(), 1); else unsetenv(name);
+}
+
 // A model directory holds draft/ or, for a model drafting with its MTP head
 // (Qwen3.8-Flash-Next from a GGUF), mtp/ beside target/; one with neither
 // is refused, as is mtp/ for a family without the head.
@@ -355,6 +376,7 @@ int main(int argc, char **argv) {
     DeterminismPolicy{}.requireCompatible(false, true);
     testServerCommandLines(argv[1]);
     testNeuralEngine();
+    testDeterministicArguments();
     for (const char *name : {"SPLASH_MTP_DRAFT_TRACE", "SPLASH_MTP_LANES", "SPLASH_MTP_DRAFT_ONE_ROW", "SPLASH_MTP_DRAFT_LOG", "SPLASH_MTP_SAMPLED_DRAFT"}) {
       const char *old = std::getenv(name);
       const std::optional<std::string> saved = old ? std::optional<std::string>(old) : std::nullopt;

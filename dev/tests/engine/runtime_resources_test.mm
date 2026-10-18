@@ -193,6 +193,20 @@ void testPersistentCacheNamespace() {
           "token-major values, an index or auxiliary state shared a dense layout's cache namespace");
 }
 
+void testDeterministicRefusals(const char *metallibPath) {
+  const test::TemporaryDirectory root("splash-deterministic-guards");
+  auto config = budgetConfig(metallibPath, root.path());
+  config.determinism = ops::DeterminismPolicy::parse("dense");
+  config.stateFormat = ops::GdnStateFormat::BFloat16;
+  config.aneFfn.enabled = false;
+  test::rejects([&] { (void)RuntimeResources::create(config, 0); },
+                "--state-format fp32", "runtime accepted deterministic bf16 state");
+  config.stateFormat = ops::GdnStateFormat::Float32;
+  config.aneFfn.enabled = true;
+  test::rejects([&] { (void)RuntimeResources::create(config, 0); },
+                "--disable-ane", "runtime accepted deterministic ANE FFN");
+}
+
 void testWeightBudgetBeforeLoading(const char *metallibPath) {
   const test::TemporaryDirectory root("splash-budget");
   RuntimeResourcesConfig config = budgetConfig(metallibPath, root.path());
@@ -742,6 +756,11 @@ int main(int argc, char **argv) {
   @autoreleasepool {
     try {
       require(argc == 2, "expected metallib path");
+      testDeterministicRefusals(argv[1]);
+      if (std::string_view(argv[1]) == "--cpu") {
+        std::cout << "deterministic runtime refusals: PASS (CPU only)\n";
+        return 0;
+      }
       testLoadedVisionIsRequiredOnlyWithVision();
       testPersistentCacheNamespace();
       testWeightBudgetBeforeLoading(argv[1]);

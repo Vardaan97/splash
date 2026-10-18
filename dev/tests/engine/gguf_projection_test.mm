@@ -34,6 +34,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <iostream>
@@ -987,14 +988,84 @@ void gatherExtents(MetalBackend &backend) {
           "element short");
 }
 
+void identityProjections(MetalBackend &backend, DeterminismPolicy policy) {
+  constexpr uint32_t maximum = 2048;
+  for (const auto matrix : {LinearMatrix{16512, 2560}, LinearMatrix{13312, 2560},
+                            LinearMatrix{2560, 6144}, LinearMatrix{320, 10240},
+                            LinearMatrix{10240, 320}, LinearMatrix{10240, 3840},
+                            LinearMatrix{2560, 3840}, LinearMatrix{2560, 5120},
+                            LinearMatrix{248320, 2560}}) {
+    for (const Fmt format : {Q80, Q4K, Q5K, Q6K, BF16}) {
+      const auto [N, K] = matrix;
+      if (K % quant_column_unit(kQuantFormats[format].block_elements)) {
+        std::cout << "T2 unsupported native GGUF row N=" << N << " K=" << K << " format=" << fmtName(format) << '\n';
+        continue;
+      }
+      const Tensor weights = tensor(backend, format, N, K);
+      Projection p = projection({&weights}, N);
+      if (N == 248320) p.destination = FloatOutput::Float32;
+      const uint32_t rowBytes = N * elementBytes(p.destination);
+      const auto x = activations(Inputs::Dense, maximum, K);
+      for (const uint32_t family : {9U, 10U}) {
+        auto device = backend.capabilities(); device.appleGpuFamily = family; device.gpuCoreCount = 40;
+        const Linear linear(device, policy);
+        const auto project = [&](const LinearPlan &plan) {
+          const Scratch scratch(backend, plan.scratchSize());
+          const auto input = bfloats(backend, storageRows(x, K, plan.workload().rows, plan.storageRows()));
+          const Guarded output(backend, uint64_t{plan.storageRows()} * rowBytes, 0xff);
+          scratch.poison(kPoisonNaN);
+          CommandGraph graph;
+          (void)linear.add(graph, {.input = input.view, .output = output.view, .scratch = scratch.bindings()}, p, plan);
+          (void)backend.submitCommandAsync(graph.dispatches()).wait();
+          if (!scratch.intact() || !input.intact() || !output.intact()) fail("T2 scratch or output guard changed");
+          const auto *bytes = static_cast<const uint8_t *>(output.view.contents());
+          return std::vector<uint8_t>(bytes, bytes + output.bytes);
+        };
+        uint64_t differentDecode = 0, differentPrefill = 0, compared = 0;
+        const auto decode = project(linear.decodePlan(p, 4));
+        for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
+          const auto got = project(linear.decodePlan(p, lanes));
+          for (uint32_t row = 0; row < lanes * 8; ++row) {
+            ++compared;
+            differentDecode += !std::equal(got.begin() + uint64_t{row} * rowBytes,
+                                            got.begin() + uint64_t{row + 1} * rowBytes,
+                                            decode.begin() + uint64_t{row} * rowBytes);
+          }
+        }
+        const auto prefill = project(linear.prefillPlan(p, maximum, LinearEpilogue::None));
+        for (uint32_t rows = 1; rows <= 300; ++rows) {
+          const auto got = project(linear.prefillPlan(p, rows, LinearEpilogue::None));
+          for (uint32_t row = 0; row < rows; ++row) {
+            ++compared;
+            differentPrefill += !std::equal(got.begin() + uint64_t{row} * rowBytes,
+                                             got.begin() + uint64_t{row + 1} * rowBytes,
+                                             prefill.begin() + uint64_t{row} * rowBytes);
+          }
+        }
+        std::cout << "T2 policy=" << policy.parts() << " family=" << family << " N=" << N << " K=" << K
+                  << " format=" << fmtName(format) << " compared=" << compared
+                  << " differing_decode_rows=" << differentDecode << " differing_prefill_rows=" << differentPrefill << '\n';
+        if ((policy.dense && differentDecode) || (policy.prefillDense && differentPrefill))
+          fail("T2 policy plans are not row invariant");
+      }
+    }
+  }
+}
+
 int main(int argc, char **argv) {
   @autoreleasepool {
-    if (argc != 2) {
+    if (argc != 2 && !(argc == 3 && std::string_view(argv[2]) == "--identity")) {
       std::cerr << "usage: gguf-projection <production-and-test.metallib>\n";
       return 2;
     }
     try {
       MetalBackend backend(argv[1]);
+      if (argc == 3) {
+        std::cout << std::unitbuf;
+        const char *value = std::getenv("SPLASH_DETERMINISTIC");
+        identityProjections(backend, DeterminismPolicy::parse(value ? value : ""));
+        return failures ? 1 : 0;
+      }
       const Linear linear(backend.capabilities());
       for (const LinearTile tile : {LinearTile::GgufRegister, LinearTile::GgufStaged}) {
         decodeTile(backend, linear, tile, false);

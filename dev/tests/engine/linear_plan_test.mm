@@ -72,6 +72,43 @@ Projection blockProjection(uint32_t n, uint32_t k, uint32_t segments, uint32_t f
 // destination keeps the configuration, input table and scratch of its bf16
 // plan on every family and core count, and only plain decode workloads take
 // one. ggufProjectionMatrix checks the fp32 kernel it encodes.
+void deterministicPlans() {
+  for (const uint32_t family : {9U, 10U}) {
+    const auto d = simulatedDevice(family, 40);
+    const Linear pinned(d, DeterminismPolicy::parse("1"));
+    const Linear baseline(d);
+    uint32_t changed = 0;
+    for (const auto matrix : {LinearMatrix{16512, 2560}, LinearMatrix{13312, 2560},
+                              LinearMatrix{2560, 6144}, LinearMatrix{248320, 2560},
+                              LinearMatrix{320, 10240}, LinearMatrix{10240, 320},
+                              LinearMatrix{10240, 3840}, LinearMatrix{2560, 3840}, LinearMatrix{2560, 5120}})
+      for (const uint32_t format : {GGUF_FMT_Q80, GGUF_FMT_Q4K, GGUF_FMT_Q5K, GGUF_FMT_Q6K, GGUF_FMT_BF16}) {
+        if (matrix.inputSize % quant_column_unit(kQuantFormats[format].block_elements)) continue;
+        const auto p = blockProjection(matrix.outputSize, matrix.inputSize, 1, format);
+        const auto wide = pinned.decodePlan(p, 4);
+        for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
+          const auto plan = pinned.decodePlan(p, lanes);
+          require(plan.configuration() == wide.configuration(), "deterministic decode configuration depends on width");
+          require(plan.storageRows() == Linear::plan(plan.workload(), wide.configuration(), plan.destination()).storageRows(),
+                  "deterministic decode storage stride depends on width");
+          require(pinned.decodeStorageRows(lanes * 8, p.shape()) >= plan.storageRows(),
+                  "deterministic decode storage disagrees with plan");
+          const auto bound = pinned.decodeScratchSize(p.shape()), scratch = plan.scratchSize();
+          require(bound.input >= scratch.input && bound.sums >= scratch.sums &&
+                      bound.partials >= scratch.partials && bound.counters >= scratch.counters,
+                  "deterministic scratch is too small");
+          changed += plan.configuration() != baseline.decodePlan(p, lanes).configuration();
+        }
+        for (uint32_t rows = 1; rows <= 32; ++rows)
+          require(pinned.prefillPlan(p, rows, LinearEpilogue::None).configuration().splits == 1,
+                  "deterministic prefill splits K");
+      }
+    for (uint32_t rows = 1; rows <= 2048; ++rows)
+      require(pinned.ggufFloatTile(rows, 512) == FloatTile::Simdgroup, "deterministic router changes tile");
+    std::cout << "deterministic plans family=" << family << " differing default plans=" << changed << '\n';
+  }
+}
+
 void floatOutputPlans() {
   const auto fp32 = [](Projection p) {
     p.destination = FloatOutput::Float32;
@@ -1030,6 +1067,7 @@ void registerTileExtents(metal::MetalBackend &backend) {
 int main(int argc, char **argv) {
   try {
     require(argc == 2, "usage: linear-plan <production.metallib|--cpu>");
+    deterministicPlans();
     ggufPlans();
     scratchBoundsRotated();
     ggufCoreLaws();

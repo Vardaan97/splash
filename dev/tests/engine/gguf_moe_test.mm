@@ -32,6 +32,7 @@
 #include "../../../runtime/metal/CommandGraph.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
 #include "../../../runtime/ops/Linear.hpp"
+#include "ops/ExecutionPlans.hpp"
 #include "../../../runtime/ops/MoE.hpp"
 #include "../../../runtime/ops/Qwen4.hpp"
 #include "GgufFormatReference.hpp"
@@ -47,6 +48,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <functional>
@@ -1061,16 +1063,137 @@ int routingLoads(MetalBackend &backend) {
   return failures;
 }
 
+// Full routing geometry with all experts mapped to one resident weight slot;
+// occupancy, routing and shared tiles still use all 512 expert identities.
+void identityMoe(MetalBackend &backend, splash::ops::DeterminismPolicy policy) {
+  constexpr uint32_t hidden = 2560, intermediate = 640, experts = 512, top = 10, total = 2048;
+  const MoeShape shape{hidden, experts, top, intermediate};
+  Model m = makeModel(backend, {hidden, 1, 1, intermediate}, Q4K, true);
+  m.router = floating(backend, experts, hidden, 0.05f);
+  m.weights.router = m.router.segment;
+  const std::vector<uint32_t> slots(experts, 0);
+  m.weights.slotTable = upload(backend, slots.data(), slots.size() * 4, "identity-slots");
+  auto caps = backend.capabilities(); caps.appleGpuFamily = 10; caps.gpuCoreCount = 40;
+  const splash::ops::ExecutionPlans plans(caps, policy);
+  const auto x = activations(uint64_t{total} * hidden), residual = activations(uint64_t{total} * hidden);
+  uint64_t compared = 0, different = 0, across = 0;
+  struct Result { std::vector<uint16_t> output; std::vector<bool> column; };
+  const auto execute = [&](const MoePlan &plan, const std::vector<uint32_t> &order,
+                           uint32_t first = 0, uint32_t last = 0, std::span<const uint32_t> ends = {}) {
+    Buffers b;
+    std::vector<float> input, res;
+    for (uint32_t row : order) {
+      input.insert(input.end(), x.begin() + uint64_t{row} * hidden, x.begin() + uint64_t{row + 1} * hidden);
+      res.insert(res.end(), residual.begin() + uint64_t{row} * hidden, residual.begin() + uint64_t{row + 1} * hidden);
+    }
+    b.moe.input = bfloatBuffer(backend, input, "identity-input");
+    b.moe.residual = bfloatBuffer(backend, res, "identity-residual");
+    b.moe.output = zeros(backend, uint64_t{order.size()} * hidden * 2, "identity-output");
+    allocate(backend, b, plan);
+    CommandGraph graph;
+    MoE::add(graph, b.moe, m.weights, plan, first, last, ends, policy.moe ? 2u : 0u);
+    (void)backend.submitCommandAsync(graph.dispatches()).wait();
+    const auto *tiles = static_cast<const MoeTileDescriptor *>(b.moe.scratch.tileDescriptors.contents());
+    const uint32_t count = *static_cast<const uint32_t *>(b.moe.scratch.tileCount.contents());
+    if (policy.moe)
+      for (uint32_t t = 0; t < count; ++t)
+        require(tiles[t].reference_rows == 0xffffffffu, "identity routed/shared tile missed staged sentinel");
+    Result result;
+    const auto *out = static_cast<const uint16_t *>(b.moe.output.contents());
+    result.output.assign(out, out + uint64_t{order.size()} * hidden);
+    const auto *routeRows = static_cast<const uint32_t *>(b.moe.scratch.routeRows.contents());
+    for (uint32_t row = 0; row < order.size(); ++row)
+      for (uint32_t route = 0; route <= top; ++route)
+        result.column.push_back(columnTile(tiles, routeRows[row * (top + 1) + route] / plan.tileRows()));
+    return result;
+  };
+  std::vector<uint32_t> order(total); std::iota(order.begin(), order.end(), 0);
+  const auto whole = execute(plans.moePrefill(shape, total), order);
+  const auto compare = [&](const Result &a, const Result &b, const std::vector<uint32_t> &indices,
+                           uint32_t first = 0, uint32_t last = 0, std::span<const uint32_t> ends = {}) {
+    for (uint32_t row = 0; row < indices.size(); ++row) {
+      const uint32_t end = ends.empty() ? last : ends[row / 8];
+      if (row % 8 < first || (end && row % 8 >= end)) continue;
+      ++compared;
+      different += !std::equal(a.output.begin() + uint64_t{row} * hidden,
+                                a.output.begin() + uint64_t{row + 1} * hidden,
+                                b.output.begin() + uint64_t{indices[row]} * hidden);
+      across += !std::equal(a.column.begin() + uint64_t{row} * (top + 1),
+                             a.column.begin() + uint64_t{row + 1} * (top + 1),
+                             b.column.begin() + uint64_t{indices[row]} * (top + 1));
+    }
+  };
+  for (const uint32_t chunk : {1U, 2U, 7U, 11U, 17U, 31U, 32U, 33U, 43U, 128U, 300U, 753U, 2048U}) {
+    for (uint32_t start = 0; start < total; start += chunk) {
+      const uint32_t rows = std::min(chunk, total - start);
+      std::vector<uint32_t> indices(order.begin() + start, order.begin() + start + rows);
+      compare(execute(plans.moePrefill(shape, rows), indices), whole, indices);
+    }
+  }
+  const std::vector<uint32_t> wideOrder(order.begin(), order.begin() + 32);
+  const auto widest = execute(plans.moeDecode(shape, 4), wideOrder);
+  for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
+    std::vector<uint32_t> indices(order.begin(), order.begin() + lanes * 8);
+    const auto plan = plans.moeDecode(shape, lanes);
+    compare(execute(plan, indices), widest, indices);
+    for (uint32_t first : {0U, 1U, 3U})
+      for (uint32_t last : {4U, 8U})
+        compare(execute(plan, indices, first, last), widest, indices, first, last);
+    const std::array<uint32_t, 4> ends{1, 3, 5, 8};
+    compare(execute(plan, indices, 0, 0, ends), widest, indices, 0, 0, ends);
+    std::reverse(indices.begin(), indices.end());
+    compare(execute(plan, indices), widest, indices);
+  }
+  std::shuffle(order.begin(), order.end(), rng);
+  compare(execute(plans.moePrefill(shape, total), order), whole, order);
+  std::cout << "T1 policy=" << policy.parts() << " compared=" << compared << " differing_rows=" << different
+            << " across_tile_kinds=" << across << (policy.moe ? "\n" : " expected-different baseline\n");
+  if (policy.moe) require(different == 0 && across == 0, "deterministic MoE rows changed");
+}
+
+void identityFloat(MetalBackend &backend, splash::ops::DeterminismPolicy policy) {
+  auto caps = backend.capabilities(); caps.appleGpuFamily = 10; caps.gpuCoreCount = 40;
+  const Linear linear(caps, policy);
+  for (const uint32_t columns : {512U, 96U, 128U, 48U}) {
+    constexpr uint32_t K = 2560, maximum = 2048;
+    const Tensor w = floating(backend, columns, K, 0.05f);
+    const auto input = bfloatBuffer(backend, activations(uint64_t{maximum} * K), "identity-float-input");
+    const auto output = zeros(backend, uint64_t{maximum} * columns * 4, "identity-float-output");
+    std::vector<uint8_t> reference;
+    uint32_t different = 0;
+    for (uint32_t rows = 1; rows <= maximum; ++rows) {
+      CommandGraph graph;
+      splash::ops::addGgufFloat(graph, input, w.segment, output, rows, columns, 0, FloatOutput::Float32,
+                                linear.ggufFloatTile(rows, columns));
+      (void)backend.submitCommandAsync(graph.dispatches()).wait();
+      const auto *bytes = static_cast<const uint8_t *>(output.contents());
+      if (reference.empty()) reference.assign(bytes, bytes + columns * 4);
+      else different += !std::equal(reference.begin(), reference.end(), bytes);
+    }
+    std::cout << "T3 policy=" << policy.parts() << " N=" << columns << " K=" << K
+              << " row_counts=1..2048 differing_rows=" << different << '\n';
+    if (policy.floatTile) require(different == 0, "simdgroup float projection is not row-count invariant");
+  }
+}
+
 } // namespace
 
 int main(int argc, const char *argv[]) {
   @autoreleasepool {
-    if (argc != 2) {
+    if (argc != 2 && !(argc == 3 && std::string_view(argv[2]) == "--identity")) {
       std::cerr << "usage: gguf_moe_test <metallib>\n";
       return 2;
     }
     try {
       MetalBackend backend(argv[1]);
+      if (argc == 3) {
+        std::cout << std::unitbuf;
+        const char *value = std::getenv("SPLASH_DETERMINISTIC");
+        const auto policy = splash::ops::DeterminismPolicy::parse(value ? value : "");
+        identityMoe(backend, policy);
+        identityFloat(backend, policy);
+        return 0;
+      }
       bufferExtents(backend);
       const int failures = floatProjection(backend) + bfloat16Weights(backend) + floatSegments(backend, 64) +
                            floatSegments(backend, 96) + floatOnlyChain(backend) + moe(backend) +

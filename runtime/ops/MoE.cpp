@@ -171,7 +171,7 @@ namespace {
 // A step's grouping into tiles, which its expert passes read: the gate and up
 // passes' column tiles of a staged GGUF plan that runs them in one pass are
 // its staged columns.
-MoeGroupParams groupParams(const MoePlan &plan, uint32_t firstRow = 0, uint32_t lastRow = 0, std::span<const uint32_t> lastRows = {}, uint32_t preserveTileKind = false) {
+MoeGroupParams groupParams(const MoePlan &plan, uint32_t firstRow = 0, uint32_t lastRow = 0, std::span<const uint32_t> lastRows = {}, uint32_t preserveTileKind = 0) {
   const MoeShape shape = plan.shape();
   const bool oneGateUp = oneGateUpPass(plan);
   MoeGroupParams params{plan.rows(), shape.expertsPerToken, plan.tileRows(), shape.experts,
