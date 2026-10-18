@@ -42,6 +42,7 @@ struct NativeArguments final {
   // ~/Library/Caches/Splash/prefix-cache.
   std::filesystem::path cacheRoot;
   kv::Format kvFormat = kv::Format::Int8;
+  ops::DeterminismPolicy determinism;
   ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
   double decodeShare = EngineConfig{}.decodeShare;
   uint32_t maxImagePatches = ops::kMaximumImagePatches;

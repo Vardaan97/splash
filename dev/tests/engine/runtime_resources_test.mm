@@ -178,6 +178,10 @@ void testPersistentCacheNamespace() {
           "other models, layouts or state formats shared a cache namespace");
   // A QSA layout's pages hold token-major values and the index's pooled
   // keys, and its states the PLE history and the index's pending keys.
+  auto deterministic = identity('a', "build", kv::Format::Int8);
+  deterministic.determinism = ops::DeterminismPolicy::parse("1");
+  require(persistentCacheNamespace(deterministic, model.stateLayout) != name,
+          "deterministic cache namespace is isolated");
   RuntimeCacheIdentity tokenMajor = identity('a', "build", kv::Format::Int8), indexed = tokenMajor;
   tokenMajor.kvLayout.valuesTokenMajor = true;
   indexed.kvLayout.indexDimension = 128;

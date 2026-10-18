@@ -216,7 +216,8 @@ std::string runtimeStatusJson(
       << ",\"draining\":" << boolean(resourceWait.draining)
       << ",\"oldest_wait_ms\":" << resourceWait.oldestWaitMilliseconds << "}"
       << ",\"loop\":{\"max_tick_ms\":" << loop.maxTickMilliseconds << "}"
-      << ",\"identity\":{\"cache\":{"
+      << ",\"identity\":{\"deterministic\":" << json::quote(cacheIdentity.determinism.parts())
+      << ",\"cache\":{"
       << "\"loaded_model_layout_sha256\":"
       << json::quote(cacheIdentity.modelLayoutSha256)
       << ",\"build_id\":" << json::quote(cacheIdentity.buildId)

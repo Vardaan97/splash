@@ -1,6 +1,7 @@
 #pragma once
 
 #include "engine/Types.hpp"
+#include "ops/Determinism.hpp"
 #include "model/Model.hpp"
 
 #include <array>
@@ -66,7 +67,8 @@ class Scheduler final {
 public:
   // Decode time owed for each unit of time a prefill runs while requests of
   // equal or higher priority decode; zero alternates one command of each kind.
-  explicit Scheduler(double decodeShare) noexcept : decodeShare_(decodeShare) {}
+  explicit Scheduler(double decodeShare, ops::DeterminismPolicy policy = {}) noexcept
+      : policy_(policy), decodeShare_(decodeShare) {}
 
   void submit(RequestSpec request);
   // A prefill command of `rows` rows took wallMilliseconds, of which its GPU
@@ -163,6 +165,7 @@ private:
   // A prefill command's estimated cost: fixed, plus per row.
   double prefillFixedMilliseconds_ = 0.0;
   double prefillMillisecondsPerToken_ = 0.0;
+  ops::DeterminismPolicy policy_;
   double decodeShare_;
   // Decode time that prefill still owes the lanes that decoded beside it
   // (not those waiting for a mask): equal-priority decode runs until its

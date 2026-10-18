@@ -39,6 +39,7 @@ inline constexpr double kResourceRetryBackoffMilliseconds = 100.0;
 // vocabulary or the governor's two hooks, which the bootstrap sets from the
 // model, its memory plan and the governor (connectToGovernor).
 struct EngineConfig final {
+  ops::DeterminismPolicy determinism;
   uint32_t maxContext = 0;
   uint32_t vocabularySize = 0;
   // Patches per image the server's --max-image-pixels allows; zero rejects
