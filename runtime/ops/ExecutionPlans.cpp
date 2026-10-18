@@ -28,13 +28,13 @@ ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device, DeterminismPoli
 
 PrefillAttentionPlan ExecutionPlans::prefillAttention(
     uint32_t rows, uint32_t queryHeads, kv::Layout layout) const {
-  return PagedAttention::prefillPlan(rows, queryHeads, layout);
+  return PagedAttention::prefillPlan(rows, queryHeads, layout, policy_);
 }
 
 VerifyAttentionPlan ExecutionPlans::verifyAttention(
     uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
     std::span<const uint32_t> historyTokens) const {
-  return PagedAttention::verifyPlan(lanes, queryHeads, layout, historyTokens);
+  return PagedAttention::verifyPlan(lanes, queryHeads, layout, historyTokens, policy_);
 }
 
 DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,

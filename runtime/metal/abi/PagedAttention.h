@@ -125,7 +125,9 @@ struct SplashVerifyAttentionParams {
   // The lane's block list, which its sparse split and reduce read.
   uint32_t block_stride;
   uint32_t block_list;
+  // 0: balanced partitions; 1: absolute power-of-two groups, starting at 64 blocks.
+  uint32_t partition;
 };
 
-static_assert(sizeof(SplashVerifyAttentionParams) == 32,
-              "Verify attention parameters are 32 bytes on both sides");
+static_assert(sizeof(SplashVerifyAttentionParams) == 36,
+              "Verify attention parameters are 36 bytes on both sides");

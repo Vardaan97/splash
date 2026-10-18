@@ -131,7 +131,7 @@ inline SplashSparseList splash_sparse_list(device const uint *lists, device cons
                             page_table3),                                      \
         lane.kv, group.x, tile.first_position, tile.active_rows, list.entries, \
         list.count, tile.splits, group.y, partials, statistics,                \
-        tile.first_slot + group.y, scratch, thread_index);                     \
+        tile.first_slot + group.y, scratch, thread_index, lane.partition);                     \
   }
 SPARSE_VERIFY_SPLIT(verify_attention_q8_sparse_kv2_g12, 2, 12, int8_t)
 SPARSE_VERIFY_SPLIT(verify_attention_bf16_sparse_kv2_g12, 2, 12, bfloat)
@@ -162,7 +162,7 @@ SPARSE_VERIFY_SPLIT(verify_attention_bf16_sparse_kv2_g12, 2, 12, bfloat)
                                  tile.first_position, tile.active_rows);       \
     splash_attention_combine_splits<Group, Rows>(                              \
         partials, statistics, output + tile.offset, tile.active_rows,          \
-        splash_sparse_written_splits(count, tile.splits), tile.first_slot,     \
+        splash_sparse_written_splits(count, tile.splits, lane.partition), tile.first_slot,     \
         fused_row, thread_index, weights, group_values);                       \
   }
 SPARSE_VERIFY_REDUCE(verify_attention_sparse_reduce_kv2_g12, 2, 12)
