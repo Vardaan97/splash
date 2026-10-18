@@ -151,6 +151,7 @@ struct VerifyAttentionPlan final {
   const metal::DispatchSize reduceGroups;
   // Whether the kernels attend through block lists (AttentionBlocks).
   const bool sparse;
+  const bool absolutePartition;
 
 private:
   friend class PagedAttention;
@@ -163,11 +164,11 @@ private:
                       std::string_view splitPipeline, std::string_view reducePipeline,
                       metal::DispatchSize splitGroups, metal::DispatchSize reduceGroups,
                       bool sparse, std::string_view storePipeline, metal::DispatchSize storeGroups,
-                      metal::DispatchSize storeThreads, kv::Layout layout, uint32_t queryHeads)
+                      metal::DispatchSize storeThreads, kv::Layout layout, uint32_t queryHeads, bool absolutePartition)
       : layout(layout), queryHeads(queryHeads), lanes(lanes), laneSplits(laneSplits),
         splits(splits), workspace(workspace),
         splitPipeline(splitPipeline), reducePipeline(reducePipeline),
-        splitGroups(splitGroups), reduceGroups(reduceGroups), sparse(sparse),
+        splitGroups(splitGroups), reduceGroups(reduceGroups), sparse(sparse), absolutePartition(absolutePartition),
         storePipeline_(storePipeline), storeGroups_(storeGroups), storeThreads_(storeThreads) {}
 };
 
@@ -211,12 +212,12 @@ public:
   // The kernels read a sequence's history from its chunk parameters, so a
   // plan depends on the rows only.
   [[nodiscard]] static PrefillAttentionPlan
-  prefillPlan(uint32_t rows, uint32_t queryHeads, kv::Layout layout);
+  prefillPlan(uint32_t rows, uint32_t queryHeads, kv::Layout layout, DeterminismPolicy policy = {});
   // historyTokens holds each lane's committed tokens before its verify rows,
   // one entry per lane.
   [[nodiscard]] static VerifyAttentionPlan
   verifyPlan(uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
-             std::span<const uint32_t> historyTokens);
+             std::span<const uint32_t> historyTokens, DeterminismPolicy policy = {});
 
   // The runtime owns allocation, not the selected kernel's workspace layout.
   // Prefill storage covers every sequence length up to maximumRows; sequences

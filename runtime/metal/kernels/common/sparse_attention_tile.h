@@ -47,15 +47,20 @@ static_assert(SplashKvPageTokens % SplashSparseBlockTokens == 0,
 // SplashSparseSplitBlocks entries. It depends on the list alone, so a lane's
 // partition is its own whatever lanes run with it. Every split past the
 // written ones takes none.
-inline uint splash_sparse_split_entries(uint count, uint splits) {
+inline uint splash_sparse_split_entries(uint count, uint splits, uint partition = 0) {
+  if (partition) {
+    uint group = 64;
+    while ((count + group - 1) / group > splits) group *= 2;
+    return group;
+  }
   const uint used = clamp((count + SplashSparseSplitBlocks - 1) / SplashSparseSplitBlocks, 1u, splits);
   const uint share = (count + used - 1) / used;
   return (share + SplashSparsePartitionBlocks - 1) / SplashSparsePartitionBlocks *
          SplashSparsePartitionBlocks;
 }
 
-inline uint splash_sparse_written_splits(uint count, uint splits) {
-  const uint per_split = splash_sparse_split_entries(count, splits);
+inline uint splash_sparse_written_splits(uint count, uint splits, uint partition = 0) {
+  const uint per_split = splash_sparse_split_entries(count, splits, partition);
   return per_split ? (count + per_split - 1) / per_split : 0;
 }
 
@@ -211,7 +216,7 @@ inline void splash_sparse_attention_tile(
     device const uint *list, uint count, uint splits, uint split,
     device float *partials, device float *statistics, ulong slot,
     threadgroup SplashSparseScratch<CacheElement, RowsPerTile * QueryHeadsPerKVHead> &scratch,
-    uint thread_index) {
+    uint thread_index, uint partition = 0) {
   constexpr ushort M = RowsPerTile * QueryHeadsPerKVHead;
   constexpr ushort N = SplashSparseStep<CacheElement>::Tokens;
   constexpr uint Blocks = SplashSparseStep<CacheElement>::Blocks;
@@ -219,7 +224,7 @@ inline void splash_sparse_attention_tile(
   constexpr bool Quantized = is_same<CacheElement, int8_t>::value;
   constexpr uint AllRows = (1u << RowsPerTile) - 1u;
   static_assert(RowsPerTile <= SPLASH_ATTENTION_BLOCK_ROW_BITS, "an entry has a bit per row");
-  const uint per_split = splash_sparse_split_entries(count, splits);
+  const uint per_split = splash_sparse_split_entries(count, splits, partition);
   const uint begin = split * per_split;
   if (begin >= count)
     return;

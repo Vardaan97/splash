@@ -167,12 +167,12 @@ uint32_t prefillSplits(uint32_t tiles) {
 } // namespace
 
 PrefillAttentionPlan PagedAttention::prefillPlan(
-    uint32_t rows, uint32_t queryHeads, kv::Layout layout) {
+    uint32_t rows, uint32_t queryHeads, kv::Layout layout, DeterminismPolicy policy) {
   const KernelLayout kernel = attentionKernelLayout(queryHeads, layout);
   if (!rows || rows > kv::kChunkedPrefillMaximumRows)
     throw std::invalid_argument("invalid attention workspace rows");
   const uint32_t tiles = kv::prefillAttentionTiles(rows);
-  const uint32_t splits = prefillSplits(tiles);
+  const uint32_t splits = policy.attention ? 1u : prefillSplits(tiles);
   const uint32_t fusedRows =
       kv::kPrefillAttentionTileRows * (queryHeads / layout.kvHeads);
   return {rows, splits,
@@ -193,7 +193,7 @@ PrefillAttentionPlan PagedAttention::prefillPlan(
 
 VerifyAttentionPlan PagedAttention::verifyPlan(
     uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
-    std::span<const uint32_t> historyTokens) {
+    std::span<const uint32_t> historyTokens, DeterminismPolicy policy) {
   const KernelLayout kernel = attentionKernelLayout(queryHeads, layout);
   if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid attention workspace batch width");
@@ -229,7 +229,7 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
            kv::kVerifyRows * (queryHeads / layout.kvHeads), lanes},
           layout.valuesTokenMajor, storePipeline(layout, true),
           {uint64_t{lanes} * 2 * kv::kVerifyRows * layout.kvHeads, 1, 1},
-          {layout.headDimension, 1, 1}, layout, queryHeads};
+          {layout.headDimension, 1, 1}, layout, queryHeads, policy.attention};
 }
 
 AttentionWorkspace PagedAttention::prefillWorkspace(
@@ -461,7 +461,7 @@ void PagedAttention::addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
     stores[lane].kv = layer;
     attention[lane] = {chunk.committed_tokens, chunk.page_table_entries, layer,
                        plan.laneSplits[lane], plan.splits, blocks.stride,
-                       blocks.list + lane};
+                       blocks.list + lane, plan.absolutePartition ? 1u : 0u};
   }
   const auto &tables = buffers.pageTables;
   graph.add(std::string(plan.storePipeline_),
