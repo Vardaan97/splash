@@ -2523,7 +2523,7 @@ void requireCapturedStateKeepsItsImageRows(model::Runtime &executor,
 // in any order (an expert's tile kind follows the routes the whole step makes
 // to it).
 void requireBatchedLanesMatchReordered(model::Runtime &executor, const model::QwenStateStorage &states,
-                                       std::span<const uint32_t> seed) {
+                                       std::span<const uint32_t> seed, bool deterministic) {
   constexpr uint32_t kCycles = 2;
   constexpr uint32_t kPromptTokens = 160;
   // Request r's prompt, from its own offset into the seed, and its pages,
@@ -2543,13 +2543,26 @@ void requireBatchedLanesMatchReordered(model::Runtime &executor, const model::Qw
   };
   // Request r in lane r, or in lane width - 1 - r `reversed`, its state lane
   // its lane.
-  const auto decodeBatch = [&](uint32_t width, bool reversed, const std::string &label) {
+  const auto decodeBatch = [&](uint32_t width, bool reversed, const std::string &label, bool warm = false) {
     const auto laneOf = [&](uint32_t request) { return reversed ? width - 1 - request : request; };
     for (uint32_t request = 0; request < width; ++request) {
       EngineRequest engineRequest = makeRequest(700 + request, prompt(request), 64);
       engineRequest.flags = RequestIgnoreEndOfSequence;
       beginCold(executor, engineRequest, laneOf(request));
-      requireOpen(prefillChunk(executor, 700 + request, 0, engineRequest.prompt, pages(request)), "batched lanes");
+      if (warm) {
+        const std::array<uint32_t, 1> captures{64};
+        const auto cold = prefillChunk(executor, 700 + request, 0, engineRequest.prompt, pages(request), {}, captures);
+        requireOpen(cold, "identity cache source");
+        const auto prefix = cold.capturedStates.front();
+        executor.end(700 + request);
+        beginCold(executor, engineRequest, laneOf(request));
+        restoreActivePrefix(executor, 700 + request, kPromptTokens, 64, prefix);
+        requireOpen(prefillChunk(executor, 700 + request, 64,
+                                 std::span<const uint32_t>(engineRequest.prompt).subspan(64), pages(request)),
+                    "identity restored tail");
+      } else {
+        requireOpen(prefillChunk(executor, 700 + request, 0, engineRequest.prompt, pages(request)), "batched lanes");
+      }
     }
     Batch batch{std::vector<std::vector<std::vector<uint32_t>>>(width), {}};
     std::vector<uint64_t> positions(width, kPromptTokens);
@@ -2584,6 +2597,18 @@ void requireBatchedLanesMatchReordered(model::Runtime &executor, const model::Qw
       require(ordered.outputs[request] == reversed.outputs[request], which + " decoded other tokens in another lane");
       requireSameCommittedState(ordered.committed[request], reversed.committed[request], which + " in two lanes");
     }
+  }
+  if (deterministic) {
+    const Batch alone = decodeBatch(1, false, "identity alone");
+    const Batch cached = decodeBatch(1, false, "identity warm", true);
+    require(alone.outputs[0] == cached.outputs[0], "T7 prompt cache changed greedy tokens");
+    requireSameCommittedState(alone.committed[0], cached.committed[0], "T7 cache hit vs cold");
+    for (uint32_t width = 2; width <= 4; ++width) {
+      const Batch peers = decodeBatch(width, false, "identity different peers");
+      require(alone.outputs[0] == peers.outputs[0], "T7 different peers changed greedy tokens");
+      requireSameCommittedState(alone.committed[0], peers.committed[0], "T7 alone vs different peers");
+    }
+    std::cout << "T7 policy on: alone vs 1-3 different peers and cache hit vs cold PASS\n";
   }
   std::cout << "batched_lanes_reordered=PASS widths=2,3,4\n";
 }
@@ -2741,7 +2766,10 @@ int main(int argc, char **argv) {
         model::loadModel(backend, modelRoot, descriptor, loadOptions);
     if (loadOptions.streamedTableBytes)
       std::cout << "ple_memory=" << (model.streamedTable() ? "streamed" : "ignored") << '\n';
-    ops::ExecutionPlans operators(backend.capabilities());
+    const char *deterministicValue = std::getenv("SPLASH_DETERMINISTIC");
+    const auto determinism = ops::DeterminismPolicy::parse(deterministicValue ? deterministicValue : "");
+    determinism.requireCompatible(stateFormat == ops::GdnStateFormat::Float32, (!givenAneFfnShare || *givenAneFfnShare != 0));
+    ops::ExecutionPlans operators(backend.capabilities(), determinism);
     model::ModelMemoryPlan executorPlan =
         model::plannedRuntimeMemory(model, operators, format, stateFormat);
     // The memory plan with `aneFfnBytes` set aside for the prefill FFN's
@@ -3056,7 +3084,7 @@ int main(int argc, char **argv) {
     requireStatesCapturedInsideCommands(executor, backend, pages, states, aneFfn.get(), samplingSeedTokens);
     requireCapturesOutliveTheirItems(executor, states, samplingSeedTokens);
     requirePrefillGroupMatchesItsChunks(executor, pages, states, samplingSeedTokens);
-    requireBatchedLanesMatchReordered(executor, states, samplingSeedTokens);
+    requireBatchedLanesMatchReordered(executor, states, samplingSeedTokens, determinism.enabled());
 
 
     // Compare the active GDN state from one 16-row chunk and two M8 commits
