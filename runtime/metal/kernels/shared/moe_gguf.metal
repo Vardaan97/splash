@@ -1,6 +1,7 @@
 // GGUF MoE experts on the staged decode tile (kernels/common/gguf_staged_tile.h); the Apple9 register form is in
 // kernels/decode/linear_gguf_sgmatrix.metal.
 #pragma clang fp reassociate(off)
+#include "metal/kernels/common/gguf_column_tile.h"
 #include "metal/kernels/common/gguf_staged_tile.h"
 #include "metal/kernels/common/moe_expert_slab.h"
 
@@ -12,7 +13,10 @@
 // (decode steps, short prefill chunks) or 32-row tiles (longer chunks, ops::moeGgufPrefillTile), where a tile runs the
 // 8-, 16- or 32-row matmul that holds its live rows (moe_live_rows): an expert's last tile is mostly partial. On the
 // 35B's real prefill routes the 32-row tiles take 17-30% less time than 64-row tiles sharing one 64-column stage over
-// four 16-row simdgroups (512 and 2048 rows, 16-core M5 Pro).
+// four 16-row simdgroups (512 and 2048 rows, 16-core M5 Pro). An expert's only tile of at most MOE_GGUF_COLUMN_ROWS
+// live rows runs the column tile instead (kernels/common/gguf_column_tile.h, moe_column_tile), each lane one of the
+// simdgroup's columns over the live rows: routes spread over many experts leave most decode tiles at one or two rows,
+// where the staged tile's padded matmul steps bound it.
 template <ushort Rows, GgufEpilogue Ep>
 inline void moe_gguf_expert_tile(device bfloat *input, device const MoeTileDescriptor *tiles, device const uint *tile_count,
                                  device uchar *w0, device uchar *w1, device uchar *meta, device uchar *sw0, device uchar *sw1,
@@ -25,6 +29,17 @@ inline void moe_gguf_expert_tile(device bfloat *input, device const MoeTileDescr
   device bfloat *x = input + ulong(group.y) * Rows * p.input_size;
   const ulong out = ulong(group.y) * Rows * p.output_size;
   const uint origin = group.x * GGUF_TILE_COLUMNS + simd_group * GGUF_STAGED_COLUMNS;
+  if (moe_column_tile(tiles, group.y)) {
+    float sums[MOE_GGUF_COLUMN_ROWS];
+    column_dot_any<MOE_GGUF_COLUMN_ROWS>(s.format, x, tile.rows, p.input_size, s.w0, s.w1, s.meta, origin + simd_lane,
+                                         0, p.input_size / 32, tl, simd_group * 32 + simd_lane, GGUF_STAGED_THREADS,
+                                         sums);
+    for (uint row = 0; row < tile.rows; ++row) {
+      const ulong o = out + ulong(row) * p.output_size + origin + simd_lane;
+      output[o] = gguf_epilogue<Ep>(sums[row], aux, o);
+    }
+    return;
+  }
   threadgroup half *my = stage + simd_group * kStagedSimdgroupStage;
   const auto run = [&](auto rows) {
     constexpr ushort R = decltype(rows)::value;
@@ -74,6 +89,27 @@ template [[host_name("moe_expert_gguf_m32_g")]] kernel MoeExpertGgufKernel moe_e
 // and prefills chunks of 16 to 512 rows 1.1-5.1% faster, within noise (-1.4..+0.6%) at one lane and on 8-row chunks; a
 // 12-core M6 runs 0.5-2.7% and a 40-core M3 Max 0.9-5.5% faster. A GGUF may store a shared expert's gate and up in
 // different formats (34 of 48 layers of one 512-expert Q2_0 checkpoint).
+// The gate/up pass's column tile (moe_column_tile), out of line. Inlined, its column dots in every format grew the
+// 32-row kernel until a 10-core M4 (Apple9) under shader validation summed one element of the staged accumulator
+// wrongly (row 0, columns 1, 3, 5 and 7 of each 32-column tile of an F16 shared expert's up; gguf-moe, both shapes),
+// the same kernel right without validation, as was the kernel before the column tile and the kernel without its column
+// branch.
+__attribute__((noinline)) void moe_gate_up_column(device bfloat *x, uint rows, uint K, uint N, MoeGgufSegment s,
+                                                  uint origin, uint simd_lane, threadgroup half2 *table, bool up,
+                                                  threadgroup bfloat *gate, device bfloat *output, ulong out) {
+  float sums[MOE_GGUF_COLUMN_ROWS];
+  quant_format_switch(s.format, [&](auto f) {
+    column_dot<decltype(f), MOE_GGUF_COLUMN_ROWS>(x, rows, K, s.w0, s.w1, s.meta, origin + simd_lane, 0, K / 32, table,
+                                                  sums);
+  });
+  if (!up)
+    for (uint row = 0; row < rows; ++row) gate[row * GGUF_STAGED_COLUMNS + simd_lane] = bfloat(sums[row]);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (up)
+    for (uint row = 0; row < rows; ++row)
+      output[out + ulong(row) * N + origin + simd_lane] =
+          bfloat(float(bfloat(sums[row])) * splash_silu(float(gate[row * GGUF_STAGED_COLUMNS + simd_lane])));
+}
 template <ushort Rows, ushort Tables>
 kernel void moe_expert_gguf_gate_up(device bfloat *input [[buffer(0)]],
                                     device const MoeTileDescriptor *tiles [[buffer(1)]],
@@ -113,6 +149,10 @@ kernel void moe_expert_gguf_gate_up(device bfloat *input [[buffer(0)]],
   const uint origin = group.x * GGUF_STAGED_COLUMNS;
   threadgroup half *my = stage + simd_group * kStagedSimdgroupStage;
   threadgroup bfloat *gate = reinterpret_cast<threadgroup bfloat *>(stage);
+  if (moe_column_tile(tiles, group.y)) {
+    moe_gate_up_column(x, tile.rows, K, N, s, origin, simd_lane, table, up, gate, output, out);
+    return;
+  }
   const auto run = [&](auto rows) {
     constexpr ushort R = decltype(rows)::value;
     static_assert(R * GGUF_STAGED_COLUMNS * sizeof(bfloat) <= kStagedSimdgroupStage * sizeof(half),
