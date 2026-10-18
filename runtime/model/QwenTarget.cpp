@@ -475,7 +475,8 @@ private:
     ops::Normalization::addRms(step.graph, residual, layer.postAttentionNorm, b.normalized, geometry_.hiddenSize,
                                step.rows);
     step.ffn = {b.normalized, residual, output, b.moe};
-    ops::MoE::addRouting(step.graph, step.ffn, layer.ffn, *step.moe);
+    ops::MoE::addRouting(step.graph, step.ffn, layer.ffn, *step.moe, 0, 0, {},
+                         operators_.determinism().moe ? 2u : 0u);
   }
 
   void addVerifyFfn(VerifyStep &step, const Qwen3_8LayerWeights &layer, metal::MetalBuffer residual,
@@ -501,7 +502,8 @@ private:
     const QwenTargetVerifyBuffers &b = step.buffers;
     ops::Normalization::addRms(step.graph, residual, layer.postAttentionNorm, b.normalized, geometry_.hiddenSize,
                                step.rows);
-    ops::MoE::add(step.graph, {b.normalized, residual, output, b.moe}, layer.ffn, *step.moe);
+    ops::MoE::add(step.graph, {b.normalized, residual, output, b.moe}, layer.ffn, *step.moe, 0, 0, {},
+                  operators_.determinism().moe ? 2u : 0u);
   }
 
   const QwenTargetWeights<Layout, Layer> &weights_;

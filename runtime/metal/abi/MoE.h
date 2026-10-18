@@ -7,6 +7,8 @@
 #include <stdint.h>
 #endif
 
+#include "ExecutionGeometry.h"
+
 // The expert slots of the routing kernels (ops::MoE): a row's router scores
 // take this many floats, the block's experts first, and the select and
 // grouping kernels run one thread per slot. A MoE block of at most
@@ -35,10 +37,11 @@ static_assert(sizeof(MoeRouteParams) == 16,
 struct MoeTileDescriptor {
   uint32_t expert;
   uint32_t rows;
+  uint32_t reference_rows; // Nonzero pins the staged arithmetic.
 };
 
-static_assert(sizeof(MoeTileDescriptor) == 8,
-              "MoE tile descriptors are 8 bytes on both sides");
+static_assert(sizeof(MoeTileDescriptor) == 12,
+              "MoE tile descriptors are 12 bytes on both sides");
 
 // The staged GGUF expert passes (kernels/shared/moe_gguf.metal) run an
 // expert's only tile of at most this many live rows on the column tile, which
@@ -54,11 +57,17 @@ static_assert(sizeof(MoeTileDescriptor) == 8,
 // tiles all ask this.
 template <typename Tiles>
 inline bool moe_column_tile(Tiles tiles, uint32_t t) {
+  if (tiles[t].reference_rows) return tiles[t].reference_rows <= MOE_GGUF_COLUMN_ROWS;
   return tiles[t].rows <= MOE_GGUF_COLUMN_ROWS && (t == 0 || tiles[t - 1].expert != tiles[t].expert);
 }
 
 // The column tiles of the gate/up and down passes, whose grids the grouping
-// writes (MoeTileCount).
+// writes (MoeTileCount). With `lane_rows`, the rows of each lane_rows rows
+// before `first_row`, and from `last_row` on when it is set, route to no
+// expert: their routes are left out of the tiles and their routed outputs
+// read their shared expert's row (ops::MoE::add firstRow and lastRow, the
+// rows of an MTP draft step that repeat a step before and a verify's rows
+// past the proposals the head drafted). Zero lane_rows routes every row.
 struct MoeGroupParams {
   uint32_t rows;
   uint32_t top_k;
@@ -66,10 +75,16 @@ struct MoeGroupParams {
   uint32_t experts;
   uint32_t gate_up_columns;
   uint32_t down_columns;
+  uint32_t lane_rows;
+  uint32_t first_row;
+  uint32_t last_row;
+  // A nonzero lane bound overrides last_row; zero uses the scalar bound.
+  uint32_t last_rows[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t preserve_tile_kind; // 0 occupancy choice; 2 staged everywhere.
 };
 
-static_assert(sizeof(MoeGroupParams) == 24,
-              "MoE grouping parameters are 24 bytes on both sides");
+static_assert(sizeof(MoeGroupParams) == 56,
+              "MoE grouping parameters are 56 bytes on both sides");
 
 // What the grouping writes besides the tiles: their count, which every pass
 // over them reads first, and the grids (column tiles, tiles, 1) of the
