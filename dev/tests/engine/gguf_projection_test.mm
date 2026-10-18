@@ -1005,17 +1005,19 @@ void identityProjections(MetalBackend &backend, DeterminismPolicy policy) {
       Projection p = projection({&weights}, N);
       if (N == 248320) p.destination = FloatOutput::Float32;
       const uint32_t rowBytes = N * elementBytes(p.destination);
+      Projection prefillProjection = p; prefillProjection.destination = FloatOutput::BFloat16;
       const auto x = activations(Inputs::Dense, maximum, K);
       for (const uint32_t family : {9U, 10U}) {
         auto device = backend.capabilities(); device.appleGpuFamily = family; device.gpuCoreCount = 40;
         const Linear linear(device, policy);
         const auto project = [&](const LinearPlan &plan) {
+          const uint64_t outputRowBytes = N * elementBytes(plan.destination());
           const Scratch scratch(backend, plan.scratchSize());
           const auto input = bfloats(backend, storageRows(x, K, plan.workload().rows, plan.storageRows()));
-          const Guarded output(backend, uint64_t{plan.storageRows()} * rowBytes, 0xff);
+          const Guarded output(backend, uint64_t{plan.storageRows()} * outputRowBytes, 0xff);
           scratch.poison(kPoisonNaN);
           CommandGraph graph;
-          (void)linear.add(graph, {.input = input.view, .output = output.view, .scratch = scratch.bindings()}, p, plan);
+          (void)linear.add(graph, {.input = input.view, .output = output.view, .scratch = scratch.bindings()}, plan.workload().phase == LinearPhase::Prefill ? prefillProjection : p, plan);
           (void)backend.submitCommandAsync(graph.dispatches()).wait();
           if (!scratch.intact() || !input.intact() || !output.intact()) fail("T2 scratch or output guard changed");
           const auto *bytes = static_cast<const uint8_t *>(output.view.contents());
@@ -1032,14 +1034,14 @@ void identityProjections(MetalBackend &backend, DeterminismPolicy policy) {
                                             decode.begin() + uint64_t{row} * rowBytes);
           }
         }
-        const auto prefill = project(linear.prefillPlan(p, maximum, LinearEpilogue::None));
+        const auto prefill = project(linear.prefillPlan(prefillProjection, maximum, LinearEpilogue::None));
         for (uint32_t rows = 1; rows <= 300; ++rows) {
-          const auto got = project(linear.prefillPlan(p, rows, LinearEpilogue::None));
+          const auto got = project(linear.prefillPlan(prefillProjection, rows, LinearEpilogue::None));
           for (uint32_t row = 0; row < rows; ++row) {
             ++compared;
-            differentPrefill += !std::equal(got.begin() + uint64_t{row} * rowBytes,
-                                             got.begin() + uint64_t{row + 1} * rowBytes,
-                                             prefill.begin() + uint64_t{row} * rowBytes);
+            differentPrefill += !std::equal(got.begin() + uint64_t{row} * (N * 2),
+                                             got.begin() + uint64_t{row + 1} * (N * 2),
+                                             prefill.begin() + uint64_t{row} * (N * 2));
           }
         }
         std::cout << "T2 policy=" << policy.parts() << " family=" << family << " N=" << N << " K=" << K

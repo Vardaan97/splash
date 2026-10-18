@@ -93,7 +93,7 @@ void Qwen4ExpTarget::addPrefillMix(PrefillStep &step, const Qwen4HyperWeights &h
   const ops::Linear &linear = operators_.linear();
   const ops::HyperShape hs = hyperShape(geometry_);
   ops::HyperConnection::addNorm(step.graph, streams ? streams : h.streams, hyper.norm, hyper.inject, h.normalized, h.weights, hs,
-                                step.rows);
+                                step.rows, {}, ops::LinearInput::Plain, operators_.determinism());
   linear.addPrefill(step.graph, h.normalized, hyper.down, h.low, step.rows, b.linearScratch);
   ops::HyperConnection::addLow(step.graph, h.low, hs, step.rows);
   linear.addPrefill(step.graph, h.low, hyper.up, h.gate, step.rows, b.linearScratch);
@@ -255,7 +255,7 @@ ops::PreparedInput Qwen4ExpTarget::addVerifyMix(VerifyStep &step, const Qwen4Hyp
   const ops::HyperShape hs = hyperShape(geometry_);
   ops::PreparedInput prepared =
       ops::HyperConnection::addNorm(step.graph, streams ? streams : h.streams, hyper.norm, hyper.inject, h.normalized, h.weights, hs,
-                                    step.rows, scratch, decodeInput(hyper.down, step.lanes));
+                                    step.rows, scratch, decodeInput(hyper.down, step.lanes), operators_.determinism());
   addDecodeProjection(step.graph, h.normalized, hyper.down, h.low, step.lanes, scratch, std::move(prepared));
   prepared = ops::HyperConnection::addLow(step.graph, h.low, hs, step.rows, scratch, decodeInput(hyper.up, step.lanes));
   addDecodeProjection(step.graph, h.low, hyper.up, h.gate, step.lanes, scratch, std::move(prepared));

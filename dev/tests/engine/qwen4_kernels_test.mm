@@ -328,10 +328,8 @@ void hyperNormKernelsTest(MetalBackend &backend, bool exact) {
     return ops::LinearScratch{zeroed(ops::tableBytes(width, rows)),
                               zeroed(ops::tableSumsBytes(ops::LinearInput::Table16, width, rows)), {}, {}};
   };
-  std::vector<uint16_t> identityNorm;
-  std::vector<float> identityWeights;
   bool okKernels = true, okPlain = true, okTables = true;
-  for (const uint32_t rows : {512u, 1u, 3u, 8u, 16u, 24u, 32u, 64u, 65u, 128u, 136u, 256u}) {
+  for (const uint32_t rows : {1u, 3u, 8u, 16u, 24u, 32u, 64u, 65u, 128u, 136u, 256u, 512u}) {
     // addNorm's kernel, and the other one on the same rows.
     const bool quarters = rows <= HYPER_CONNECTION_NORM_QUARTER_ROWS;
     const std::string other = quarters ? "hyper_connection_norm_loaded" : "hyper_connection_norm_quarters";
@@ -359,20 +357,6 @@ void hyperNormKernelsTest(MetalBackend &backend, bool exact) {
     }
     run(backend, graph);
     const uint64_t rowBytes = uint64_t{rows} * width * 2, weightBytes = uint64_t{rows} * streams * 4;
-    if (std::getenv("SPLASH_IDENTITY_KERNEL_TEST")) {
-      const auto norm = download<uint16_t>(normalized, uint64_t{rows} * width);
-      const auto mix = download<float>(weights, uint64_t{rows} * streams);
-      if (identityNorm.empty()) { identityNorm = norm; identityWeights = mix; }
-      else {
-        uint32_t different = 0;
-        for (uint32_t r = 0; r < rows; ++r)
-          different += !std::equal(norm.begin() + uint64_t{r} * width, norm.begin() + uint64_t{r + 1} * width,
-                                   identityNorm.begin() + uint64_t{r} * width) ||
-                       std::memcmp(mix.data() + r * streams, identityWeights.data() + r * streams, streams * 4) != 0;
-        check(different == 0, "T6 hyper norm across row counts differing_rows=" + std::to_string(different));
-      }
-    }
-
     const bool kernels = same(normalized, normalizedOther, rowBytes) && same(weights, weightsOther, weightBytes, true);
     okKernels &= kernels;
     if (!kernels) std::cout << "  the kernels differ at " << rows << " rows\n";
@@ -393,6 +377,54 @@ void hyperNormKernelsTest(MetalBackend &backend, bool exact) {
   check(okKernels, "hyper norm: the quarters and loaded kernels' output and weights " + how);
   check(okPlain, "hyper norm without injection: normalized rows " + how + " the injecting mix's");
   check(okTables, "hyper norm tables: the quarters and loaded kernels' output, weights and tables " + how);
+}
+
+void identityHyperNorm(MetalBackend &backend, ops::DeterminismPolicy policy) {
+  std::mt19937 rng(13);
+  constexpr uint32_t maximum = 2048, width = kHidden * kStreams;
+  const ops::HyperShape shape{kHidden, kStreams, kRank};
+  const auto xs = upload(backend, randoms(rng, uint64_t{maximum} * width, 1.5f));
+  auto nw = randoms(rng, width, 0.3f); for (float &v : nw) v += 1.0f;
+  const NormWeights norm{upload(backend, nw), true};
+  const auto inject = upload(backend, randoms(rng, kStreams * width, 0.02f));
+  for (bool injects : {false, true}) {
+    for (const auto layout : {ops::LinearInput::Plain, ops::LinearInput::Table16}) {
+      std::vector<uint16_t> reference;
+      std::vector<float> referenceWeights;
+      uint64_t different = 0, compared = 0;
+      const std::vector<uint32_t> counts = layout == ops::LinearInput::Plain
+          ? std::vector<uint32_t>{2048, 1, 3, 8, 16, 24, 32, 64, 65, 128, 136, 256, 512}
+          : std::vector<uint32_t>{32, 8, 16, 24};
+      for (uint32_t rows : counts) {
+        const auto output = scratch(backend, uint64_t{rows} * width * 2);
+        const auto weights = scratch(backend, uint64_t{rows} * kStreams * 4);
+        ops::LinearScratch table;
+        if (layout != ops::LinearInput::Plain) {
+          table.input = scratch(backend, ops::tableBytes(width, rows));
+          table.sums = scratch(backend, ops::tableSumsBytes(layout, width, rows));
+        }
+        CommandGraph graph;
+        (void)ops::HyperConnection::addNorm(graph, xs, norm, injects ? inject : MetalBuffer{}, output, weights,
+                                            shape, rows, table, layout, policy);
+        run(backend, graph);
+        const auto values = download<uint16_t>(output, uint64_t{rows} * width);
+        const auto mix = injects ? download<float>(weights, uint64_t{rows} * kStreams)
+                                : std::vector<float>(uint64_t{rows} * kStreams, 0.0f);
+        if (reference.empty()) { reference = values; referenceWeights = mix; continue; }
+        for (uint32_t r = 0; r < rows; ++r) {
+          ++compared;
+          different += !std::equal(values.begin() + uint64_t{r} * width, values.begin() + uint64_t{r + 1} * width,
+                                   reference.begin() + uint64_t{r} * width) ||
+                       (injects && std::memcmp(mix.data() + r * kStreams, referenceWeights.data() + r * kStreams,
+                                               kStreams * 4) != 0);
+        }
+      }
+      std::cout << "T6 hyper norm policy=" << policy.parts() << " inject=" << injects
+                << " table=" << (layout != ops::LinearInput::Plain) << " compared=" << compared
+                << " differing_rows=" << different << '\n';
+      if (policy.floatTile) check(different == 0, "deterministic hyper norm row invariance");
+    }
+  }
 }
 
 void pleTest(MetalBackend &backend) {
@@ -681,6 +713,8 @@ void qsaTest(MetalBackend &backend, QsaCase c) {
                            pendingAfter);
   run(backend, graph);
 
+  std::vector<std::vector<uint16_t>> committedPending;
+  for (const auto &pending : pendingAfter) committedPending.push_back(download<uint16_t>(pending, kQsaPendingBytes / 2));
   if (std::getenv("SPLASH_IDENTITY_KERNEL_TEST")) {
     const auto originalQueries = download<uint16_t>(queries, uint64_t{laneRows} * H * D);
     const auto originalMasks = download<uint32_t>(mask, uint64_t{laneRows} * words);
@@ -784,7 +818,7 @@ void qsaTest(MetalBackend &backend, QsaCase c) {
     }
     // The tokens of the block the retained rows leave open, then zeros.
     const uint32_t end = x.first + retained[l], open = end / 4 * 4;
-    const auto gotPending = download<uint16_t>(pendingAfter[l], kQsaPendingBytes / 2);
+    const auto &gotPending = committedPending[l];
     for (uint32_t slot = 0; slot < QWEN4_QSA_PENDING; ++slot)
       for (uint32_t d = 0; d < D; ++d)
         okCommit &= gotPending[slot * D + d] ==
@@ -1495,7 +1529,8 @@ int main(int argc, const char *argv[]) {
       MetalBackend backend(argv[1]);
       if (identity) {
         setenv("SPLASH_IDENTITY_KERNEL_TEST", "1", 1);
-        hyperNormKernelsTest(backend, true);
+        const char *value = std::getenv("SPLASH_DETERMINISTIC");
+        identityHyperNorm(backend, ops::DeterminismPolicy::parse(value ? value : ""));
         pleTest(backend);
         qsaTest(backend, {2050, 8, 512, 0, 4, 17});
         qsaTest(backend, {2061, 16, 512, 0, 1, 31});

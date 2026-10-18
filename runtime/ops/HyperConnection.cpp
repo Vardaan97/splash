@@ -36,7 +36,7 @@ void HyperConnection::addInit(metal::CommandGraph &graph, metal::MetalBuffer emb
 PreparedInput HyperConnection::addNorm(metal::CommandGraph &graph, metal::MetalBuffer streams,
                                        const NormWeights &norm, metal::MetalBuffer inject,
                                        metal::MetalBuffer normalized, metal::MetalBuffer weights, HyperShape shape,
-                                       uint32_t rows, LinearScratch scratch, LinearInput layout) {
+                                       uint32_t rows, LinearScratch scratch, LinearInput layout, DeterminismPolicy policy) {
   requireShape(shape);
   if (shape.streams != HYPER_CONNECTION_MAXIMUM_STREAMS || shape.hidden != HYPER_CONNECTION_NORM_HIDDEN)
     throw std::invalid_argument("no hyper-connection norm kernel for the shape");
@@ -46,7 +46,7 @@ PreparedInput HyperConnection::addNorm(metal::CommandGraph &graph, metal::MetalB
                                            injects ? weights : norm.buffer};
   // An injecting mix of decode's few rows runs a threadgroup of a quarter per
   // stream each, the rest one of kThreads (kernels/shared/hyper_connection.metal).
-  const bool quarters = injects && rows <= HYPER_CONNECTION_NORM_QUARTER_ROWS;
+  const bool quarters = !policy.floatTile && injects && rows <= HYPER_CONNECTION_NORM_QUARTER_ROWS;
   const std::string name = quarters ? "hyper_connection_norm_quarters" : "hyper_connection_norm_loaded";
   const uint32_t threads = quarters ? HYPER_CONNECTION_NORM_QUARTER_THREADS : kThreads;
   if (layout == LinearInput::Plain) {
