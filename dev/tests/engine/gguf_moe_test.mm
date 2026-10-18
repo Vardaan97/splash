@@ -1087,7 +1087,7 @@ void identityMoe(MetalBackend &backend, splash::ops::DeterminismPolicy policy) {
   uint64_t compared = 0, different = 0, across = 0;
   struct Result { std::vector<uint16_t> output; std::vector<bool> column; };
   const auto execute = [&](const MoePlan &plan, const std::vector<uint32_t> &order,
-                           uint32_t first = 0, uint32_t last = 0, std::span<const uint32_t> ends = {}) {
+                           uint32_t first = 0, uint32_t last = 0, std::span<const uint32_t> ends = {}, bool defaultMode = false) {
     Buffers b;
     std::vector<float> input, res;
     for (uint32_t row : order) {
@@ -1099,11 +1099,11 @@ void identityMoe(MetalBackend &backend, splash::ops::DeterminismPolicy policy) {
     b.moe.output = zeros(backend, uint64_t{order.size()} * hidden * 2, "identity-output");
     allocate(backend, b, plan);
     CommandGraph graph;
-    MoE::add(graph, b.moe, weights, plan, first, last, ends, policy.moe ? 2u : 0u);
+    MoE::add(graph, b.moe, weights, plan, first, last, ends, policy.moe && !defaultMode ? 2u : 0u);
     (void)backend.submitCommandAsync(graph.dispatches()).wait();
     const auto *tiles = static_cast<const MoeTileDescriptor *>(b.moe.scratch.tileDescriptors.contents());
     const uint32_t count = *static_cast<const uint32_t *>(b.moe.scratch.tileCount.contents());
-    if (policy.moe)
+    if (policy.moe && !defaultMode)
       for (uint32_t t = 0; t < count; ++t)
         require(tiles[t].reference_rows == 0xffffffffu, "identity routed/shared tile missed staged sentinel");
     Result result;
@@ -1117,6 +1117,14 @@ void identityMoe(MetalBackend &backend, splash::ops::DeterminismPolicy policy) {
   };
   std::vector<uint32_t> order(total); std::iota(order.begin(), order.end(), 0);
   const auto whole = execute(plans.moePrefill(shape, total), order);
+  if (policy.moe) {
+    const auto baseline = execute(plans.moePrefill(shape, total), order, 0, 0, {}, true);
+    require(std::none_of(baseline.column.begin(), baseline.column.end(), [](bool v) { return v; }),
+            "full-occupancy identity reference unexpectedly chose a column tile");
+    require(whole.output == baseline.output, "forced staged MoE changed the full-occupancy default output");
+    std::cout << "T1 forced staged vs full-occupancy default bitwise PASS\n";
+  }
+
   const auto compare = [&](const Result &a, const Result &b, const std::vector<uint32_t> &indices,
                            uint32_t first = 0, uint32_t last = 0, std::span<const uint32_t> ends = {}) {
     for (uint32_t row = 0; row < indices.size(); ++row) {
