@@ -321,8 +321,11 @@ Scheduler::planPrefill(std::vector<PrefillRequestView> ready) const {
     if (!budget || view.request->spec.priority != selectedPriority ||
         plan.width() == model::ExecutionLimits::maximumBatchWidth)
       break;
-    const uint32_t rows =
-        std::min(view.request->spec.prefillTokens - view.promptProcessed, budget);
+    const uint32_t remaining = view.request->spec.prefillTokens - view.promptProcessed;
+    uint32_t rows = std::min(remaining, budget);
+    if (policy_.align && rows < remaining)
+      rows -= rows % SPLASH_PREFILL_ATTENTION_TILE_ROWS;
+    if (!rows) continue;
     plan.items.push_back(
         {view.request->spec.id, rows, view.promptProcessed});
     budget -= rows;
