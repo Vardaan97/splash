@@ -3207,3 +3207,15 @@ while a server runs. Running it again upgrades; installed models stay. To try
 an archive before uploading it, serve `dist/` (`python3 -m http.server`) and
 run the installer with `SPLASH_BASE_URL` naming that server, `SPLASH_VERSION`
 and any `SPLASH_TOKEN`.
+
+`SPLASH_DETERMINISTIC=1` (or `all`) enables the opt-in greedy identity policy;
+`0` or unset preserves the default arithmetic. A comma list of `moe,dense,prefill,float,attention,align`
+selects individual parts for diagnosis. Startup reports the canonical parts in its log and
+`/status` at `identity.deterministic`, and requires fp32 recurrent state and `--disable-ane`.
+The policy pins trunk expert tile kinds, dense decode width, short prefill K partitions,
+float tiles and attention partitions, and aligns non-final prefill chunks. It targets batch,
+draft and prompt-cache invariance for Flash-Next on Apple9/Apple10 with int8 or bf16 KV
+in the dense QSA regime (up to 2048 tokens); verify partitions remain position-invariant
+up to 32K tokens. Sparse QSA unions, reuse inside previously generated history, sampled
+decoding and other model families are outside this guarantee. Performance costs await
+owner-window measurements; no speed claim is made from untimed correctness tests.
