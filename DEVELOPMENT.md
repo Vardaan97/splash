@@ -2290,9 +2290,11 @@ expert, so decode results of GGUF MoE targets on the staged tile, the 35B's incl
 invariant to the batch (`kernels/common/moe_expert_slab.h`). Which rows a decode step routes also
 follows the verify budget ([Drafts](#drafts)), which learns from timing and earlier requests, so a
 MoE target's decode results can differ between runs of one request.
-The float router and alpha/beta projections run in `kernels/shared/gguf_float.metal`, and the
-token rows are gathered by one template in `kernels/shared/embedding.metal`. These plans are
-fixed rules of GPU family, core count, shape and format.
+The float router, QSA indexer and alpha/beta projections run in `kernels/shared/gguf_float.metal`,
+which runs two projections of one input in one dispatch where they take the same tile (the
+indexer's query and key, each on the tile of its own width), and the token rows are gathered by
+one template in `kernels/shared/embedding.metal`. These plans are fixed rules of GPU family, core
+count, shape and format.
 
 A rotated projection rotates its input once into `LinearScratch::rotated`
 (`gguf_rotate`, in fp32 and rounded once to bf16) before its quantized segments,
