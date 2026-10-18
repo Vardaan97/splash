@@ -82,7 +82,8 @@ void deterministicPlans() {
                               LinearMatrix{2560, 6144}, LinearMatrix{248320, 2560},
                               LinearMatrix{320, 10240}, LinearMatrix{10240, 320},
                               LinearMatrix{10240, 3840}, LinearMatrix{2560, 3840}, LinearMatrix{2560, 5120}})
-      for (const uint32_t format : {GGUF_FMT_Q80, GGUF_FMT_Q4K, GGUF_FMT_Q5K, GGUF_FMT_Q6K, GGUF_FMT_BF16}) {
+      for (const uint32_t format : {GGUF_FMT_Q80, GGUF_FMT_Q4K, GGUF_FMT_Q5K, GGUF_FMT_Q6K, GGUF_FMT_BF16,
+                                    GGUF_FMT_Q2K, GGUF_FMT_IQ2XXS}) {
         if (matrix.inputSize % quant_column_unit(kQuantFormats[format].block_elements)) continue;
         const auto p = blockProjection(matrix.outputSize, matrix.inputSize, 1, format);
         const auto wide = pinned.decodePlan(p, 4);
