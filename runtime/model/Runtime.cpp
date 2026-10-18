@@ -5,6 +5,7 @@
 #include "model/Qwen4DraftContext.hpp"
 #include "model/Qwen4Exp.hpp"
 #include "model/Qwen4Steps.hpp"
+#include "model/Qwen4PlePrefetch.hpp"
 #include "AwakeClock.hpp"
 #include "model/QwenState.hpp"
 #include "model/QwenTarget.hpp"
@@ -531,21 +532,10 @@ struct Runtime::Impl {
     // Each lane's position and the tokens its proposals' n-grams reach
     // back to (its anchor included), which the listener hashes with the
     // proposals it finds in the copy.
-    struct Lane final {
-      uint64_t position;
-      std::vector<uint32_t> history;
-    };
-    std::vector<Lane> laneInputs;
-    const size_t reach = geometry.target.pleNgram;
-    for (uint32_t lane = 0; lane < lanes; ++lane) {
-      const Request &entry = *entries[lane];
-      const uint64_t position = items[lane].logicalPosition;
-      std::vector<uint32_t> history(entry.tokens.begin() + std::min<size_t>(entry.tokens.size(), position) -
-                                        std::min<size_t>(position, reach),
-                                    entry.tokens.begin() + std::min<size_t>(entry.tokens.size(), position));
-      history.push_back(*entry.pendingToken);
-      laneInputs.push_back({position + 1, std::move(history)});
-    }
+    std::vector<Qwen4PlePrefetchInput> laneInputs;
+    for (uint32_t lane = 0; lane < lanes; ++lane)
+      laneInputs.push_back(qwen4PlePrefetchInput(items[lane].logicalPosition, entries[lane]->tokens,
+                                               *entries[lane]->pendingToken, geometry.target.pleNgram));
     auto done = std::make_shared<std::promise<void>>();
     plePrefetched = done->get_future();
     plePrefetchEvent.notify(
