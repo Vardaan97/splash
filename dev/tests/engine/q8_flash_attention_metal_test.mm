@@ -37,16 +37,17 @@ struct Shape {
   uint32_t kvHeads;
   uint32_t queryHeadsPerKvHead;
   const char *suffix;
+  bool bfloat = false;
   uint32_t queryHeads() const { return kvHeads * queryHeadsPerKvHead; }
   uint32_t fusedRows() const { return kRows * queryHeadsPerKvHead; }
   bool sparse() const { return queryHeadsPerKvHead == 12; }
   Layout layout() const {
     return {.attentionLayers = 1, .kvHeads = kvHeads, .headDimension = kHeadDimension,
-            .valuesTokenMajor = sparse()};
+            .format = bfloat ? Format::BFloat16 : Format::Int8, .valuesTokenMajor = sparse()};
   }
   // A phase's ("verify" or "prefill") split and reduce entries.
   std::string split(const char *phase) const {
-    return std::string(phase) + (sparse() ? "_attention_q8_sparse" : "_attention_q8_split") + suffix;
+    return std::string(phase) + (bfloat ? "_attention_bf16_sparse" : (sparse() ? "_attention_q8_sparse" : "_attention_q8_split")) + suffix;
   }
   std::string reduce(const char *phase) const {
     return std::string(phase) + (sparse() ? "_attention_sparse_reduce" : "_attention_reduce") + suffix;
@@ -167,6 +168,7 @@ struct Case {
   // maskWords is 0.
   std::vector<uint32_t> mask;
   uint32_t maskWords = 0;
+  uint32_t queryStride = kQueryStride;
 
   bool attends(uint32_t row, uint32_t token) const {
     if (!maskWords) return true;
@@ -177,7 +179,7 @@ struct Case {
   uint64_t queryIndex(uint32_t head, uint32_t row, uint32_t dimension) const {
     const uint32_t kvHead = head / shape.queryHeadsPerKvHead;
     const uint32_t localHead = head % shape.queryHeadsPerKvHead;
-    return ((uint64_t{kvHead} * kQueryStride + row) * shape.queryHeadsPerKvHead +
+    return ((uint64_t{kvHead} * queryStride + row) * shape.queryHeadsPerKvHead +
             localHead) *
                kHeadDimension +
            dimension;
@@ -211,10 +213,11 @@ Case makeCase(id<MTLDevice> device, Shape shape, uint32_t committed,
   result.pageTable = HostKvExtents::mixedPages(spread, pages, committed + activeRows);
   result.pageTableBuffer = makeBuffer(device, pages * sizeof(SplashKvPage));
   result.pool->writeTable(result.pageTable, result.pageTableBuffer.contents);
-  result.params = {committed, activeRows, kStride, pages,
+  result.queryStride = std::max(kStride, (activeRows + 31) / 32 * 32);
+  result.params = {committed, activeRows, result.queryStride, pages,
                    result.pool->layer(kLayer), splits, 0, 0};
   uint64_t queryElements =
-      uint64_t{shape.queryHeads()} * kQueryStride * kHeadDimension;
+      uint64_t{shape.queryHeads()} * result.queryStride * kHeadDimension;
   result.queries = makeBuffer(device, queryElements * sizeof(BFloat16Bits));
   return result;
 }
@@ -341,6 +344,17 @@ void fill(Case &data) {
               floatToBFloat16(valuePattern(global, head, dimension)));
         }
       }
+    }
+    if (shape.bfloat) {
+      for (uint32_t head = 0; head < shape.kvHeads; ++head)
+        for (uint32_t token = 0; token < valid; ++token)
+          for (uint32_t dimension = 0; dimension < kHeadDimension; ++dimension) {
+            data.slab<BFloat16Bits>(SPLASH_KV_KEYS, logicalPage)[splash_kv_key_element(head, token, dimension)] =
+                floatToBFloat16(pageKeys[logicalIndex(token, head, dimension)]);
+            data.slab<BFloat16Bits>(SPLASH_KV_VALUES, logicalPage)[data.pool->valueElement(head, token, dimension)] =
+                floatToBFloat16(pageValues[logicalIndex(token, head, dimension)]);
+          }
+      continue;
     }
     quantizeLayerPage(pageKeys, pageValues, valid, *quantized);
     const uint64_t elements = layout.elementsPerLayerPage();
@@ -490,7 +504,7 @@ std::vector<uint8_t> copyOf(id<MTLBuffer> buffer) {
 Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
                   id<MTLComputePipelineState> split,
                   id<MTLComputePipelineState> reduce, const Case &data,
-                  uint32_t width) {
+                  uint32_t width, uint32_t partition = 0) {
   const Shape shape = data.shape;
   const uint32_t splits = data.params.split_count;
   require(data.params.rows == kRows, "a verify lane attends all its rows");
@@ -512,7 +526,7 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
   std::array<VerifyAttentionParams, 4> params{};
   for (uint32_t lane = 0; lane < params.size(); ++lane)
     params[lane] = {data.params.committed_tokens, data.params.page_table_entries, data.params.kv, splits, splits,
-                    blocks.stride, blocks.stride ? kQsaJunkLists + lane : 0, 0};
+                    blocks.stride, blocks.stride ? kQsaJunkLists + lane : 0, partition};
   id<MTLCommandBuffer> command = [queue commandBuffer];
   id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
   [encoder setComputePipelineState:split];
@@ -560,7 +574,8 @@ Dispatch dispatchPrefill(id<MTLDevice> device, id<MTLCommandQueue> queue,
   const Shape shape = data.shape;
   const uint32_t splits = data.params.split_count;
   id<MTLBuffer> output = makeBuffer(device, data.queries.length);
-  const uint64_t slots = uint64_t{shape.kvHeads} * splits;
+  const uint32_t tiles = splash::kv::prefillAttentionTiles(data.params.rows);
+  const uint64_t slots = uint64_t{shape.kvHeads} * splits * tiles;
   id<MTLBuffer> partials = makeBuffer(
       device, slots * shape.fusedRows() * kHeadDimension * sizeof(float));
   id<MTLBuffer> statistics =
@@ -587,7 +602,7 @@ Dispatch dispatchPrefill(id<MTLDevice> device, id<MTLCommandQueue> queue,
   [encoder setBytes:&params length:sizeof(params) atIndex:paramsIndex];
   for (id<MTLBuffer> extent : data.extents)
     [encoder useResource:extent usage:MTLResourceUsageRead];
-  [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads, 1, splits)
+  [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads, tiles, splits)
           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   [encoder setComputePipelineState:reduce];
   [encoder setBuffer:partials offset:0 atIndex:0];
@@ -597,7 +612,7 @@ Dispatch dispatchPrefill(id<MTLDevice> device, id<MTLCommandQueue> queue,
   if (shape.sparse())
     [encoder setBuffer:blocks.counts offset:0 atIndex:paramsIndex++];
   [encoder setBytes:&params length:sizeof(params) atIndex:paramsIndex];
-  [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads, shape.fusedRows(), 1)
+  [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads, shape.fusedRows(), tiles)
           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   [encoder endEncoding];
   finish(command);
@@ -898,7 +913,85 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
   }
 }
 
-void run(const char *libraryPath) {
+void identityAttention(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLLibrary> library,
+                        splash::ops::DeterminismPolicy policy) {
+  uint64_t compared = 0, differentPrefill = 0, differentVerify = 0, differentLists = 0;
+  for (bool bfloat : {false, true}) {
+    const Shape shape{2, 12, "_kv2_g12", bfloat};
+    const auto pipelines = makePipelines(device, library, shape);
+    const auto absoluteQueries = [](Case &data) {
+      auto *q = static_cast<BFloat16Bits *>(data.queries.contents);
+      for (uint32_t h = 0; h < data.shape.queryHeads(); ++h)
+        for (uint32_t r = 0; r < data.params.rows; ++r)
+          for (uint32_t d = 0; d < kHeadDimension; ++d)
+            q[data.queryIndex(h, r, d)] = floatToBFloat16(queryPattern(data.params.committed_tokens + r, h, d));
+    };
+    const auto row = [](const Case &data, const Dispatch &result, uint32_t r, uint32_t lane = 0) {
+      std::vector<uint8_t> bytes;
+      for (uint32_t h = 0; h < data.shape.queryHeads(); ++h) {
+        const auto offset = lane * data.queries.length + data.queryIndex(h, r, 0) * 2;
+        bytes.insert(bytes.end(), result.output.begin() + offset,
+                     result.output.begin() + offset + kHeadDimension * 2);
+      }
+      return bytes;
+    };
+    constexpr uint32_t total = 1100;
+    const auto prefillCase = [&](uint32_t start, uint32_t rows) {
+      const auto plan = splash::ops::PagedAttention::prefillPlan(rows, 24, shape.layout(), policy);
+      auto data = makeCase(device, shape, start, rows, plan.splits);
+      fill(data); absoluteQueries(data); return data;
+    };
+    const auto whole = prefillCase(0, total);
+    const auto wholeOutput = dispatchPrefill(device, queue, pipelines.prefillSplit, pipelines.prefillReduce, whole);
+    const std::vector<std::vector<uint32_t>> cuts{
+        {32, 1068}, {736, 17, 347}, {8, 24, 72, 256, 16, 512, 212},
+        {1, 7, 33, 73, 129, 17, 300, 540}};
+    for (const auto &chunks : cuts) {
+      uint32_t start = 0;
+      for (uint32_t rows : chunks) {
+        const auto data = prefillCase(start, rows);
+        const auto output = dispatchPrefill(device, queue, pipelines.prefillSplit, pipelines.prefillReduce, data);
+        for (uint32_t r = 0; r < rows; ++r) {
+          ++compared;
+          differentPrefill += row(data, output, r) != row(whole, wholeOutput, start + r);
+        }
+        start += rows;
+      }
+      require(start == total, "identity prefill cuts do not cover the sequence");
+    }
+    for (uint32_t position : {40U, 191U, 192U, 193U, 255U, 256U, 500U, 1000U, 2047U, 8191U, 32760U}) {
+      std::vector<uint8_t> reference;
+      for (uint32_t k = 0; k < kRows; ++k) {
+        auto data = makeCase(device, shape, position - k, kRows, kVerifyMaximumSplits);
+        fill(data); absoluteQueries(data);
+        for (uint32_t width = 1; width <= 4; ++width) {
+          const auto output = dispatch(device, queue, pipelines.split, pipelines.reduce, data, width,
+                                       policy.attention ? 1u : 0u);
+          if (reference.empty()) reference = row(data, output, k);
+          for (uint32_t lane = 0; lane < width; ++lane) {
+            ++compared;
+            differentVerify += row(data, output, k, lane) != reference;
+          }
+          data.maskWords = ((position + 8) / 4 + 32) / 32;
+          data.mask.assign(uint64_t{kRows} * data.maskWords, ~0u);
+          const auto listed = dispatch(device, queue, pipelines.split, pipelines.reduce, data, width,
+                                       policy.attention ? 1u : 0u);
+          for (uint32_t lane = 0; lane < width; ++lane)
+            differentLists += row(data, listed, k, lane) != row(data, output, k, lane);
+          data.maskWords = 0; data.mask.clear();
+        }
+      }
+    }
+    std::cout << "T4 policy=" << policy.parts() << " format=" << (bfloat ? "bf16" : "int8")
+              << " compared=" << compared << " differing_prefill_rows=" << differentPrefill
+              << " differing_verify_rows=" << differentVerify << " differing_list_rows=" << differentLists << '\n';
+  }
+  require(differentLists == 0, "list-of-all differs from no-list; lane-local list selection required");
+  if (policy.attention)
+    require(differentPrefill == 0 && differentVerify == 0, "deterministic attention is not row invariant");
+}
+
+void run(const char *libraryPath, bool identity) {
   testContract();
   id<MTLDevice> device = MTLCreateSystemDefaultDevice();
   if (!device)
@@ -910,6 +1003,11 @@ void run(const char *libraryPath) {
   if (!library)
     throw std::runtime_error(error.localizedDescription.UTF8String);
   id<MTLCommandQueue> queue = [device newCommandQueue];
+  if (identity) {
+    const char *value = std::getenv("SPLASH_DETERMINISTIC");
+    identityAttention(device, queue, library, splash::ops::DeterminismPolicy::parse(value ? value : ""));
+    return;
+  }
   for (const Shape shape : kShapes) {
     for (uint32_t splits : {1U, 3U, 7U, 32U, 65U, 128U}) {
       checkReduce(device, queue, library, shape, splits, kRows);
@@ -970,10 +1068,10 @@ void run(const char *libraryPath) {
 int main(int argc, const char *argv[]) {
   @autoreleasepool {
     try {
-      if (argc != 2)
+      if (argc != 2 && !(argc == 3 && std::string_view(argv[2]) == "--identity"))
         throw std::runtime_error(
             "usage: q8_flash_attention_metal_test <metallib>");
-      run(argv[1]);
+      run(argv[1], argc == 3);
       return 0;
     } catch (const std::exception &error) {
       std::cerr << "q8_flash_attention_metal_test: " << error.what() << '\n';

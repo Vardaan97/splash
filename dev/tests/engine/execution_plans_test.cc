@@ -6,6 +6,7 @@
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <vector>
 
 namespace {
 using namespace splash;
@@ -53,6 +54,22 @@ void covers(const Workspace &stride, const Workspace &needed, uint32_t lanes,
   for (auto field : fields)
     require((stride.*field) * lanes >= needed.*field,
             "workspace does not cover an installed plan");
+}
+
+void deterministicAttentionPlans() {
+  for (uint32_t family : {9U, 10U}) {
+    auto d = device(family); d.gpuCoreCount = 40;
+    const ExecutionPlans pinned(d, DeterminismPolicy::parse("1"));
+    const kv::Layout layout{1, 2, 256, kv::Format::Int8, 0, true};
+    for (uint32_t rows = 1; rows <= 2048; ++rows)
+      require(pinned.prefillAttention(rows, 24, layout).splits == 1,
+              "deterministic prefill attention split count");
+    for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
+      const std::vector<uint32_t> history(lanes, 1000);
+      require(pinned.verifyAttention(lanes, 24, layout, history).absolutePartition,
+              "deterministic verify absolute partition");
+    }
+  }
 }
 
 void baselinePlans() {
@@ -293,6 +310,7 @@ void invalidLookupsAndContextEdges() {
 
 int main() {
   try {
+    deterministicAttentionPlans();
     baselinePlans();
     ggufMoePlans();
     unknownCoreCount();

@@ -1243,11 +1243,47 @@ void bfloatState(MetalBackend &backend, const GdnShape &shape, uint32_t lanes, b
   std::cout << where << ": the fp32 decode's rows and its state rounded\n";
 }
 
+void identityVerifyRows(MetalBackend &backend, const GdnShape &shape) {
+  uint32_t differentRows = 0, differentStates = 0;
+  for (uint32_t k = 0; k < kRows; ++k) {
+    Fixture full(backend, shape, 1, true), split(backend, shape, 1, true);
+    const auto step = [&](Fixture &f) {
+      CommandGraph graph; encodeDecode(f, graph, "T5 identity");
+      (void)backend.submitCommandAsync(graph.dispatches()).wait();
+    };
+    step(full); step(split);
+    const uint64_t width = uint64_t{shape.valueHeads} * kHeadDim;
+    std::vector<uint16_t> expected(full.hiddenRow(0, k, 0), full.hiddenRow(0, k, 0) + width);
+    std::vector<uint16_t> packed(static_cast<const uint16_t *>(full.packed.contents()),
+                                 static_cast<const uint16_t *>(full.packed.contents()) + full.packed.sizeBytes() / 2);
+    std::array<uint32_t, kMaxLanes> retained{}; retained[0] = k + 1;
+    full.advance(retained); step(full);
+    retained[0] = k; split.advance(retained);
+    for (uint32_t layer = 0; layer < kLayers; ++layer)
+      for (uint32_t r = 0; r < kRows; ++r) {
+        const uint64_t destination = uint64_t{layer} * kMaxLanes * split.packedStride + uint64_t{r} * shape.packedWidth;
+        const uint64_t source = uint64_t{layer} * kMaxLanes * split.packedStride + uint64_t{std::min(k + r, kRows - 1)} * shape.packedWidth;
+        std::memcpy(static_cast<uint16_t *>(split.packed.contents()) + destination, packed.data() + source, shape.packedWidth * 2);
+      }
+    step(split);
+    differentRows += !std::equal(expected.begin(), expected.end(), split.hiddenRow(0, 0, 0));
+    retained[0] = 1; split.advance(retained); step(split);
+    differentStates += std::memcmp(full.next[0].contents(), split.next[0].contents(), full.cell.bytes) != 0;
+  }
+  std::cout << "T5 verify row vs folded row0 differing_rows=" << differentRows
+            << " differing_states=" << differentStates << '\n';
+  require(differentRows == 0 && differentStates == 0, "GDN position-in-verify changed fp32 output or committed state");
+}
+
 int main(int argc, char **argv) {
   try {
-    if (argc != 2)
+    if (argc != 2 && !(argc == 3 && std::string_view(argv[2]) == "--identity"))
       throw std::invalid_argument("usage: gdn-decode METALLIB");
     MetalBackend backend(argv[1]);
+    if (argc == 3) {
+      for (const auto &shape : kShapes) identityVerifyRows(backend, shape);
+      return 0;
+    }
     rejectsInvalid(backend);
     for (const GdnShape &shape : kShapes)
       for (const uint32_t lanes : {1U, kMaxLanes})

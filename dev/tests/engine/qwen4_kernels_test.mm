@@ -333,8 +333,10 @@ void hyperNormKernelsTest(MetalBackend &backend, bool exact) {
     return ops::LinearScratch{zeroed(ops::tableBytes(width, rows)),
                               zeroed(ops::tableSumsBytes(ops::LinearInput::Table16, width, rows)), {}, {}};
   };
+  std::vector<uint16_t> identityNorm;
+  std::vector<float> identityWeights;
   bool okKernels = true, okPlain = true, okTables = true;
-  for (const uint32_t rows : {1u, 3u, 8u, 16u, 24u, 32u, 64u, 65u, 128u, 136u, 256u, 512u}) {
+  for (const uint32_t rows : {512u, 1u, 3u, 8u, 16u, 24u, 32u, 64u, 65u, 128u, 136u, 256u}) {
     // addNorm's kernel, and the other one on the same rows.
     const bool quarters = rows <= HYPER_CONNECTION_NORM_QUARTER_ROWS;
     const std::string other = quarters ? "hyper_connection_norm_loaded" : "hyper_connection_norm_quarters";
@@ -362,6 +364,20 @@ void hyperNormKernelsTest(MetalBackend &backend, bool exact) {
     }
     run(backend, graph);
     const uint64_t rowBytes = uint64_t{rows} * width * 2, weightBytes = uint64_t{rows} * streams * 4;
+    if (std::getenv("SPLASH_IDENTITY_KERNEL_TEST")) {
+      const auto norm = download<uint16_t>(normalized, uint64_t{rows} * width);
+      const auto mix = download<float>(weights, uint64_t{rows} * streams);
+      if (identityNorm.empty()) { identityNorm = norm; identityWeights = mix; }
+      else {
+        uint32_t different = 0;
+        for (uint32_t r = 0; r < rows; ++r)
+          different += !std::equal(norm.begin() + uint64_t{r} * width, norm.begin() + uint64_t{r + 1} * width,
+                                   identityNorm.begin() + uint64_t{r} * width) ||
+                       std::memcmp(mix.data() + r * streams, identityWeights.data() + r * streams, streams * 4) != 0;
+        check(different == 0, "T6 hyper norm across row counts differing_rows=" + std::to_string(different));
+      }
+    }
+
     const bool kernels = same(normalized, normalizedOther, rowBytes) && same(weights, weightsOther, weightBytes, true);
     okKernels &= kernels;
     if (!kernels) std::cout << "  the kernels differ at " << rows << " rows\n";
@@ -461,6 +477,27 @@ void pleTest(MetalBackend &backend) {
     for (uint32_t c = 0; c < width; ++c) okH &= f32(gotH[j * width + c]) == input(int(rows) - int(history) + int(j), c);
   check(okX, "PLE convolution: streams + gated + silu(dilated taps over the history)");
   check(okH, "PLE convolution: the history after the sequence");
+
+  uint32_t differingChunks = 0;
+  for (uint32_t cut = 1; cut < rows; ++cut) {
+    const auto partialHistory = scratch(backend, history * width * 2);
+    const auto finalHistory = scratch(backend, history * width * 2);
+    const auto restoredStreams = upload(backend, x);
+    const auto originalGate = upload(backend, gotG);
+    const auto tapsBuffer = upload(backend, tapsW);
+    CommandGraph chunks;
+    ops::NgramEmbedding::addConvolution(chunks, conv, histIn, partialHistory, tapsBuffer, originalGate,
+                                        restoredStreams, shape, cut);
+    ops::NgramEmbedding::addConvolution(chunks,
+        backend.view(conv, uint64_t{cut} * width * 2, uint64_t{rows - cut} * width * 2),
+        partialHistory, finalHistory, tapsBuffer,
+        backend.view(originalGate, uint64_t{cut} * width * 4, uint64_t{rows - cut} * width * 4),
+        backend.view(restoredStreams, uint64_t{cut} * width * 4, uint64_t{rows - cut} * width * 4), shape, rows - cut);
+    run(backend, chunks);
+    differingChunks += std::memcmp(finalHistory.contents(), histOut.contents(), history * width * 2) != 0 ||
+                       std::memcmp(restoredStreams.contents(), streamsBuffer.contents(), rows * width * 4) != 0;
+  }
+  check(differingChunks == 0, "T6 PLE cold vs restored history differing_chunks=" + std::to_string(differingChunks));
 
   // The history after a lane's retained rows (a count the GPU holds) and
   // after a sequence's first rows (one the host knows).
@@ -663,6 +700,59 @@ void qsaTest(MetalBackend &backend, QsaCase c) {
   ops::BlockIndexer::addCommit(graph, keys, 1, laneRows, rows, firstPositions, upload(backend, retained), pendingBefore,
                                pendingAfter);
   run(backend, graph);
+
+  if (std::getenv("SPLASH_IDENTITY_KERNEL_TEST")) {
+    const auto originalQueries = download<uint16_t>(queries, uint64_t{laneRows} * H * D);
+    const auto originalMasks = download<uint32_t>(mask, uint64_t{laneRows} * words);
+    const auto originalPooled = download<uint16_t>(extent, extents * extentBytes / 2);
+    for (uint32_t l = 0; l < lanes; ++l) {
+      const std::array first{firstPositions[l]}, count{counts[l]};
+      const std::array table{tables[l]}, pending{pendingBefore[l]};
+      const ops::IndexerRows one{rows, first, {table, indexOffset}, top, words, stride};
+      const auto q = backend.view(queries, uint64_t{l} * rows * H * D * 2, uint64_t{rows} * H * D * 2);
+      const auto k = backend.view(keys, uint64_t{l} * rows * D * 2, uint64_t{rows} * D * 2);
+      const auto m = backend.view(mask, uint64_t{l} * rows * words * 4, uint64_t{rows} * words * 4);
+      const auto floats = [&](const std::vector<float> &values, uint64_t offset, uint64_t size) {
+        return upload(backend, std::vector<float>(values.begin() + offset, values.begin() + offset + size));
+      };
+      CommandGraph single;
+      ops::BlockIndexer::addProject(single, floats(query, uint64_t{l} * rows * H * D, uint64_t{rows} * H * D),
+          floats(stepKeys, uint64_t{l} * rows * D, uint64_t{rows} * D), {upload(backend, qnP), true},
+          backend.view(cosT, uint64_t{l} * rows * 32 * 4, uint64_t{rows} * 32 * 4), backend.view(sinT, uint64_t{l} * rows * 32 * 4, uint64_t{rows} * 32 * 4), q, k, one);
+      std::vector<BlockIndexerBlock> records(blocks.begin() + l * laneRecords, blocks.begin() + (l + 1) * laneRecords);
+      ops::BlockIndexer::addPool(single, {upload(backend, records), count, laneRecords, k, pending}, keyNorm, invFreqBuffer, ropeScale, one);
+      ops::BlockIndexer::addSelect(single, q, scores, scoreRows, m, one);
+      run(backend, single);
+    }
+    const auto separateQueries = download<uint16_t>(queries, uint64_t{laneRows} * H * D);
+    const auto separateMasks = download<uint32_t>(mask, uint64_t{laneRows} * words);
+    uint32_t different = 0;
+    for (uint32_t r = 0; r < laneRows; ++r)
+      different += !std::equal(originalQueries.begin() + uint64_t{r} * H * D,
+                               originalQueries.begin() + uint64_t{r + 1} * H * D,
+                               separateQueries.begin() + uint64_t{r} * H * D) ||
+                   !std::equal(originalMasks.begin() + uint64_t{r} * words,
+                               originalMasks.begin() + uint64_t{r + 1} * words,
+                               separateMasks.begin() + uint64_t{r} * words);
+    check(different == 0 && originalPooled == download<uint16_t>(extent, extents * extentBytes / 2),
+          "T6 QSA separate vs batched lanes differing_rows=" + std::to_string(different));
+    for (uint32_t chunk : {1U, 7U, 17U, 2048U}) {
+      CommandGraph partitioned;
+      for (QsaLane &x : lane) {
+        for (const auto &pending : x.pending) std::memset(pending.contents(), 0, pending.sizeBytes());
+        for (uint32_t from = 0; from < x.tokens; from += chunk)
+          qsaPrefillStep(backend, partitioned, x, from, std::min(chunk, x.tokens - from), keyNorm, invFreqBuffer, ropeScale, indexOffset);
+      }
+      run(backend, partitioned);
+      const auto changed = download<uint16_t>(extent, extents * extentBytes / 2);
+      uint32_t differentBlocks = 0;
+      for (uint64_t block = 0; block < originalPooled.size() / D; ++block)
+        differentBlocks += !std::equal(originalPooled.begin() + block * D, originalPooled.begin() + (block + 1) * D,
+                                       changed.begin() + block * D);
+      check(differentBlocks == 0,
+            "T6 QSA pooled keys across prefill cuts differing_blocks=" + std::to_string(differentBlocks));
+    }
+  }
 
   // A rotation's angle is the fp32 product the RoPE tables take (the
   // queries' and the pool's alike): at thousands of tokens its rounding moves
@@ -988,9 +1078,19 @@ void pleHashTest(MetalBackend &backend) {
 int main(int argc, const char *argv[]) {
   @autoreleasepool {
     try {
+      const bool identity = argc == 3 && std::string(argv[2]) == "--identity";
       const bool bitwise = argc == 3 && std::string(argv[2]) == "bitwise";
-      if (argc != 2 && !bitwise) throw std::runtime_error("usage: qwen4-kernels METALLIB [bitwise]");
+      if (argc != 2 && !bitwise && !identity) throw std::runtime_error("usage: qwen4-kernels METALLIB [bitwise]");
       MetalBackend backend(argv[1]);
+      if (identity) {
+        setenv("SPLASH_IDENTITY_KERNEL_TEST", "1", 1);
+        hyperNormKernelsTest(backend, true);
+        pleTest(backend);
+        qsaTest(backend, {2050, 8, 512, 0, 4, 17});
+        qsaTest(backend, {2061, 16, 512, 0, 1, 31});
+        std::cout << "T6 identity kernels complete\n";
+        return failures ? 1 : 0;
+      }
       if (bitwise) {
         // Uninstrumented: the norm's kernels alone, exact.
         if (std::getenv("MTL_SHADER_VALIDATION")) throw std::runtime_error("bitwise runs without shader validation");
