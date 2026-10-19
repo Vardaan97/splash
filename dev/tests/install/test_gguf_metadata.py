@@ -12,126 +12,33 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from tokenizers import Tokenizer, pre_tokenizers
+from tokenizers import Tokenizer
 from transformers import AutoTokenizer
 
 from dev.tests import fixture_files
 from dev.tests.fixture_files import GGUF_TYPE_ARRAY, GGUF_TYPE_STRING
 from dev.tests.installer_fixtures import (
+    BYTE,
     DENSE,
     DRAFT_COMMIT,
     FLASH_NEXT,
+    FLASH_NEXT_ARRAYS,
+    GGML,
     MOE,
+    NORMAL,
+    UNKNOWN,
     FakeHub,
     draft_dir,
     family_config,
+    fixture,
+    loadable_tensors,
     selection,
+    vision_fixture,
+    write_gguf,
 )
 from install import assembly, families, gguf, hub, models, upstream
 
 GGUF_REPO = "unsloth/Qwen3.6-35B-A3B-GGUF"
-
-# The GGUF specification's token types (llama_token_type), stated
-# independently of the reader under test.
-NORMAL, UNKNOWN, CONTROL, USER_DEFINED, UNUSED, BYTE = 1, 2, 3, 4, 5, 6
-# GGML tensor types (ggml_type), stated independently of gguf.TENSOR_TYPES.
-GGML = {
-    "F32": 0,
-    "F16": 1,
-    "Q5_0": 6,
-    "Q5_1": 7,
-    "Q8_0": 8,
-    "Q2_K": 10,
-    "Q4_K": 12,
-    "IQ2_XXS": 16,
-    "IQ3_XXS": 18,
-    "IQ4_XS": 23,
-    "IQ1_M": 29,
-    "BF16": 30,
-    "TQ2_0": 35,
-    "MXFP4": 39,
-    "NVFP4": 40,
-    "Q2_0": 42,
-    "PQ2_0": 142,
-}
-# The arrays of a Qwen3.8-Flash-Next header, which its gguf-metadata.json
-# leaves out as scalar_metadata does: each layer's QSA compress ratio, a
-# 4-token block for each full-attention layer (every fourth) and 0 for each
-# GDN one, and the one layer its PLE n-gram embedding feeds.
-FLASH_NEXT_ARRAYS = {
-    "qwen4exp.attention.compress_ratios": [
-        4 if layer % 4 == 3 else 0 for layer in range(48)
-    ],
-    "qwen4exp.ple.layers": [1],
-}
-
-
-def write_gguf(path, values, tensors=()):
-    """A GGUF header of the values and the tensors' (name, GGML type), each
-    tensor 256 values without data: the metadata reader reads no more."""
-    table = [(name, [256], kind, b"") for name, kind in tensors]
-    return fixture_files.write_gguf(path, values, table)
-
-
-def fixture(*, native=False, family=MOE):
-    """A GGUF's metadata of family's (Qwen3.6-35B-A3B's by default): its
-    architecture's, as the native configuration test reads it too, with
-    FLASH_NEXT_ARRAYS for Qwen3.8-Flash-Next, and a tokenizer's, native=True
-    of the family's vocabulary size."""
-    tokens = sorted(pre_tokenizers.ByteLevel.alphabet())
-    tokens += ["ab", "<|endoftext|>", "<|im_end|>", "<think>", "<|im_start|>"]
-    types = [NORMAL] * 257 + [CONTROL, CONTROL, USER_DEFINED, CONTROL]
-    if native:
-        padding = 248320 - len(tokens)
-        tokens += [f"[unused{i}]" for i in range(padding)]
-        types += [UNUSED] * padding
-    typed = family_config(family, "gguf-metadata.json")
-    return (
-        typed["unsigned"]
-        | typed["float"]
-        | typed["string"]
-        | (FLASH_NEXT_ARRAYS if family == FLASH_NEXT else {})
-        | {
-            "tokenizer.ggml.model": "gpt2",
-            "tokenizer.ggml.pre": "qwen35",
-            "tokenizer.ggml.tokens": tokens,
-            "tokenizer.ggml.token_type": types,
-            "tokenizer.ggml.merges": ["a b"],
-            "tokenizer.ggml.eos_token_id": 258,
-            "tokenizer.ggml.bos_token_id": 257,
-            "tokenizer.ggml.padding_token_id": 257,
-            "tokenizer.chat_template": "{% for message in messages %}{{ message.content }}<|im_end|>{% endfor %}",
-        }
-    )
-
-
-def loadable_tensors(values, directory):
-    """A tensor table the native loader accepts for the header values: each
-    tensor it reads, quantized as Q4_K or F32."""
-    header = gguf.Metadata(write_gguf(directory / "header.gguf", values))
-    return {
-        name: GGML[next(t for t in ("Q4_K", "F32") if t in types)]
-        for name, types in gguf.loaded_tensors(header).items()
-    }
-
-
-def vision_fixture():
-    return {
-        "general.architecture": "clip",
-        "clip.projector_type": "qwen3vl_merger",
-        "clip.use_gelu": True,
-        "clip.vision.block_count": 27,
-        "clip.vision.embedding_length": 1152,
-        "clip.vision.attention.head_count": 16,
-        "clip.vision.feed_forward_length": 4304,
-        "clip.vision.projection_dim": 2048,
-        "clip.vision.patch_size": 16,
-        "clip.vision.spatial_merge_size": 2,
-        "clip.vision.image_size": 768,
-        "clip.vision.is_deepstack_layers": [False] * 27,
-        "clip.vision.image_mean": [0.5] * 3,
-        "clip.vision.image_std": [0.5] * 3,
-    }
 
 
 class GgufMetadataTests(unittest.TestCase):
@@ -878,7 +785,9 @@ class GgufMetadataTests(unittest.TestCase):
             models.installation_lock(models_root),
             contextlib.redirect_stdout(io.StringIO()),
         ):
-            return assembly.derived_metadata(models_root, {"target/m.gguf": path})
+            return assembly.derived_metadata(
+                models_root, {"target/m.gguf": path}, {path: assembly.file_record(path)}
+            )
 
     def test_vision_projector_is_chosen_by_its_header(self):
         tensors = (
@@ -915,10 +824,11 @@ class GgufMetadataTests(unittest.TestCase):
         )
         only_f16 = projectors(**{"mmproj-f16": f16, "mmproj-x": text})
         self.assertEqual(upstream.select_vision(only_f16)[0], "mmproj-f16.gguf")
+        # Text only, the model is served: the caller says how to ask for it.
         with self.assertRaisesRegex(
-            models.ModelError,
+            models.VisionError,
             r"no BF16, F32 or F16 vision projector \(mmproj-q8.gguf \(clip: F32, Q8_0\); "
-            r"mmproj-x.gguf \(qwen35moe: BF16, F32\)\); use --language-only",
+            r"mmproj-x.gguf \(qwen35moe: BF16, F32\)\)$",
         ):
             upstream.select_vision(
                 projectors(**{"mmproj-q8": quantized, "mmproj-x": text})
@@ -1236,7 +1146,12 @@ class GgufMetadataTests(unittest.TestCase):
             values,
             [("v.patch_embd.weight", GGML["F32"])],
         )
-        with self.assertRaisesRegex(models.ModelError, "vision preprocessing"):
+        # The refusal names the projector, and how to serve text only.
+        with self.assertRaisesRegex(
+            models.ModelError,
+            "vision projector mmproj-F32.gguf: unsupported vision preprocessing "
+            "configuration; use --language-only to serve text only",
+        ):
             self.prepare(
                 selection(self.root, GGUF_REPO + ":Q4_K_M", language_only=False)
             )

@@ -29,6 +29,7 @@ INSTALL_FILES = (
     "families.py",
     "assembly.py",
     "upstream.py",
+    "local.py",
     "gguf.py",
     "requirements.txt",
 )

@@ -108,18 +108,23 @@ def _write_durably(path, data):
         os.fsync(stream.fileno())
 
 
-def file_record(path: Path):
+def file_record(path: Path, recorded=None):
     """What model.json records of a linked file: its path, size and times,
     which verify compares on every start, and its content digest, which
-    verify(full=True) recomputes (_digest_of)."""
+    verify(full=True) recomputes (_digest_of). recorded, the record an
+    earlier assembly keeps of the file, gives the digest without reading the
+    file while it keeps the path, size and times recorded, as verify trusts
+    them to."""
     stat = path.stat()
-    return {
+    record = {
         "path": str(path.absolute()),
         "bytes": stat.st_size,
         "mtime_ns": stat.st_mtime_ns,
         "ctime_ns": stat.st_ctime_ns,
-        "digest": _digest(path),
     }
+    if recorded and all(recorded[key] == value for key, value in record.items()):
+        return record | {"digest": recorded["digest"]}
+    return record | {"digest": _digest(path)}
 
 
 def _digest(path):
@@ -229,15 +234,15 @@ def pins(record):
     return sorted(snapshots.items())
 
 
-def recorded_pins(link: Path):
-    """pins of the assembly a selection link names, as its record states
-    them whether or not the assembly still verifies; none without a record
-    of the shape build writes."""
+def recorded(link: Path):
+    """The record of the assembly a selection link names, whether or not the
+    assembly still verifies; None without a record of the shape build
+    writes."""
     try:
         record = models.read_json(link / "model.json")
     except models.ModelError:
-        return []
-    return pins(record) if _well_formed(record) else []
+        return None
+    return record if _well_formed(record) else None
 
 
 def _metadata_inputs(files):
@@ -272,13 +277,14 @@ def metadata_key(file_records):
     )
 
 
-def derived_metadata(models_root: Path, files):
+def derived_metadata(models_root: Path, files, records):
     """The key and the files, by assembly path, of the metadata derived from
     the GGUF files among files (assembly path -> source file): derived once,
-    and again when its entry is damaged. Call it under the installation lock."""
+    and again when its entry is damaged. records maps each source file to
+    its record (file_record). Call it under the installation lock."""
     names = _metadata_inputs(files)
     inputs = [files[name] for name in names]
-    sources = [file_record(path) for path in inputs]
+    sources = [records[path] for path in inputs]
     key = _metadata_key(sources)
     # A split target's metadata is its first file's (split order is name
     # order); the vision projector comes last.
@@ -286,7 +292,12 @@ def derived_metadata(models_root: Path, files):
 
     def write(stage):
         contents = gguf.derived_files(*derive)
-        if [file_record(path) for path in inputs] != sources:
+        # A source written while it was read no longer has its record's times.
+        current = [
+            file_record(path, source)
+            for path, source in zip(inputs, sources, strict=True)
+        ]
+        if current != sources:
             raise models.ModelError("GGUF source changed while reading metadata")
         for name, data in contents.items():
             _write_durably(stage / name, data)

@@ -1948,6 +1948,68 @@ Every request, including image placeholder, token-count and judgment
 startup; tokenizer files and the tokenizer object are unchanged. The probe's
 upstream fixtures are in `dev/tests/fixtures/chat_templates/`.
 
+### Local model files
+
+An application that downloads models itself prepares them for the server
+with `install.local.prepare_local_model`, the installer's one public
+interface, and starts the server on the directory it returns. It runs in
+Splash's own Python (`.venv/bin/python` in a checkout, `python/bin/python3`
+in a release) with the checkout or release root on `PYTHONPATH`, and makes no
+network request:
+
+```python
+from install.local import ModelError, prepare_local_model
+
+model = prepare_local_model(
+    "/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf",
+    draft="/models/Qwen3.8-27B-DFlash2",
+    mmproj="/models/Qwen3.8-27B-GGUF/mmproj-BF16.gguf",
+)
+```
+
+```sh
+PYTHONPATH="$ROOT" "$ROOT/python/bin/python3" -P -m server.server "$MODEL" \
+    --tokenizer "$MODEL/tokenizer" --model unsloth/Qwen3.8-27B-GGUF \
+    --binary "$ROOT/engine/splash" --port 8000
+```
+
+`--model` is the ID the API reports, in `OWNER/REPO` form, and `--binary` the
+engine of the same checkout or release (`build/splash` in a checkout). The
+server takes the [server options](#server-options) of `splash serve`; the
+model's source options (`--revision`, `--draft-model`, `--language-only`,
+`--offline`) are `prepare_local_model`'s arguments instead, or have no use.
+
+- `target`: a GGUF file, any part of a split GGUF naming all its parts,
+  which lie beside it; or a directory, an MLX model's or one holding a single
+  GGUF target, whole or split, beside any projectors named `mmproj`.
+- `draft`: the directory of a DFlash2 draft ([Drafts](#drafts)). Without
+  one, the family's released draft is taken from the Hugging Face cache,
+  where a download left it.
+- `mmproj`: a GGUF target's vision projector ([Vision](#vision)); without
+  one, a GGUF target serves text only. An MLX target serves images with the
+  tower in its checkpoint unless `language_only=True`.
+- `models_dir`: where prepared models are kept, Splash's own models
+  directory by default ([files Splash writes](#files-splash-writes)).
+
+The files are checked as a download is, by the engine's `model-check` and the
+GGUF screening, on their metadata ([Upstream model
+loading](#upstream-model-loading)). When Splash cannot serve them without a
+download (a missing file or split part, an unsupported format, a draft of
+another model), a `ModelError` names the file and the reason. The directory
+returned is an assembly of links to the files ([Installation](#installation)),
+which never changes. Preparing the same files again returns it, reading only
+their metadata, sizes and times; the first preparation reads each file
+outside the Hugging Face cache once, for its digest. Once a file changes,
+prepare again and restart the server on the directory returned.
+
+`prepare_local_model` and `ModelError` keep their names, parameters,
+defaults, results and errors across the releases of one major version; a
+release may add keyword parameters whose defaults keep that behavior.
+Nothing else in `install/` is public, nor is the layout of the prepared
+directory, which is the server's and the engine's of the release that
+prepared it: after an upgrade, prepare again, as `splash serve` installs at
+every start.
+
 ### Splash packages
 
 Splash packages, such as `incoai/Qwen3.8-27B-Splash`, are the prebuilt format
@@ -2028,6 +2090,8 @@ Hub snapshots, published atomically. The other installer modules each own one
 part: `hub.py` the sources, the Hub cache and its pins; `assembly.py` the
 assembly layout, its build, verification and garbage collection, and the
 metadata derived from a GGUF; `families.py` each family's draft repository;
+`local.py` the assembly of local files ([Local model files](#local-model-files)),
+which inspects them and publishes them as `upstream.py` does a repository's;
 and `models.py` model IDs, selections, the
 installation lock, the command line (`install/models.py --model ID
 prepare|verify|link`, where `link` prints the selection link) and running the
@@ -2038,7 +2102,10 @@ checkout builds the engine before it installs, as `make install` and the first
 loader reads it, and `splash serve`, `test-http-real` and the HTTP regression
 benchmark hold it while they run, so a concurrent installation cannot collect
 the assembly they serve. It is local installation metadata, not a file model
-publishers supply.
+publishers supply. It records each file's path, size, times and digest: a Hub
+cache file's is the blob's name, any other file's its SHA-256, which an
+assembly that replaces another keeps for each file it still links unchanged
+in path, size and times, so only a new or changed file is read for it.
 
 Installation resolves each source's revision to a commit once, downloads by
 that commit and records it in `model.json`, so a repository update cannot mix

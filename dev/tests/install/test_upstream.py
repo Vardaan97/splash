@@ -1204,9 +1204,9 @@ class UpstreamTest(unittest.TestCase):
         )
         self.assertIn(
             f"Warning: cannot use the {DENSE.name} draft {DENSE.draft_repo}@"
-            f"{'e' * 12}; keeping the installed one: draft configuration is "
-            f"incompatible with {DENSE.name}: draft config dflash_config block_size "
-            "mismatch: checkpoint 16, runtime 8",
+            f"{'e' * 12}; keeping the installed one: {DENSE.draft_repo}'s draft "
+            f"configuration is incompatible with {DENSE.name}: draft config "
+            "dflash_config block_size mismatch: checkpoint 16, runtime 8",
             warnings,
         )
 
@@ -1506,9 +1506,17 @@ class UpstreamTest(unittest.TestCase):
         with contextlib.chdir(self.root):
             repo = hub.Repository.resolve(MODEL, "branch")
         self.assertEqual(fake.requests, [(MODEL, "branch")])
-        self.assertEqual((repo.directory, repo.revision), (None, "a" * 40))
+        self.assertEqual((repo.paths, repo.revision), (None, "a" * 40))
+        (self.root / MODEL / "config.json").write_text("{}")
         local = hub.Repository.resolve(str(self.root / MODEL))
-        self.assertEqual((local.directory, local.revision), (self.root / MODEL, None))
+        self.assertEqual(
+            (local.name, local.paths, local.revision),
+            (
+                str(self.root / MODEL),
+                {"config.json": self.root / MODEL / "config.json"},
+                None,
+            ),
+        )
         with self.assertRaisesRegex(models.ModelError, "draft directory not found"):
             hub.Repository.resolve(str(self.root / "deleted-draft"))
 
