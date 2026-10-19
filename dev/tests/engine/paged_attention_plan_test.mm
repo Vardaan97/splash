@@ -158,6 +158,29 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
                 (lanes < 4 || plan.laneSplits[3] == kv::kVerifyMaximumSplits),
             "verify partition changed");
   }
+  if (layout.valuesTokenMajor) {
+    const auto policy = ops::DeterminismPolicy::parse("attention");
+    // Every chunk start through 32K, including its speculative tail, fits
+    // fixed absolute runs in the actual plan and the allocation-time bound.
+    // Peers cross the split-count boundaries without changing lane zero.
+    constexpr uint32_t runTokens =
+        SPLASH_VERIFY_ATTENTION_PARTITION_BLOCKS * SPLASH_ATTENTION_BLOCK_TOKENS;
+    const auto bound = ops::PagedAttention::verifyWorkspace(4, queryHeads, layout);
+    for (uint32_t start = 0; start <= 32768; ++start) {
+      const std::array<uint32_t, 4> histories{start, 8191, 16383, 32767};
+      const auto plan = ops::PagedAttention::verifyPlan(4, queryHeads, layout, histories, policy);
+      require(plan.absolutePartition && plan.workspace.partialsBytes <= bound.partialsBytes &&
+                  plan.workspace.statisticsBytes <= bound.statisticsBytes,
+              "deterministic verify exceeds the allocation bound");
+      for (uint32_t lane = 0; lane < histories.size(); ++lane) {
+        const uint32_t required = (histories[lane] + kv::kVerifyRows + runTokens - 1) / runTokens;
+        require(required <= plan.laneSplits[lane] &&
+                    plan.laneSplits[lane] == kv::verifyAttentionSplits(histories[lane]) &&
+                    plan.laneSplits[lane] <= plan.splits && plan.splits <= kv::kVerifyMaximumSplits,
+                "production verify plan cannot cover fixed deterministic runs");
+      }
+    }
+  }
   for (const uint32_t rows : {0U, 2049U})
     rejects([&] { (void)ops::PagedAttention::prefillPlan(rows, queryHeads, layout); },
             "invalid attention workspace rows", "a prefill plan of no rows or past the budget was accepted");

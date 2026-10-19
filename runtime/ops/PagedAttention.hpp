@@ -42,6 +42,8 @@ static_assert(kVerifyChunkStride >= kVerifyRows &&
 inline constexpr uint32_t kVerifySplits = 32;
 inline constexpr uint32_t kVerifyPagesPerSplit = 16;
 static_assert(kVerifySplits <= kVerifyMaximumSplits);
+static_assert(SPLASH_VERIFY_ATTENTION_PARTITION_BLOCKS * SPLASH_ATTENTION_BLOCK_TOKENS ==
+              kVerifyPagesPerSplit * kPageTokens);
 
 // One lane's verify split count of the page loop: one split per
 // kVerifyPagesPerSplit pages its history and verify rows fill, never fewer

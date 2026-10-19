@@ -3215,8 +3215,14 @@ selects individual parts for diagnosis. Startup reports the canonical parts in i
 The policy pins trunk expert tile kinds, dense decode width, short prefill K partitions,
 float projection and hyper-connection norm tiles and attention partitions, and aligns non-final prefill chunks. It targets batch,
 draft and prompt-cache invariance for Flash-Next on Apple9/Apple10 with int8 or bf16 KV
-in the dense QSA regime (up to 2048 tokens); verify partitions remain position-invariant
-up to 32K tokens. Sparse QSA unions, reuse inside previously generated history, sampled
+in the dense QSA regime (up to 2048 tokens); no-list verify partitions remain position-invariant
+up to 32K tokens. Deterministic verify uses fixed runs of 128 four-token blocks
+through this range, including speculative rows past 32K. The production plan's
+lane split counts cover these runs within the existing 128-split scratch bound;
+chunk starts, lane counts and split counts do not move their boundaries. The
+attention identity test compares every verify-row position across the 8K, 16K,
+24K and 32K boundaries with the production plan, for int8 and bf16 KV at 1–4 lanes.
+Sparse QSA unions, reuse inside previously generated history, sampled
 decoding and other model families are outside this guarantee. The measured observations below are from an earlier build; untimed kernel
 checks do not establish runtime speed or a broader identity guarantee.
 

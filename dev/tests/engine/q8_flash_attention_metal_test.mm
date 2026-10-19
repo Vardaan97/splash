@@ -505,18 +505,21 @@ std::vector<uint8_t> copyOf(id<MTLBuffer> buffer) {
 Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
                   id<MTLComputePipelineState> split,
                   id<MTLComputePipelineState> reduce, const Case &data,
-                  uint32_t width, uint32_t partition = 0) {
+                  uint32_t width, uint32_t partition = 0,
+                  const splash::ops::VerifyAttentionPlan *plan = nullptr) {
   const Shape shape = data.shape;
-  const uint32_t splits = data.params.split_count;
+  const uint32_t splits = plan ? plan->splits : data.params.split_count;
   require(data.params.rows == kRows, "a verify lane attends all its rows");
   const uint64_t laneBytes = data.queries.length;
   id<MTLBuffer> queries = makeBuffer(device, width * laneBytes);
   id<MTLBuffer> output = makeBuffer(device, width * laneBytes);
   const uint64_t slots = uint64_t{width} * shape.kvHeads * splits;
   id<MTLBuffer> partials = makeBuffer(
-      device, slots * shape.fusedRows() * kHeadDimension * sizeof(float));
+      device, plan ? plan->workspace.partialsBytes
+                   : slots * shape.fusedRows() * kHeadDimension * sizeof(float));
   id<MTLBuffer> statistics =
-      makeBuffer(device, slots * shape.fusedRows() * 2 * sizeof(float));
+      makeBuffer(device, plan ? plan->workspace.statisticsBytes
+                             : slots * shape.fusedRows() * 2 * sizeof(float));
   for (uint32_t lane = 0; lane < width; ++lane) {
     std::memcpy(static_cast<uint8_t *>(queries.contents) + lane * laneBytes,
                 data.queries.contents, laneBytes);
@@ -525,8 +528,9 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
   // lane l's list kQsaJunkLists + l.
   const BlockLists blocks = data.maskWords ? qsaBlockLists(device, data, width) : BlockLists{partials, partials, 0};
   std::array<VerifyAttentionParams, 4> params{};
-  for (uint32_t lane = 0; lane < params.size(); ++lane)
-    params[lane] = {data.params.committed_tokens, data.params.page_table_entries, data.params.kv, splits, splits,
+  for (uint32_t lane = 0; lane < width; ++lane)
+    params[lane] = {data.params.committed_tokens, data.params.page_table_entries, data.params.kv,
+                    plan ? plan->laneSplits[lane] : splits, splits,
                     blocks.stride, blocks.stride ? kQsaJunkLists + lane : 0, partition};
   id<MTLCommandBuffer> command = [queue commandBuffer];
   id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
@@ -995,14 +999,24 @@ void identityAttention(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLLi
       }
       require(!other.read().output.empty(), "co-batched prefill peer did not run");
     }
-    for (uint32_t position : {40U, 191U, 192U, 193U, 255U, 256U, 500U, 1000U, 2047U, 8191U, 32760U}) {
+    // Move the same absolute query through all eight verify rows, including
+    // chunks on either side of every 8K boundary through 32K. In particular,
+    // position 8191 is row seven of start 8184 and row zero of start 8191.
+    for (uint32_t position : {40U, 191U, 192U, 193U, 255U, 256U, 500U, 1000U, 2047U,
+                              8191U, 8192U, 16383U, 16384U, 24575U, 24576U, 32760U, 32767U, 32768U}) {
       std::vector<uint8_t> reference;
       for (uint32_t k = 0; k < kRows; ++k) {
-        auto data = makeCase(device, shape, position - k, kRows, kVerifyMaximumSplits);
+        std::array<uint32_t, 4> histories;
+        histories.fill(position - k);
+        const auto single = splash::ops::PagedAttention::verifyPlan(
+            1, shape.queryHeads(), shape.layout(), std::span(histories).first(1), policy);
+        auto data = makeCase(device, shape, position - k, kRows, single.laneSplits[0]);
         fill(data); absoluteQueries(data);
         for (uint32_t width = 1; width <= 4; ++width) {
+          const auto plan = splash::ops::PagedAttention::verifyPlan(
+              width, shape.queryHeads(), shape.layout(), std::span(histories).first(width), policy);
           const auto output = dispatch(device, queue, pipelines.split, pipelines.reduce, data, width,
-                                       policy.attention ? 1u : 0u);
+                                       policy.attention ? 1u : 0u, &plan);
           if (reference.empty()) reference = row(data, output, k);
           for (uint32_t lane = 0; lane < width; ++lane) {
             ++compared;
@@ -1011,7 +1025,7 @@ void identityAttention(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLLi
           data.maskWords = ((position + 8) / 4 + 32) / 32;
           data.mask.assign(uint64_t{kRows} * data.maskWords, ~0u);
           const auto listed = dispatch(device, queue, pipelines.split, pipelines.reduce, data, width,
-                                       policy.attention ? 1u : 0u);
+                                       policy.attention ? 1u : 0u, &plan);
           for (uint32_t lane = 0; lane < width; ++lane)
             differentLists += row(data, listed, k, lane) != row(data, output, k, lane);
           data.maskWords = 0; data.mask.clear();

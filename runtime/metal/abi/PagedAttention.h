@@ -64,6 +64,9 @@ static_assert(sizeof(SplashChunkedPrefillParams) == 24,
 // follows its own list, not its history.
 #define SPLASH_SPARSE_SPLIT_BLOCKS 48u
 #define SPLASH_SPARSE_MINIMUM_SPLITS 32u
+// Deterministic verify uses fixed runs of 512 tokens in the no-list case.
+// The history-scaled plan provides one split per run until the scratch cap.
+#define SPLASH_VERIFY_ATTENTION_PARTITION_BLOCKS 128u
 
 static_assert(SPLASH_MAXIMUM_PHYSICAL_KV_TOKENS / SPLASH_ATTENTION_BLOCK_TOKENS <
                   1u << (32 - SPLASH_ATTENTION_BLOCK_ROW_BITS),
@@ -125,7 +128,8 @@ struct SplashVerifyAttentionParams {
   // The lane's block list, which its sparse split and reduce read.
   uint32_t block_stride;
   uint32_t block_list;
-  // 0: balanced partitions; 1: absolute power-of-two groups, starting at 64 blocks.
+  // 0: balanced partitions; 1: fixed 128-block runs until the scratch cap,
+  // then power-of-two multiples of that run. Sparse unions remain list-relative.
   uint32_t partition;
 };
 

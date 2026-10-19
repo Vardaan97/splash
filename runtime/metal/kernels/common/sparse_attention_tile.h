@@ -55,8 +55,13 @@ static_assert(SplashKvPageTokens % SplashSparseBlockTokens == 0,
 // the written ones takes none.
 inline uint splash_sparse_split_entries(uint count, uint splits, uint partition = 0) {
   if (partition) {
-    uint group = 64;
-    while ((count + group - 1) / group > splits) group *= 2;
+    // Fixed absolute runs for no-list verify, independent of the chunk's
+    // position and the lane's split count. The plan supplies one split per
+    // 512 tokens (at least 32); its existing 128-slot scratch covers these
+    // runs through 64K visible tokens, including every chunk containing a
+    // query below 32K. Beyond that capacity only, widen the runs to fit.
+    uint group = SPLASH_VERIFY_ATTENTION_PARTITION_BLOCKS;
+    while ((count + group - 1) / group > SplashVerifyMaximumSplits) group *= 2;
     return group;
   }
   const uint units = (count + SplashSparsePartitionBlocks - 1) / SplashSparsePartitionBlocks;
