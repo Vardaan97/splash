@@ -94,9 +94,9 @@ constexpr std::chrono::seconds kCacheLockWait{20};
 // A cache nobody opened or wrote for this long is removed at the next start,
 // whether or not that start keeps a cache itself.
 constexpr std::chrono::hours kStaleCache{24 * 14};
-// How long a start that follows an unclean end serves on probation: the
-// server counts a failure within that time toward a crash loop
-// (server/backend.py `CRASH_LOOP_WINDOW_SECONDS`).
+// How long a start serves on probation: the server counts a failure within
+// that time toward a crash loop (server/backend.py
+// `CRASH_LOOP_WINDOW_SECONDS`) and stops restarting after three in a row.
 constexpr std::chrono::seconds kProbation{60};
 
 // A cache root the engine made stays out of Time Machine backups, as
@@ -1155,10 +1155,7 @@ void RuntimeResources::adoptPersistentCache() {
   logLine("Persistent cache ", directory.path().string(), ": took back ", adoption.states,
           " restore points over ", adoption.blocks, " KV blocks (", adoption.bytes / kMiB,
           " MiB); left ", adoption.dropped, " copies behind.",
-          directory.uncleanExit()
-              ? " The last process did not stop cleanly: this one serves on probation for "
-                "its first minute."
-              : "");
+          directory.uncleanExit() ? " The last process did not stop cleanly." : "");
 }
 
 void RuntimeResources::beginServing() {
@@ -1166,16 +1163,13 @@ void RuntimeResources::beginServing() {
   CacheDirectory *directory = persistentCache_.directory.get();
   if (!directory)
     return;
-  const bool probation = directory->uncleanExit();
   try {
-    directory->beginServing(probation);
+    directory->beginServing();
   } catch (const std::exception &error) {
     logLine("Persistent cache cannot mark this process serving (", error.what(),
             "); the next start will not know how it ended.");
     return;
   }
-  if (!probation)
-    return;
   probation_ = std::thread([this, directory] {
     std::unique_lock lock(probationMutex_);
     if (probationWake_.wait_until(lock, AwakeClock::now() + kProbation,
@@ -1187,6 +1181,19 @@ void RuntimeResources::beginServing() {
       logLine("Persistent cache probation did not end (", error.what(), ").");
     }
   });
+}
+
+void RuntimeResources::engineFailed() noexcept {
+  CacheDirectory *directory = persistentCache_.directory.get();
+  if (!directory)
+    return;
+  // A probation that has not ended yet ends failed.
+  stopProbation();
+  try {
+    directory->engineFailed();
+  } catch (const std::exception &error) {
+    logLine("Persistent cache cannot record the engine's failure (", error.what(), ").");
+  }
 }
 
 void RuntimeResources::stopProbation() noexcept {

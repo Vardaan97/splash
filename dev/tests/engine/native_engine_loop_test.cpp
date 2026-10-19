@@ -715,13 +715,15 @@ void testControlFailureUsesExecutionBoundary() {
 
 // A frame whose handling throws stops the engine through the same boundary
 // as tick(): one EngineUnhealthy event, whatever was thrown, with a Metal
-// failure named and counted.
+// failure named and counted, and the engine's failure told once.
 void testFrameFailureUsesExecutionBoundary() {
   enum class Thrown { Standard, Metal, Foreign };
   for (const Thrown thrown : {Thrown::Standard, Thrown::Metal, Thrown::Foreign}) {
     RuntimeMetrics metrics;
     engine::NativeLoopConfig config;
     config.metrics = &metrics;
+    uint32_t told = 0;
+    config.engineFailed = [&told] { ++told; };
     LoopFixture fixture(config, {.pages = 8});
     engine::NativeRuntime &loop = fixture.loop;
     fixture.status = [thrown]() -> std::string {
@@ -748,9 +750,9 @@ void testFrameFailureUsesExecutionBoundary() {
         ++errors;
       }
     }
-    require(errors == 1 && metrics.snapshot().metalFailures ==
-                               (thrown == Thrown::Metal ? 1U : 0U),
-            "a frame exception was reported or counted more than once");
+    require(errors == 1 && told == 1 &&
+                metrics.snapshot().metalFailures == (thrown == Thrown::Metal ? 1U : 0U),
+            "a frame exception was reported, told or counted other than once");
   }
 }
 

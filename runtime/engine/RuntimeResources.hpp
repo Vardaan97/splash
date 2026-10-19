@@ -249,8 +249,11 @@ public:
   // The engine is Ready: what the start allocated as memory a request in
   // service needs is in place, so the governor's mark for it ends, and a
   // persistent tier's directory marks this process serving, on probation for
-  // its first minute after an unclean end (CacheDirectory::beginServing).
+  // its first minute (CacheDirectory::beginServing).
   void beginServing();
+  // The engine reported its own failure: within probation, the next start
+  // finds a persistent tier emptied (CacheDirectory::engineFailed).
+  void engineFailed() noexcept;
   // At a clean stop, after the engine's flush (Engine::flushRestorePoints):
   // each state copy's label takes its state's current recency, both files
   // reach the drive and the directory records a clean end. False when they

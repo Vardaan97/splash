@@ -40,6 +40,10 @@ struct NativeLoopConfig {
   // when its last request ends; the process keeps the Mac from idle sleep in
   // between (main.mm). It must not throw. Empty where nothing needs to know.
   std::function<void(bool)> holdingRequests;
+  // Told when the engine's own work fails (its failure boundary below caught
+  // an exception), before the failure is reported. It must not throw. Empty
+  // where nothing needs to know.
+  std::function<void()> engineFailed;
   std::function<uint64_t()> unixMicros = systemUnixMicros;
   std::function<double()> monotonicMilliseconds = awakeMilliseconds;
 };

@@ -202,6 +202,8 @@ bool NativeRuntime::weightsRefused(metal::AllocationFailure failure) {
 }
 
 void NativeRuntime::executionFailed(std::exception_ptr failure) {
+  if (config_.engineFailed)
+    config_.engineFailed();
   try {
     std::rethrow_exception(failure);
   } catch (const metal::MetalBackendError &error) {
