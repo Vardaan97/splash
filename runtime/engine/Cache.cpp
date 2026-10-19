@@ -613,6 +613,36 @@ CacheReclaimResult Cache::reclaimForPages(uint32_t pages, CacheReclaimMode mode,
   return total;
 }
 
+CacheReclaimResult Cache::reclaimForMemory(ReclaimClass upTo, bool keepRunway) {
+  // Free pages first, as the extent they fill; one that empties the runway
+  // kept gives nothing yet, and the next one does.
+  bool gone = false;
+  for (CacheReclaimResult released; (released = releaseExtent(keepRunway)).madeProgress;) {
+    if (released.reclaimedBytes)
+      return released;
+    gone = true;
+  }
+  // Then the victims in reclaimOne's order while their KV can empty an
+  // extent, until one is released or a state goes.
+  while (extentWithinReach(upTo)) {
+    const CacheReclaimResult evicted =
+        evictOne(CacheReclaimMode::ReleaseExtents, upTo, false, true);
+    if (!evicted.madeProgress || evicted.evictedState)
+      return {.madeProgress = gone || evicted.madeProgress,
+              .pending = evicted.pending,
+              .evictedState = evicted.evictedState};
+    gone = true;
+    if (const CacheReclaimResult released = releaseExtent(keepRunway); released.reclaimedBytes)
+      return released;
+  }
+  // Otherwise only a state.
+  CacheReclaimResult state = reclaimStateForLane(upTo);
+  state.madeProgress = state.madeProgress || gone;
+  if (!state.evictedState)
+    state.pending = state.pending || refusalPending(CacheReclaimMode::ReleaseExtents);
+  return state;
+}
+
 uint32_t Cache::reusablePages(ReclaimClass upTo, kv::PageForm form) const {
   const uint32_t unheld = pool_.reusablePages(form);
   if (upTo == ReclaimClass::InUse)
@@ -803,8 +833,8 @@ void Cache::dropPoisoned() {
   });
 }
 
-bool Cache::extentWithinReach() const {
-  return pendingPages(kv::PageForm::Full) + pool_.extentPages() <= reusablePages(ReclaimClass::Ordinary);
+bool Cache::extentWithinReach(ReclaimClass upTo) const {
+  return pendingPages(kv::PageForm::Full) + pool_.extentPages() <= reusablePages(upTo);
 }
 
 CacheReclaimResult Cache::releaseExtent(bool keepRunway) {

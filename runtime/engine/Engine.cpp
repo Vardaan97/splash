@@ -2012,11 +2012,11 @@ auto Engine::allocate(Attempt &&attempt, bool inService, ReclaimClass upTo,
 // The reclaim step for a lane's state the engine's limit refused. The pooled
 // buffers a lane starts from stay for its activation to take: idle model
 // memory beyond them goes first (a pooled buffer, else the idle vision
-// arena, else one rebuildable cache entry), then one empty extent, or else
-// one victim of the cache with the extent it empties. Memory for later (the
-// hot block cache's growth toward its planned size) takes no rebuildable
-// cache entry, among which that very cache's slots past its floor are, nor
-// the empty extent kept for the next request.
+// arena, else one rebuildable cache entry), then the cache gives up what
+// gives memory back: an extent, or a state (Cache::reclaimForMemory). Memory
+// for later (the hot block cache's growth toward its planned size) takes no
+// rebuildable cache entry, among which that very cache's slots past its
+// floor are, nor the empty extent kept for the next request.
 // A host refusal comes to neither step but to the reuse path (allocate()):
 // the pressure controller owns that shrink, and evicting for an allocator
 // that refuses all the same would drain the cache before macOS can
@@ -2025,10 +2025,12 @@ CacheReclaimResult Engine::reclaimForState(ReclaimClass upTo, bool forLater) {
   if (reclaimIdleState(true, forLater ? model::IdleMemory::Buffers
                                       : model::IdleMemory::BuffersThenCaches))
     return {true, 0};
-  const CacheReclaimResult reclaimed =
-      cache_.reclaimOne(CacheReclaimMode::ReleaseExtents, upTo, false, forLater, true);
+  CacheReclaimResult reclaimed = cache_.reclaimForMemory(upTo, forLater);
   if (reclaimed.madeProgress)
     signalResourceProgress();
+  // KV gone from an extent that stays gives the governor nothing: the
+  // allocation is asked for again only once memory has come back.
+  reclaimed.madeProgress = reclaimed.reclaimedBytes || reclaimed.evictedState;
   return reclaimed;
 }
 

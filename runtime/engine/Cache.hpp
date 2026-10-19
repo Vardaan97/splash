@@ -604,6 +604,17 @@ public:
   [[nodiscard]] CacheReclaimResult reclaimForPages(uint32_t pages, CacheReclaimMode mode,
                                                    ReclaimClass upTo,
                                                    kv::PageForm form = kv::PageForm::Full);
+  // The reclaim step for memory the governor funds that an allocation was
+  // refused: a lane's state, or the model's memory for its reads of spilled
+  // KV. It takes what reclaimOne(ReleaseExtents, upTo, false, keepRunway)
+  // takes, in its order, until memory comes back: an extent's bytes
+  // (reclaimedBytes), or a state's buffers, which the model's pool returns
+  // (evictedState). A KV leaf gives back memory only as the extent its page
+  // empties, so leaves go until one is released, and only while one can be
+  // (extentWithinReach(upTo)); otherwise only a state goes
+  // (reclaimStateForLane). It makes progress when anything goes, memory
+  // back or not, and is pending as a refused allocation is (refusalPending).
+  [[nodiscard]] CacheReclaimResult reclaimForMemory(ReclaimClass upTo, bool keepRunway);
   // The most pages of the form reclaimForPages(pages, mode, upTo, form) can
   // leave free: every allocated page of the form no request holds, but with
   // Ordinary not the idle KV that states in use restore through.
@@ -845,11 +856,11 @@ private:
   // An ordinary state at the block or anywhere below it.
   [[nodiscard]] bool holdsOrdinaryState(uint64_t block) const;
   void startRestore(uint64_t block);
-  // Evicting ordinary KV may empty an extent: the pages Ordinary may reuse
+  // Evicting KV of the class may empty an extent: the pages upTo may reuse
   // (reusablePages), less those whose demotion is in flight, cover one. That
   // counts the leaves that need a demotion too, which an Immediate step
   // passes over while the tier takes writes.
-  [[nodiscard]] bool extentWithinReach() const;
+  [[nodiscard]] bool extentWithinReach(ReclaimClass upTo = ReclaimClass::Ordinary) const;
   // Returns one extent of free pages: an empty one, or the one compactExtent
   // empties; progress with zero bytes when the extent emptied is the runway
   // kept. No progress when the free pages fill none.

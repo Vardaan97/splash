@@ -8578,6 +8578,41 @@ void testARefusedDecodeTakesThePrefillLanesMemory() {
   }
 }
 
+// The model's memory for a lane's reads of spilled KV is memory the
+// governor funds: only an extent's bytes or a state's buffers make room for
+// it. Refused a lane's floor of the hot block cache, the engine evicts no KV
+// leaf whose page cannot empty an extent, as an idle spilled chain's Index
+// pages cannot, and asks for the floor again only once memory has come
+// back, not after each leaf.
+void testRefusedModelMemoryTakesWhatGivesMemoryBack() {
+  // Extents of 64 pages, which the requests share.
+  Spilling spill(1024, true, Spilling::Extent{64});
+  // An earlier conversation leaves its spilled chain cached, its pages
+  // holding their index.
+  const std::vector<uint32_t> earlier(40 * KvCache::pageTokens + 1, 1);
+  spill.engine.submit(request(1, earlier));
+  spill.runUntilIdle();
+  const uint32_t indexPages = spill.cache.spillSnapshot().spilledPages;
+  require(spill.cache.lookup(earlier, {}).kvBoundary == 40 * KvCache::pageTokens && indexPages != 0,
+          "the earlier conversation did not leave its spilled chain cached");
+  // A lane decodes beside one refused its floor.
+  uint32_t attempts = 0;
+  bool room = false;
+  spill.model.spilledReadsRoom = [&](uint64_t id) {
+    attempts += id == 3;
+    return id != 3 || room;
+  };
+  spill.engine.submit(Spilling::prompt(2, 2, 5, 200));
+  spill.engine.submit(Spilling::prompt(3, 3, 5, 8));
+  spill.runUntil([&] { return attempts != 0; }, "the lane did not ask for its floor");
+  require(attempts <= 4 && spill.cache.spillSnapshot().spilledPages >= indexPages,
+          "a refused floor evicted Index pages, asking for it again after each");
+  room = true;
+  spill.runUntilIdle();
+  require(spill.events.completedCount == 3 && spill.events.failedCount == 0,
+          "the lane refused its floor did not run once it had it");
+}
+
 // A Spill lane whose pages the SSD cache takes no more of keeps them Full.
 // Alone at the memory wall, a decoding lane then ends with Length, as at
 // the end of its context, and a prefilling one fails naming the SSD cache;
@@ -11316,6 +11351,7 @@ int main() {
     testSpillResumeCommitsAgain();
     testDecodeLeavesOutALaneRefusedItsHotFloor();
     testARefusedDecodeTakesThePrefillLanesMemory();
+    testRefusedModelMemoryTakesWhatGivesMemoryBack();
     testLoneSpillLaneEndsAtTheWall();
     testHotCacheGrowthTakesNoModelCache();
     testStreamingLaneSizesItsCommandsByItsReads();

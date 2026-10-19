@@ -2524,7 +2524,9 @@ it (`cache.priority_suspensions` in `/status`) and resumes once a lane and its
 memory are free. A new request below the priority of a running lane neither
 starts nor takes a lane until no lane of that priority runs, since it could not
 run before. Critical pressure evicts every unpinned cache entry and stops all
-growth.
+growth. Refused at `--max-memory`, a lane's state, or the model's memory for
+reading KV from the SSD cache, takes cached KV only while evicting it can empty
+an extent, and is tried again only once an extent or a state has gone.
 
 A request keeps its reusable model state at the last whole 32-token page before
 its generation prompt, the text a chat template appends to open the reply: the
