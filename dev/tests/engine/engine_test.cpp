@@ -8044,7 +8044,7 @@ struct Spilling {
   explicit Spilling(uint32_t slots, bool always = true)
       : budget(std::make_shared<model::DiskBudget>(uint64_t{slots} * 100)),
         cache(pool, &tier, budget, CacheSpillPolicy{1, 1}),
-        engine(config(always, &paused), cache, model, events) {
+        engine(config(always, &paused, &serving), cache, model, events) {
     tier.budget = budget;
     tier.transferLimit = 1024;
     require(static_cast<bool>(pool.fillRunway(kv::PageForm::Index)),
@@ -8053,9 +8053,10 @@ struct Spilling {
     model.decodeFinishes = false;
   }
 
-  static EngineConfig config(bool always, const bool *paused) {
+  static EngineConfig config(bool always, const bool *paused, bool *serving) {
     EngineConfig result = test::engineConfig();
     result.growthPaused = [paused] { return *paused; };
+    result.serving = [serving](bool value) { return std::exchange(*serving, value); };
     result.spill = {.capable = true,
                     .always = always,
                     .denseTokens = KvCache::pageTokens,
@@ -8100,8 +8101,11 @@ struct Spilling {
   engine::Cache cache;
   Executor model;
   Events events;
-  // Whether the host holds growth back (EngineConfig::growthPaused).
+  // Whether the host holds growth back (EngineConfig::growthPaused), and
+  // whether the engine marks what it allocates as memory a request in
+  // service needs (EngineConfig::serving).
   bool paused = false;
+  bool serving = false;
   engine::Engine engine;
   double now = 1;
 };
@@ -8401,6 +8405,34 @@ void testSpilledFullExtentsLeaveOnceNoPromptGrows() {
     spill.paused = false;
     spill.runUntilIdle();
   }
+}
+
+// While the host holds growth back, a Spill prompt's landed pages move to
+// Index pages past the runway too: the Index extents they take are memory
+// the request in service needs, as its Full pages are, and free many times
+// what they take. A prompt that the engine's limit holds with its pages
+// spilled, but not as Full pages, completes with them spilled.
+void testSpillMovesThroughTheHostPause() {
+  Spilling spill(1024);
+  // As the governor does, the host refuses growth unless a request in
+  // service needs it, then the engine's limit: 90 Full pages.
+  spill.storage.budgetPages = 90;
+  spill.storage.growthAllowed = [&](uint32_t) {
+    const bool host = spill.paused && !spill.serving;
+    spill.storage.allocationFailure =
+        host ? metal::AllocationFailure::HostPressure : metal::AllocationFailure::EngineBudget;
+    return !host;
+  };
+  spill.paused = true;
+  // 120 pages and a token: two prefill commands, the second after 62 of the
+  // first's 64 pages spilled, 58 of them past the runway's four Index pages.
+  // As Full pages, the prompt's 121 outgrow the limit.
+  spill.engine.submit(Spilling::prompt(1, 1, 120, 8));
+  spill.runUntilIdle();
+  require(spill.events.failedCount == 0 && spill.events.completedCount == 1 &&
+              spill.events.usage.at(1).second == 8 && spill.model.prefillChunks.at(1) == 2 &&
+              spill.cache.spillSnapshot().spilledPages == 118,
+          "a Spill prompt kept its landed pages Full under the host's pause until the engine's limit");
 }
 
 // A Spill request suspended for a higher priority returns its commitment
@@ -11202,6 +11234,7 @@ int main() {
     testOnlySpillingLanesRunPrefillGroups();
     testALaneThatConvertsAtItsPrefillRunsItAloneAndWhole();
     testSpilledFullExtentsLeaveOnceNoPromptGrows();
+    testSpillMovesThroughTheHostPause();
     testSpillResumeCommitsAgain();
     testDecodeLeavesOutALaneRefusedItsHotFloor();
     testLoneSpillLaneEndsAtTheWall();

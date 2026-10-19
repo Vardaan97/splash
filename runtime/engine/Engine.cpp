@@ -1519,11 +1519,17 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
   // Index runway they draw on refills if memory allows. The Full extents
   // they empty leave memory too, but one, the runway, while a spilling
   // prompt still grows into it or the host holds growth back, when it could
-  // not be allocated again.
+  // not be allocated again. The Index pages, the runway's included, are
+  // memory the resident Spill lanes need, as their Full pages are, and a
+  // fraction of what the moves free: the host's pause holds them back only
+  // while no such lane is in service.
   if (spill) {
     const SpilledExtents extents =
         spillingPrompt() || config_.growthPaused() ? SpilledExtents::KeepRunway : SpilledExtents::Released;
-    static_cast<void>(allocate([&] { return cache_.spillWritten(extents); }, false,
+    const bool inService = std::any_of(requests_.begin(), requests_.end(), [](const auto &entry) {
+      return entry.second.lane && entry.second.kvMode == KvMode::Spill;
+    });
+    static_cast<void>(allocate([&] { return cache_.spillWritten(extents); }, inService,
                                ReclaimClass::Ordinary, {}, true));
   }
   // A command's later passes run its item again: the lane holds what it
