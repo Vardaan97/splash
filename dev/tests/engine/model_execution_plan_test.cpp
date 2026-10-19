@@ -4,6 +4,10 @@
 #include "model/ModelFactory.hpp"
 #include "model/QwenTargetLoader.hpp"
 #include "model/RuntimeArenas.hpp"
+#include "model/Qwen4Steps.hpp"
+#include "model/Qwen4ScratchSizing.hpp"
+
+#include <cmath>
 
 #include "metal/abi/QuantFormat.h"
 
@@ -26,8 +30,14 @@ template <class Weights>
 model::LoadedModel loadedModel() {
   model::LoadedModel result;
   Weights target;
-  const model::DFlashDraftLayout draft =
-      std::is_same_v<Weights, model::Qwen3_6MoeWeights> ? test::qwen3_6MoeDraft() : test::qwen3_8Draft();
+  const model::DFlashDraftLayout draft = [&] {
+    if constexpr (std::is_same_v<Weights, model::Qwen4ExpWeights>) {
+      target.layout.mtpLayers = 1;
+      return model::nullDraftLayout(target.layout.hiddenSize, target.layout.vocabularySize);
+    } else {
+      return std::is_same_v<Weights, model::Qwen3_6MoeWeights> ? test::qwen3_6MoeDraft() : test::qwen3_8Draft();
+    }
+  }();
   const auto projection = [](uint32_t n, uint32_t k) {
     return ops::Projection(n, k, ops::BlockWeights{{ops::QuantizedSegment::planes(GGUF_FMT_Q4K, n, k, {}, {}, {})}});
   };
@@ -53,11 +63,46 @@ model::LoadedModel loadedModel() {
       layer.downProjection = projection(layout.hiddenSize, layout.intermediateSize);
     }
   }
+  if constexpr (std::is_same_v<Weights, model::Qwen4ExpWeights>) {
+    const auto hyper = [&] {
+      model::Qwen4HyperWeights h;
+      h.down = projection(layout.hyperRank, layout.streamWidth());
+      h.up = projection(layout.streamWidth(), layout.hyperRank);
+      return h;
+    };
+    const auto indexer = [&] {
+      model::Qwen4IndexerWeights i;
+      i.query = projection(layout.indexerHeads * layout.indexerHeadDimension, layout.hiddenSize);
+      i.key = projection(layout.indexerHeadDimension, layout.hiddenSize);
+      return i;
+    };
+    for (uint32_t i = 0; i < layout.layers; ++i) {
+      auto &layer = target.layers[i];
+      layer.mixerHyper = hyper();
+      layer.ffnHyper = hyper();
+      if (layout.isFullAttentionLayer(i)) layer.indexer = indexer();
+    }
+    target.finalHyper = hyper();
+    target.mtp.emplace();
+    auto &mtp = *target.mtp;
+    mtp.block.mixer = model::QwenAttentionWeights{};
+    std::get<model::QwenAttentionWeights>(mtp.block.mixer).inputProjection =
+        projection(layout.packedFullWidth, layout.hiddenSize);
+    std::get<model::QwenAttentionWeights>(mtp.block.mixer).outputProjection =
+        projection(layout.hiddenSize, layout.attentionWidth);
+    mtp.block.mixerHyper = hyper();
+    mtp.block.ffnHyper = hyper();
+    mtp.block.indexer = indexer();
+    mtp.head = hyper();
+    mtp.embedHidden = projection(layout.hiddenSize, 2 * layout.hiddenSize);
+  }
   ops::VisionLayout vision;
   vision.outputHiddenSize = target.layout.hiddenSize;
   result.descriptor = model::makeModelDescriptor(
       "operator workspace test", target.layout, draft, vision,
-      model::TargetSource::Safetensors, model::VisionSource::Safetensors);
+      std::is_same_v<Weights, model::Qwen4ExpWeights> ? model::TargetSource::Gguf : model::TargetSource::Safetensors,
+      model::VisionSource::Safetensors);
+  if constexpr (std::is_same_v<Weights, model::Qwen4ExpWeights>) result.descriptor.draftModel = false;
   result.target = std::move(target);
   result.draft.layout = draft;
   return result;
@@ -184,6 +229,61 @@ void checkYarnGeometry() {
   }, "invalid model runtime geometry", "a geometry serving another window than the model's was accepted");
 }
 
+// CPU-only: the served YaRN window must reach MTP scratch planning without
+// losing its thirteenth KV layer, pending keys or no-DFlash workspace policy.
+void checkMtpYarnGeometry() {
+  for (double factor : {4.0, 1.9999771118164062}) {
+    auto loaded = loadedModel<model::Qwen4ExpWeights>();
+    loaded.descriptor = model::withYarn(std::move(loaded.descriptor), factor);
+    const auto g = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32);
+    const auto &t = g.target;
+    const auto &weights = std::get<model::Qwen4ExpWeights>(loaded.target);
+    const uint32_t window = factor == 4.0 ? 1'010'000 : 524'282;
+    require(!g.hasDraft && t.mtpLayers == 1 && t.kvLayout.attentionLayers == 13 &&
+                t.trunkAttentionLayers() == 12 && t.contextTokens() == window &&
+                t.ropeScaling == loaded.descriptor.ropeScaling,
+            "MTP geometry lost its served window, scaling or thirteenth KV layer");
+    const uint64_t pending = 13 * 3 * 128 * sizeof(uint16_t);
+    require(t.indexerPendingBytes() == pending &&
+                t.stateLayout.auxiliaryBytes == t.pleHistoryBytes() + pending +
+                                                   uint64_t{t.streamWidth()} * sizeof(float),
+            "MTP auxiliary state lost its pending keys or carried streams");
+    std::array<float, SPLASH_TARGET_ROPE_PAIRS> native{}, scaled{};
+    model::rotaryInverseFrequencies(t.rotaryTheta, t.rotaryPairs, {}, native);
+    model::rotaryInverseFrequencies(t.rotaryTheta, t.rotaryPairs, t.ropeScaling, scaled);
+    require(scaled.front() == native.front() &&
+                std::abs(scaled.back() * factor / native.back() - 1.0) < 1e-6 &&
+                std::abs(t.ropeScaling.attentionFactor() - (1.0 + 0.1 * std::log(factor))) < 1e-6,
+            "MTP target frequencies or attention factor were not scaled");
+    for (uint32_t family : {9U, 10U, 11U}) {
+      DeviceCapabilities device;
+      device.appleGpuFamily = family;
+      device.gpuCoreCount = 16;
+      const ops::ExecutionPlans plans(device);
+      require(model::DecodeArena::gateScratchBytes(g, plans) == 0,
+              "an MTP target planned DFlash gate scratch");
+    }
+    // The production planner must reserve every layer's raw keys. Removing
+    // one KV layer changes only that tensor, by one complete layer of keys.
+    auto twelve = t;
+    --twelve.kvLayout.attentionLayers;
+    const auto fewer = model::Qwen4Steps::scratchBytes(weights, twelve, g.prefillChunks);
+    const uint64_t keyLayerBytes = uint64_t{model::kLaneCount} * model::kDecodeRows *
+                                   BLOCK_INDEXER_DIMENSION * sizeof(uint16_t);
+    require(g.targetScratch.decode == fewer.decode + keyLayerBytes,
+            "MTP decode scratch did not reserve the thirteenth layer's raw keys");
+    const uint32_t capacity = model::qwen4IndexerMaskWords(t.contextTokens()) * 32;
+    for (uint32_t remaining = 2; remaining <= SPLASH_TARGET_VERIFY_ROWS; ++remaining) {
+      const uint32_t end = window - remaining + SPLASH_TARGET_VERIFY_ROWS;
+      require(capacity > end / BLOCK_INDEXER_BLOCK &&
+                  capacity > (end - 1) / BLOCK_INDEXER_BLOCK + BLOCK_INDEXER_TILE_SLACK,
+              "MTP indexer scratch does not cover the physical verify tail");
+    }
+    std::cout << "MTP YaRN factor " << factor << ": window " << window
+              << ", 13 KV layers, scaled frequencies, zero draft gate, pending/raw keys and tail PASS\n";
+  }
+}
+
 // Arenas are sized from the projections the weights hold, so each must have
 // sizes; an empty one would drop its workspace from the bound silently.
 void checkUnsizedProjection() {
@@ -251,6 +351,7 @@ int main() {
     checkGdnWidths();
     checkGateUpLayers();
     checkYarnGeometry();
+    checkMtpYarnGeometry();
     const auto dense = loadedModel<model::Qwen3_8Weights>();
     const auto sparse = loadedModel<model::Qwen3_6MoeWeights>();
     checkLaneScratch(dense);

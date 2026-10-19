@@ -1,5 +1,5 @@
 #include "metal/abi/KernelABI.h"
-#include "metal/abi/Qwen4.h"
+#include "metal/abi/Qwen4Mtp.h"
 #include "metal/abi/QuantFormat.h"
 #include "metal/abi/HyperConnection.h"
 #include "metal/kernels/common/rms_inverse.h"

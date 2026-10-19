@@ -1,3 +1,4 @@
+#include "ops/Qwen4Mtp.hpp"
 #include "model/Qwen4ExpTarget.hpp"
 
 #include "metal/abi/BlockIndexer.h"
@@ -401,7 +402,7 @@ void Qwen4ExpTarget::addStateCommit(metal::CommandGraph &graph, QwenTargetCommit
   if (hasMtp()) {
     const metal::MetalBuffer streams = steps_.verifyScratch(lanes * kVerifyRows).streams;
     for (uint32_t lane = 0; lane < lanes; ++lane)
-      ops::Qwen4::addMtpCarry(graph, rowsOf<float>(streams, lane * kVerifyRows, kVerifyRows,
+      ops::Qwen4Mtp::addMtpCarry(graph, rowsOf<float>(streams, lane * kVerifyRows, kVerifyRows,
                                                    geometry_.streamWidth()),
                               mtpCarried(buffers.auxiliaryOut[lane]),
                               backend_.view(buffers.retainedCounts, lane * sizeof(uint32_t), sizeof(uint32_t)),
@@ -495,22 +496,22 @@ void Qwen4ExpTarget::addMtpPrefill(PrefillStep &step) const {
   const uint32_t rows = step.rows, hidden = geometry_.hiddenSize, width = geometry_.streamWidth();
   const uint32_t stride = ExecutionLimits::prefillTokenBudget;
   for (const QwenTargetPrefillSequence &sequence : step.sequences) {
-    ops::Qwen4::addMtpInput(step.graph, rowsOf<uint16_t>(b.hidden[0], sequence.rowBegin, sequence.rows, hidden),
+    ops::Qwen4Mtp::addMtpInput(step.graph, rowsOf<uint16_t>(b.hidden[0], sequence.rowBegin, sequence.rows, hidden),
                             mtpCarried(sequence.auxiliaryIn),
                             rowsOf<float>(h.streams, sequence.rowBegin, sequence.rows, width),
                             mtp.embedNorm, mtp.hiddenNorm, h.mtpInput, hs, sequence.rows, sequence.rows,
                             sequence.rowBegin, stride);
-    ops::Qwen4::addMtpCarry(step.graph, rowsOf<float>(h.streams, sequence.rowBegin, sequence.rows, width),
+    ops::Qwen4Mtp::addMtpCarry(step.graph, rowsOf<float>(h.streams, sequence.rowBegin, sequence.rows, width),
                             mtpCarried(sequence.auxiliaryOut), {}, hs, sequence.rows);
     for (const QwenTargetStateCapture &capture : sequence.stateCaptures)
-      ops::Qwen4::addMtpCarry(step.graph, rowsOf<float>(h.streams, sequence.rowBegin, capture.row, width),
+      ops::Qwen4Mtp::addMtpCarry(step.graph, rowsOf<float>(h.streams, sequence.rowBegin, capture.row, width),
                               mtpCarried(capture.auxiliary), {}, hs, capture.row);
   }
   for (uint32_t s = 0; s < hs.streams; ++s)
     linear.addPrefill(step.graph, rowsOf<uint16_t>(h.mtpInput, s * stride, stride, 2 * hidden),
                       mtp.embedHidden, rowsOf<uint16_t>(h.gate, s * stride, stride, hidden), rows,
                       b.linearScratch);
-  ops::Qwen4::addMtpWiden(step.graph, h.gate, h.mtpStreams, hs, rows, stride);
+  ops::Qwen4Mtp::addMtpWiden(step.graph, h.gate, h.mtpStreams, hs, rows, stride);
   addPrefillMix(step, mtp.block.mixerHyper, b.normalized, h.mtpStreams);
   addPrefillMixer(step, std::get<QwenAttentionWeights>(mtp.block.mixer), {h.branch, {}}, addPrefillQsa(step, *mtp.block.indexer));
 }
@@ -530,7 +531,7 @@ void Qwen4ExpTarget::addMtpVerify(VerifyStep &step, metal::MetalBuffer embedding
   const uint32_t rows = step.rows, hidden = geometry_.hiddenSize, width = geometry_.streamWidth();
   const uint32_t stride = decodeStorageLanes(step.lanes) * laneRows;
   for (uint32_t lane = 0; lane < step.lanes; ++lane)
-    ops::Qwen4::addMtpInput(step.graph, rowsOf<uint16_t>(embedding, lane * laneRows, laneRows, hidden),
+    ops::Qwen4Mtp::addMtpInput(step.graph, rowsOf<uint16_t>(embedding, lane * laneRows, laneRows, hidden),
                             mtpCarried(b.auxiliary[lane]),
                             rowsOf<float>(history, lane * laneRows, laneRows, width), mtp.embedNorm,
                             mtp.hiddenNorm, h.mtpInput, hs, laneRows, limit, lane * laneRows, stride);
@@ -539,7 +540,7 @@ void Qwen4ExpTarget::addMtpVerify(VerifyStep &step, metal::MetalBuffer embedding
     addDecodeProjection(step.graph, rowsOf<uint16_t>(h.mtpInput, s * stride, stride, 2 * hidden),
                         mtp.embedHidden, rowsOf<uint16_t>(h.gate, s * stride, stride, hidden), step.lanes,
                         b.linearScratch);
-  ops::Qwen4::addMtpWiden(step.graph, h.gate, h.mtpStreams, hs, rows, stride);
+  ops::Qwen4Mtp::addMtpWiden(step.graph, h.gate, h.mtpStreams, hs, rows, stride);
   const uint32_t attentionLayer = geometry_.trunkAttentionLayers();
   const QwenAttentionWeights &attention = std::get<QwenAttentionWeights>(mtp.block.mixer);
   step.attentionLayer = attentionLayer;
@@ -579,7 +580,7 @@ void Qwen4ExpTarget::addMtpDraft(metal::CommandGraph &graph, QwenTargetVerifyBuf
       const ops::QuantizedSegment &rows = buffers.draftContextHeads[lane].blocks().segments.front();
       if (rows.outputSize != kQwen4DraftContextTokens || buffers.draftContextCounts[lane] > rows.outputSize)
         throw std::invalid_argument("invalid MTP draft context rows");
-      ops::Qwen4::addCopyHeadRows(graph, weights->logitsProjection.blocks().segments.front(), rows,
+      ops::Qwen4Mtp::addCopyHeadRows(graph, weights->logitsProjection.blocks().segments.front(), rows,
                                   buffers.draftContextCopies[lane], buffers.draftContextCopyCounts[lane]);
     }
   VerifyStep step{verifyStep(graph, buffers, kv, chunks, lanes)};
@@ -599,7 +600,7 @@ void Qwen4ExpTarget::addMtpDraft(metal::CommandGraph &graph, QwenTargetVerifyBuf
     // (h.mtpHistory), so they need no experts; the later rows repeat row
     // j - 1, so they route to its experts.
     for (uint32_t j = 1; j <= draft.steps; ++j) {
-      ops::Qwen4::addMtpTokens(graph, buffers.anchors, buffers.proposals, h.mtpTokens, lanes, laneRows,
+      ops::Qwen4Mtp::addMtpTokens(graph, buffers.anchors, buffers.proposals, h.mtpTokens, lanes, laneRows,
                                buffers.proposalsPerLane, j);
       ops::Embedding::add(graph, h.mtpTokens, weightsBase_.tokenEmbedding, buffers.hidden[1], step.rows);
       addMtpVerify(step, buffers.hidden[1], h.mtpHistory, j, true, j - 1, draftHead);
@@ -615,14 +616,14 @@ void Qwen4ExpTarget::addMtpDraft(metal::CommandGraph &graph, QwenTargetVerifyBuf
                                               uint64_t{buffers.draftContextLogitsSlot} * sizeof(float)),
                                 1, buffers.linearScratch);
           }
-        ops::Qwen4::addMtpArgmaxContext(graph, buffers.logits, buffers.proposals, buffers.candidates,
+        ops::Qwen4Mtp::addMtpArgmaxContext(graph, buffers.logits, buffers.proposals, buffers.candidates,
                                         draftHead->tokens, buffers.draftContextLogits, buffers.draftContextTokens,
                                         buffers.draftContextInfo, lanes, laneRows, vocabulary,
                                         kQwen4DraftContextTokens, buffers.draftContextLogitsSlot,
                                         buffers.proposalsPerLane, buffers.candidatesPerProposal, j - 1,
                                         j == draft.steps);
       } else {
-        ops::Qwen4::addMtpArgmax(graph, buffers.logits, buffers.proposals, buffers.candidates, lanes, laneRows,
+        ops::Qwen4Mtp::addMtpArgmax(graph, buffers.logits, buffers.proposals, buffers.candidates, lanes, laneRows,
                                  vocabulary, buffers.proposalsPerLane, buffers.candidatesPerProposal, j - 1,
                                  j == draft.steps, draftHead ? draftHead->tokens : metal::MetalBuffer{});
       }
@@ -635,7 +636,7 @@ void Qwen4ExpTarget::addMtpDraft(metal::CommandGraph &graph, QwenTargetVerifyBuf
       }
       if (j < draft.steps)
         for (uint32_t lane = 0; lane < lanes; ++lane)
-          ops::Qwen4::addMtpCarry(graph, rowsOf<float>(h.mtpStreams, lane * laneRows, j, width),
+          ops::Qwen4Mtp::addMtpCarry(graph, rowsOf<float>(h.mtpStreams, lane * laneRows, j, width),
                                   rowsOf<float>(h.mtpHistory, lane * laneRows + j - 1, 1, width), {},
                                   hyperShape(geometry_), j);
     }
