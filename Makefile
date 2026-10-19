@@ -258,6 +258,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/HyperConnection.cpp \
 	runtime/ops/NgramEmbedding.cpp \
 	runtime/ops/BlockIndexer.cpp \
+	runtime/ops/Qwen4Mtp.cpp \
 	runtime/ops/PagedAttention.cpp \
 	runtime/ops/PageStorage.cpp \
 	runtime/ops/RoPE.cpp \

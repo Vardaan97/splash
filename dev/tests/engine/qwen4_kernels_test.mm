@@ -1,3 +1,4 @@
+#include "ops/Qwen4Mtp.hpp"
 // Qwen3.8-Flash-Next's kernels (kernels/shared/hyper_connection.metal,
 // ngram_embedding.metal and block_indexer.metal) through ops::HyperConnection,
 // ops::NgramEmbedding and ops::BlockIndexer, against fp64 CPU references of the
@@ -32,7 +33,7 @@
 #include "metal/abi/HyperConnection.h"
 #include "metal/abi/NgramEmbedding.h"
 #include "metal/abi/QuantFormat.h"
-#include "metal/abi/Qwen4.h"
+#include "metal/abi/Qwen4Mtp.h"
 
 #import <Foundation/Foundation.h>
 
@@ -941,7 +942,7 @@ void streamMeanTest(MetalBackend &backend) {
   check(ok, "stream mean: each row's streams' mean, bf16, in its slot of wider rows");
 }
 
-// The MTP head's kernels (ops::Qwen4::addMtp*): the stream-major inputs of
+// The MTP head's kernels (ops::Qwen4Mtp::addMtp*): the stream-major inputs of
 // the embedding and the shifted streams, the widening of the eh projection's
 // rows, a draft step's tokens, the argmax proposals and the carried row.
 void mtpTest(MetalBackend &backend) {
@@ -957,7 +958,7 @@ void mtpTest(MetalBackend &backend) {
   MetalBuffer output = scratch(backend, uint64_t{streams} * total * 2 * hidden * 2);
   std::memset(output.contents(), 0, output.sizeBytes());
   CommandGraph graph;
-  ops::Qwen4::addMtpInput(graph, upload(backend, e16), upload(backend, carried), upload(backend, history),
+  ops::Qwen4Mtp::addMtpInput(graph, upload(backend, e16), upload(backend, carried), upload(backend, history),
                           NormWeights{upload(backend, enorm), true}, NormWeights{upload(backend, hnorm), true}, output,
                           shape, rows, limit, offset, total);
   run(backend, graph);
@@ -988,7 +989,7 @@ void mtpTest(MetalBackend &backend) {
   const auto projected = bf16s(randoms(rng, rows * width, 1.0f));
   MetalBuffer widened = scratch(backend, rows * width * 4);
   CommandGraph widen;
-  ops::Qwen4::addMtpWiden(widen, upload(backend, projected), widened, shape, rows, rows);
+  ops::Qwen4Mtp::addMtpWiden(widen, upload(backend, projected), widened, shape, rows, rows);
   run(backend, widen);
   const auto w = download<float>(widened, rows * width);
   bool okWiden = true;
@@ -1006,7 +1007,7 @@ void mtpTest(MetalBackend &backend) {
   MetalBuffer anchorBuffer = upload(backend, anchors), proposedBuffer = upload(backend, proposed),
               tokens = scratch(backend, lanes * laneRows * 4);
   CommandGraph tokenGraph;
-  ops::Qwen4::addMtpTokens(tokenGraph, anchorBuffer, proposedBuffer, tokens, lanes, laneRows, proposals, 3);
+  ops::Qwen4Mtp::addMtpTokens(tokenGraph, anchorBuffer, proposedBuffer, tokens, lanes, laneRows, proposals, 3);
   run(backend, tokenGraph);
   const auto t = download<uint32_t>(tokens, lanes * laneRows);
   bool okTokens = true;
@@ -1024,7 +1025,7 @@ void mtpTest(MetalBackend &backend) {
   std::vector<uint32_t> cand(lanes * proposals * candidates, 7);
   MetalBuffer candidateBuffer = upload(backend, cand);
   CommandGraph argmax;
-  ops::Qwen4::addMtpArgmax(argmax, upload(backend, logits), proposedBuffer, candidateBuffer, lanes, laneRows,
+  ops::Qwen4Mtp::addMtpArgmax(argmax, upload(backend, logits), proposedBuffer, candidateBuffer, lanes, laneRows,
                            vocabulary, proposals, candidates, 4, true);
   run(backend, argmax);
   const auto p = download<uint32_t>(proposedBuffer, lanes * proposals);
@@ -1053,9 +1054,9 @@ void mtpTest(MetalBackend &backend) {
   MetalBuffer mappedProposed = upload(backend, mappedProposals), mappedCandidate = upload(backend, mappedCandidates);
   MetalBuffer draftLogitBuffer = upload(backend, draftLogits);
   CommandGraph mapped;
-  ops::Qwen4::addMtpArgmax(mapped, draftLogitBuffer, mappedProposed, mappedCandidate, lanes, laneRows, drafted,
+  ops::Qwen4Mtp::addMtpArgmax(mapped, draftLogitBuffer, mappedProposed, mappedCandidate, lanes, laneRows, drafted,
                            proposals, candidates, 2, false, upload(backend, draftTokens));
-  ops::Qwen4::addMtpArgmax(mapped, draftLogitBuffer, mappedProposed, mappedCandidate, lanes, laneRows, drafted,
+  ops::Qwen4Mtp::addMtpArgmax(mapped, draftLogitBuffer, mappedProposed, mappedCandidate, lanes, laneRows, drafted,
                            proposals, candidates, 3, true, upload(backend, draftTokens));
   run(backend, mapped);
   const auto mp = download<uint32_t>(mappedProposed, lanes * proposals);
@@ -1092,7 +1093,7 @@ void mtpTest(MetalBackend &backend) {
   std::vector<uint32_t> contextProposals(lanes * proposals, 5), contextCandidates(lanes * proposals * candidates, 7);
   MetalBuffer contextProposed = upload(backend, contextProposals), contextCandidate = upload(backend, contextCandidates);
   CommandGraph withContext;
-  ops::Qwen4::addMtpArgmaxContext(withContext, upload(backend, vocabularyLogits), contextProposed, contextCandidate,
+  ops::Qwen4Mtp::addMtpArgmaxContext(withContext, upload(backend, vocabularyLogits), contextProposed, contextCandidate,
                                   upload(backend, draftTokens), upload(backend, contextLogits),
                                   upload(backend, contextTokens), upload(backend, info), lanes, laneRows, drafted,
                                   capacity, slot, proposals, candidates, 1, true);
@@ -1130,7 +1131,7 @@ void mtpTest(MetalBackend &backend) {
         ops::QuantizedSegment::planes(format, targetRows, inputs, t0, layout.plane1_bytes ? t1 : MetalBuffer{}, tm);
     const std::vector<uint32_t> pairs{5, 0, 77, 1, 127, 63, 0, 64, 64, 127};
     CommandGraph copies;
-    ops::Qwen4::addCopyHeadRows(copies, source, target, upload(backend, pairs), 5);
+    ops::Qwen4Mtp::addCopyHeadRows(copies, source, target, upload(backend, pairs), 5);
     run(backend, copies);
     const auto rowOf = [&](const uint8_t *plane, uint32_t row, uint32_t units, uint32_t unitBytes) {
       std::vector<uint8_t> out;
@@ -1165,8 +1166,8 @@ void mtpTest(MetalBackend &backend) {
   MetalBuffer carriedOut = scratch(backend, width * 4), carriedFixed = scratch(backend, width * 4);
   MetalBuffer streamBuffer = upload(backend, streamRows);
   CommandGraph carry;
-  ops::Qwen4::addMtpCarry(carry, streamBuffer, carriedOut, upload(backend, std::vector<uint32_t>{5}), shape, laneRows);
-  ops::Qwen4::addMtpCarry(carry, streamBuffer, carriedFixed, {}, shape, 3);
+  ops::Qwen4Mtp::addMtpCarry(carry, streamBuffer, carriedOut, upload(backend, std::vector<uint32_t>{5}), shape, laneRows);
+  ops::Qwen4Mtp::addMtpCarry(carry, streamBuffer, carriedFixed, {}, shape, 3);
   run(backend, carry);
   const auto co = download<float>(carriedOut, width), cf = download<float>(carriedFixed, width);
   bool okCarry = true;
