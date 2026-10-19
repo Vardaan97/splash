@@ -3217,8 +3217,8 @@ float projection and hyper-connection norm tiles and attention partitions, and a
 draft and prompt-cache invariance for Flash-Next on Apple9/Apple10 with int8 or bf16 KV
 in the dense QSA regime (up to 2048 tokens); verify partitions remain position-invariant
 up to 32K tokens. Sparse QSA unions, reuse inside previously generated history, sampled
-decoding and other model families are outside this guarantee. Performance costs await
-owner-window measurements; no speed claim is made from untimed correctness tests.
+decoding and other model families are outside this guarantee. The measured observations below are from an earlier build; untimed kernel
+checks do not establish runtime speed or a broader identity guarantee.
 
 ## Deterministic mode integration on Flash-Next
 
