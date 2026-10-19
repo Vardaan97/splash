@@ -8295,6 +8295,82 @@ void testOnlySpillingLanesRunPrefillGroups() {
   }
 }
 
+// A Resident lane that restored a spilled chain, whose copies landed, and
+// converts to Spill when memory refuses its prefill command spills the
+// chain's pages at once (Cache::convertToSpill): from that command on it
+// streams its history from the SSD cache, which the plan made before did
+// not know. The command runs it as the scheduler runs a lane that streams,
+// alone and whole: in one pass where the model runs a command in passes
+// over its layers, and without a lane planned beside it, which it leads or
+// follows.
+void testALaneThatConvertsAtItsPrefillRunsItAloneAndWhole() {
+  // The model's passes, and the rows of a peer whose prompt has run a
+  // chunk, beside which the lane's command is planned: none, more than the
+  // lane's, or fewer.
+  for (const auto &[passes, peerRows] : {std::pair{4u, 0u}, {1u, 300u}, {1u, 40u}}) {
+    Spilling spill(64, false);
+    // Each prefill command: its width, its passes, and the lane whose
+    // history it streams, if any (one at most, as the model checks).
+    struct Command final {
+      uint32_t width, passes;
+      uint64_t streamed;
+    };
+    std::vector<Command> prefills;
+    spill.model.commandTimes = [&](const BatchPlan &plan, std::span<const ModelBatchItem> items) {
+      if (plan.kind == WorkKind::Prefill) {
+        const auto streamed = std::ranges::find_if(items, [](const ModelBatchItem &item) {
+          return item.pageSources != nullptr;
+        });
+        prefills.push_back({plan.width(), plan.passes, streamed == items.end() ? 0 : streamed->requestId});
+      }
+      return test::CommandTimes{};
+    };
+    // The first turn converts at the memory wall as it decodes, and its
+    // pages spill as their copies land, but its dense page and its window's;
+    // the wall took its states, and the turn again keeps one at its end.
+    spill.storage.budgetPages = 9;
+    spill.engine.submit(Spilling::prompt(1, 1, 7, 40));
+    spill.runUntilIdle();
+    std::vector<uint32_t> history(7 * KvCache::pageTokens + 1, 1);
+    history.insert(history.end(), spill.events.outputs.at(1).begin(), spill.events.outputs.at(1).end());
+    spill.storage.budgetPages = std::numeric_limits<uint32_t>::max();
+    spill.engine.submit(request(2, history));
+    spill.runUntilIdle();
+    require(spill.engine.snapshot().spill.converted == 1 && spill.cache.spillSnapshot().spilledPages == 6,
+            "the first turn did not spill its chain");
+    // The next turn starts Resident and restores the chain into Full pages,
+    // its copies kept; 192 tokens more take seven pages past its eight.
+    spill.model.passes = passes;
+    spill.engine.observePrefill(model::ExecutionLimits::prefillTokenBudget, passes > 1 ? 4900.0 : 1000.0,
+                                passes > 1 ? 3400.0 : 0.0);
+    history.insert(history.end(), 192, 5);
+    spill.engine.submit(request(3, history));
+    static_cast<void>(spill.engine.tick(spill.now++));
+    if (peerRows) {
+      // A peer runs its first chunk while the restore is in flight, which
+      // lands before the peer's next command.
+      spill.engine.submit(
+          request(4, std::vector<uint32_t>(model::ExecutionLimits::prefillTokenBudget + peerRows, 7)));
+      static_cast<void>(spill.engine.tick(spill.now++));
+      spill.tier.complete();
+      static_cast<void>(spill.engine.tick(spill.now++));
+    }
+    // The host refuses growth until the chain spills again: the lane's
+    // command converts it, and its pages move into free Index pages.
+    spill.storage.growthAllowed = [&](uint32_t) { return spill.cache.spillSnapshot().spilledPages != 0; };
+    spill.runUntilIdle();
+    require(spill.events.failedCount == 0 && spill.events.completedCount == (peerRows ? 4u : 3u) &&
+                spill.engine.snapshot().spill.converted == 2 &&
+                std::ranges::any_of(prefills, [](const Command &command) { return command.streamed == 3; }),
+            "the lane did not convert at its prefill and stream its history");
+    require(std::ranges::all_of(prefills,
+                                [](const Command &command) {
+                                  return !command.streamed || (command.width == 1 && command.passes == 1);
+                                }),
+            "a command streamed a lane's history beside another lane or in passes");
+  }
+}
+
 // The Full extents a spill empties leave memory, but one, the runway, while
 // a spilling prompt still grows into it or the host holds growth back.
 void testSpilledFullExtentsLeaveOnceNoPromptGrows() {
@@ -11124,6 +11200,7 @@ int main() {
     testAStartThatConvertsCountsNoConversion();
     testShortQuotaBoundsWaitsOrRefusesASpillStart();
     testOnlySpillingLanesRunPrefillGroups();
+    testALaneThatConvertsAtItsPrefillRunsItAloneAndWhole();
     testSpilledFullExtentsLeaveOnceNoPromptGrows();
     testSpillResumeCommitsAgain();
     testDecodeLeavesOutALaneRefusedItsHotFloor();

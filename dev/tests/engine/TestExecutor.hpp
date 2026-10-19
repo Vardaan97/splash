@@ -458,6 +458,18 @@ public:
   submit(const BatchPlan &plan, std::span<const ModelBatchItem> items,
          std::function<void()> completion) override {
     checkPageTables(items);
+    // A prefill command streams the history of one lane at most, whose
+    // pages hold only their index, and only whole, as the production
+    // runtime refuses another.
+    if (plan.kind == WorkKind::Prefill) {
+      const auto streams = std::ranges::count_if(items, [](const ModelBatchItem &item) {
+        return item.pageSources && item.pageSources->indexPages();
+      });
+      if (streams > 1)
+        throw std::logic_error("a prefill command streams the history of one sequence");
+      if (streams && plan.passes > 1)
+        throw std::invalid_argument("a prefill command's passes are not ones the runtime runs");
+    }
     std::unique_ptr<ModelBatchTicket> ticket;
     if (plan.kind == WorkKind::Decode && plan.constrained &&
         plan.decodeStage == DecodeStage::Regular) {

@@ -1615,6 +1615,21 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
     // A lane that runs is waiting for nothing.
     active.resourceWait = {};
   }
+  // Admission may have converted a lane to Spill, whose history then
+  // streams (streamsHistory), at once where its restored chain's copies had
+  // landed: the plan, made before, did not know. The command takes the
+  // shape the scheduler gives a lane that streams, alone and whole
+  // (planPrefill, passesFor): a command streams one lane's history, and
+  // only whole.
+  if (prefill && spill && !admitted.empty()) {
+    const auto streams = [&](const BatchItem &item) { return streamsHistory(request(item.requestId)); };
+    if (streams(admitted.front())) {
+      admitted.resize(1);
+      plan.passes = 1;
+    } else {
+      std::erase_if(admitted, streams);
+    }
+  }
   // The hot block cache they read through grows toward its planned size,
   // by an extent at most, into memory nothing needs now.
   if (spilledReads)
