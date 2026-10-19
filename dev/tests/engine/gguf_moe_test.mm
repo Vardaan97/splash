@@ -1025,7 +1025,7 @@ void identityMoe(MetalBackend &backend, splash::ops::DeterminismPolicy policy) {
     const auto *routeRows = static_cast<const uint32_t *>(b.moe.scratch.routeRows.contents());
     for (uint32_t row = 0; row < order.size(); ++row)
       for (uint32_t route = 0; route <= top; ++route)
-        result.column.push_back(columnTile(tiles, routeRows[row * (top + 1) + route] / plan.tileRows()));
+        result.column.push_back(moe_column_tile(tiles, routeRows[row * (top + 1) + route] / plan.tileRows()));
     return result;
   };
   std::vector<uint32_t> order(total); std::iota(order.begin(), order.end(), 0);
