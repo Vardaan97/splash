@@ -1,4 +1,5 @@
 import contextlib
+import dataclasses
 import io
 import math
 import re
@@ -26,7 +27,7 @@ from dev.tests.installer_fixtures import (
     family_config,
     selection,
 )
-from install import assembly, gguf, hub, models, upstream
+from install import assembly, families, gguf, hub, models, upstream
 
 GGUF_REPO = "unsloth/Qwen3.6-35B-A3B-GGUF"
 
@@ -1064,13 +1065,12 @@ class GgufMetadataTests(unittest.TestCase):
             ),
         )
 
-    def flash_next_repository(self, repo, draft):
+    def flash_next_repository(self, repo):
         """A Qwen3.8-Flash-Next GGUF in repo on a FakeHub, as its Q2_0
         release stores it: Q2_0 experts and 16-bit floats where the loader
         reads floats (a BF16 router, shared-expert scalar gate and injection
-        weights, an F16 PLE convolution); and a DFlash2 draft of it in
-        draft, of the fixture's made-up sizes: none is released for the
-        family."""
+        weights, an F16 PLE convolution), with the family's DFlash2 draft
+        repository, of the fixture's made-up sizes."""
 
         def build(root):
             root.mkdir(parents=True)
@@ -1093,13 +1093,17 @@ class GgufMetadataTests(unittest.TestCase):
 
         fake = FakeHub(self, self.root / "hub")
         fake.publish(repo, "a" * 40, build)
-        fake.publish(draft, DRAFT_COMMIT, lambda root: draft_dir(root, FLASH_NEXT))
+        fake.publish(
+            FLASH_NEXT.draft_repo,
+            DRAFT_COMMIT,
+            lambda root: draft_dir(root, FLASH_NEXT),
+        )
         return fake
 
-    def test_flash_next_drafts_with_the_draft_it_names(self):
-        repo, draft = "someone/Flash-Next-GGUF", "someone/Flash-Next-DFlash2"
-        fake = self.flash_next_repository(repo, draft)
-        chosen = selection(self.root, repo + ":Q2_0", draft_model=draft)
+    def test_flash_next_drafts_with_its_released_draft(self):
+        repo, draft = "someone/Flash-Next-GGUF", FLASH_NEXT.draft_repo
+        fake = self.flash_next_repository(repo)
+        chosen = selection(self.root, repo + ":Q2_0")
         output = self.prepare(chosen)
         self.assertIn(f"Selected model-Q2_0.gguf from {repo}.", output)
         self.assertEqual(fake.requests, [(repo, None), (draft, None)])
@@ -1124,13 +1128,17 @@ class GgufMetadataTests(unittest.TestCase):
             family_config(FLASH_NEXT, "draft/config.json"),
         )
 
-    def test_flash_next_without_a_draft_is_refused_before_any_download(self):
+    def test_a_family_without_a_released_draft_is_refused_before_any_download(self):
         repo = "someone/Flash-Next-GGUF"
-        fake = self.flash_next_repository(repo, "someone/Flash-Next-DFlash2")
-        with self.assertRaisesRegex(
-            models.ModelError,
-            "no DFlash2 draft is released for Qwen3.8-Flash-Next; "
-            "name one with --draft-model",
+        fake = self.flash_next_repository(repo)
+        unreleased = dataclasses.replace(FLASH_NEXT, draft_repo=None)
+        with (
+            mock.patch.object(families, "FAMILIES", (unreleased,)),
+            self.assertRaisesRegex(
+                models.ModelError,
+                "no DFlash2 draft is released for Qwen3.8-Flash-Next; "
+                "name one with --draft-model",
+            ),
         ):
             self.prepare(selection(self.root, repo + ":Q2_0"))
         self.assertNotIn(f"{repo}/model-Q2_0.gguf", fake.downloads)

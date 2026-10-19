@@ -26,7 +26,7 @@ class ModelFamily:
 FAMILIES = (
     ModelFamily("Qwen3.8-27B", "incoai/Qwen3.8-27B-DFlash2"),
     ModelFamily("Qwen3.6-35B-A3B", "incoai/Qwen3.6-35B-A3B-DFlash2"),
-    ModelFamily("Qwen3.8-Flash-Next", None),
+    ModelFamily("Qwen3.8-Flash-Next", "incoai/Qwen3.8-Flash-Next-DFlash2"),
 )
 
 

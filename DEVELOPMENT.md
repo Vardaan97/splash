@@ -1552,8 +1552,8 @@ the parameters, `GgufFile` and the planner check the rest).
 Every model decodes with a DFlash2 draft. Each family names the repository
 of the DFlash2 checkpoint trained for it (`families.FAMILIES`), which holds
 it as the release publishes it: `config.json` and BF16 `model.safetensors`
-(or the shards its index names); no draft of Qwen3.8-Flash-Next is released
-yet, so its installation names one with `--draft-model`. Installation
+(or the shards its index names); a family whose draft is not released yet
+names none, and its installation names one with `--draft-model`. Installation
 downloads only those files and follows the repository's default branch as it
 follows the target's ([Revisions](#revisions)); `--draft-model` accepts
 another repository, followed the same way, or a local directory that holds
