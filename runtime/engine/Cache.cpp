@@ -835,7 +835,7 @@ void Cache::dropPoisoned() {
 }
 
 bool Cache::extentWithinReach(ReclaimClass upTo) const {
-  return pendingPages(kv::PageForm::Full) + pool_.extentPages() <= reusablePages(upTo);
+  return writes(WriteClass::Reclaim) + pool_.extentPages() <= reusablePages(upTo);
 }
 
 CacheReclaimResult Cache::releaseExtent(bool keepRunway) {

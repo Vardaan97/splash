@@ -867,7 +867,9 @@ private:
   // Evicting KV of the class may empty an extent: the pages upTo may reuse
   // (reusablePages), less those whose demotion is in flight, cover one. That
   // counts the leaves that need a demotion too, which an Immediate step
-  // passes over while the tier takes writes.
+  // passes over while the tier takes writes. A page written through is none
+  // of them: its Spill request holds it, though it frees once its copy lands
+  // (pendingPages).
   [[nodiscard]] bool extentWithinReach(ReclaimClass upTo = ReclaimClass::Ordinary) const;
   // Returns one extent of free pages: an empty one, or the one compactExtent
   // empties; progress with zero bytes when the extent emptied is the runway

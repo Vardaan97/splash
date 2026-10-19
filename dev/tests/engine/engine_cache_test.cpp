@@ -4658,6 +4658,40 @@ void testWritesThatFreeNothingHoldNothingBack() {
   spill.cache.endRequest(1);
 }
 
+// The reclaim for memory the governor funds evicts KV while that can empty
+// an extent: the pages it may reuse, less those whose demotion is in
+// flight, cover one. A page written through that will spill is its Spill
+// request's, not one of them: while such writes are in flight, an idle
+// chain whose leaves empty an extent still goes, and the extent is
+// released.
+void testMemoryReclaimEmptiesAnExtentBesideWritesThatSpill() {
+  Spilling spill;
+  // Two Index pages hold other blocks' index: the Index extent is not empty,
+  // and of the four writes that will spill, the two the free Index pages
+  // can take are pending.
+  KvPageAcquisition index = spill.pool.acquirePages(2, kv::PageForm::Index);
+  spill.start(1, Spilling::prompt(1000, 6), 6);
+  // An idle chain on the second extent's last page and the third's first
+  // three, whose fourth is free.
+  spill.start(2, Spilling::prompt(5000, 4), 4, KvMode::Resident);
+  spill.cache.endRequest(2);
+  require(index.granted() && spill.cache.writeThrough() == 6 &&
+              spill.cache.pendingPages(kv::PageForm::Full) == 2 && spill.pool.freePageCount() == 1 &&
+              spill.cache.reusablePages(ReclaimClass::Ordinary) == 5,
+          "fixture geometry changed");
+  const CacheReclaimResult reclaimed = spill.cache.reclaimForMemory(ReclaimClass::Ordinary, false);
+  require(reclaimed.reclaimedBytes == 400 && spill.storage.releasedExtents == 1 &&
+              spill.cache.pendingPages(kv::PageForm::Full) == 2,
+          "the reclaim for memory stopped short of the extent an idle chain empties beside writes "
+          "that spill");
+  spill.cache.checkInvariants();
+  for (uint32_t page : index.pages)
+    spill.pool.releasePage(page, false);
+  spill.tier.complete();
+  static_cast<void>(spill.cache.pollTransfers());
+  spill.cache.endRequest(1);
+}
+
 // A Resident request whose growth is denied converts to Spill: it commits
 // quota, its published pages start to be written, and the admission run
 // again waits for them, without allocating anything, until they land and
@@ -5278,6 +5312,7 @@ int main() {
     testReusablePagesCountTheirForm();
     testPendingPagesCountWritesThatSpill();
     testWritesThatFreeNothingHoldNothingBack();
+    testMemoryReclaimEmptiesAnExtentBesideWritesThatSpill();
     testConversionWaitsForItsPagesToSpill();
     testConversionAtTheWallFindsTheRunway();
     testUnspillOnlyAsTheOnlyHolder();
