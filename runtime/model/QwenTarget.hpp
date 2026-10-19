@@ -382,6 +382,10 @@ struct QwenTargetMtpDraft final {
   // Whether the steps draft from the draft vocabulary and the lanes' context
   // rows (QwenTarget::hasMtpDraftVocabulary) rather than the whole head.
   bool draftVocabulary = false;
+  // Opt-in at B>1: each lane stops at its own depth and gates its own head.
+  bool perLane = false;
+  std::array<uint32_t, ExecutionLimits::maximumBatchWidth> laneSteps{};
+  uint32_t vocabularyMask = 0;
   // With `prefetchEvent`, step `prefetchStep` copies each lane's proposals so
   // far to `prefetchTokens` (proposalsPerLane uint32 per lane) and signals
   // the event to `prefetchValue`: a streamed PLE table reads the rows those
@@ -497,6 +501,9 @@ public:
       const kv::PageStorage &kv,
       std::span<const kv::ChunkedPrefillParams> chunks,
       uint32_t lanes, uint32_t liveRows = 0) const = 0;
+  virtual void addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
+                         const kv::PageStorage &kv, std::span<const kv::ChunkedPrefillParams> chunks,
+                         uint32_t lanes, std::array<uint32_t, ExecutionLimits::maximumBatchWidth> liveRows) const;
   // The head over `lanes` lanes of targetVerifyRows rows of the last layer's
   // output, as verify ends: one sweep of the vocabulary projection for every
   // lane.

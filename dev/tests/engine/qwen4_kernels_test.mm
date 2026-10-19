@@ -964,7 +964,8 @@ void mtpTest(MetalBackend &backend) {
   const ops::HyperShape shape{hidden, streams, 0};
   const auto embedding = randoms(rng, rows * hidden, 1.0f);
   const auto carried = randoms(rng, width, 2.0f);
-  const auto history = randoms(rng, rows * width, 2.0f);
+  auto history = randoms(rng, rows * width, 2.0f);
+  std::fill(history.begin() + (limit - 1) * width, history.end(), NAN);
   const auto enorm = randoms(rng, hidden, 1.0f);
   const auto hnorm = randoms(rng, width, 1.0f);
   const auto e16 = bf16s(embedding);
@@ -1119,6 +1120,34 @@ void mtpTest(MetalBackend &backend) {
   }
   okContext &= cp[0] == 5 && cp[proposals] == 5;
   check(okContext, "MTP argmax with context rows: a context token, the lower token on a tie, only the lane's count");
+
+  // Mixed vocabulary gates and depths use independent B1 selectors, but
+  // proposals/candidates remain at the batch lane offsets. Lane
+  // 0 stops after a mapped+context proposal; lane 1 continues with the whole
+  // vocabulary. Its later selection must not overwrite the stopped lane.
+  MetalBuffer mixedProposed = upload(backend, std::vector<uint32_t>(lanes * proposals, 5));
+  MetalBuffer mixedCandidate = upload(backend, std::vector<uint32_t>(lanes * proposals * candidates, 7));
+  const auto view = [&](MetalBuffer buffer, uint32_t lane, uint32_t count) {
+    return backend.view(buffer, uint64_t{lane} * count * 4, uint64_t{count} * 4);
+  };
+  CommandGraph mixed;
+  ops::Qwen4Mtp::addMtpArgmaxContext(mixed, upload(backend, vocabularyLogits), view(mixedProposed, 0, proposals),
+      view(mixedCandidate, 0, proposals * candidates), upload(backend, draftTokens),
+      upload(backend, contextLogits), upload(backend, contextTokens), view(upload(backend, info), 0, 4),
+      1, laneRows, drafted, capacity, slot, proposals, candidates, 1, true);
+  ops::Qwen4Mtp::addMtpArgmax(mixed, view(upload(backend, logits), 1, laneRows * vocabulary),
+      view(mixedProposed, 1, proposals), view(mixedCandidate, 1, proposals * candidates),
+      1, laneRows, vocabulary, proposals, candidates, 3, true);
+  run(backend, mixed);
+  const auto mixedTokens = download<uint32_t>(mixedProposed, lanes * proposals);
+  uint32_t wholeBest = 0;
+  for (uint32_t token = 1; token < vocabulary; ++token)
+    if (logits[(laneRows + 3) * uint64_t{vocabulary} + token] >
+        logits[(laneRows + 3) * uint64_t{vocabulary} + wholeBest]) wholeBest = token;
+  bool okMixed = mixedTokens[0] == 5;
+  for (uint32_t i = 1; i < proposals; ++i) okMixed &= mixedTokens[i] == 202007;
+  for (uint32_t i = 0; i < proposals; ++i) okMixed &= mixedTokens[proposals + i] == (i < 3 ? 5 : wholeBest);
+  check(okMixed, "MTP lane gates: mapped+context and whole-head selectors retain independent depths and tails");
 
   // Rows of one quantized tensor copied to rows of another: each pair's
   // destination row is its source row, byte for byte, in every plane.

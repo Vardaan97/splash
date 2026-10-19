@@ -36,6 +36,9 @@ public:
   void prepareVerifyLane(uint32_t lane, uint64_t position, const QwenTargetRequest &request) override;
   void addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers, const kv::PageStorage &kv,
                  std::span<const kv::ChunkedPrefillParams> chunks, uint32_t lanes, uint32_t liveRows = 0) const override;
+  void addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers, const kv::PageStorage &kv,
+                   std::span<const kv::ChunkedPrefillParams> chunks, uint32_t lanes,
+                   std::array<uint32_t, ExecutionLimits::maximumBatchWidth> liveRows) const override;
   // The hidden rows are the final mix, which the head reads as they are.
   void addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden, metal::MetalBuffer finalHidden,
                     metal::MetalBuffer logits, uint32_t lanes, ops::LinearScratch scratch) const override;
@@ -110,7 +113,8 @@ private:
 
   void addMtpPrefill(PrefillStep &step) const;
   void addMtpVerify(VerifyStep &step, metal::MetalBuffer embedding, metal::MetalBuffer history,
-                    uint32_t limit, bool full, uint32_t firstRow = 0, const Qwen4DraftHead *draftHead = nullptr) const;
+                    uint32_t limit, bool full, uint32_t firstRow = 0, const Qwen4DraftHead *draftHead = nullptr,
+                    std::span<const uint32_t> lastRows = {}, std::span<const uint32_t> laneSteps = {}) const;
   [[nodiscard]] metal::MetalBuffer mtpCarried(const metal::MetalBuffer &auxiliary) const;
   const Qwen4ExpWeights &weights_;
   // The step scratch and the inputs the target makes of a step's tokens.

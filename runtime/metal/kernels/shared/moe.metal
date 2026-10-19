@@ -135,7 +135,9 @@ MOE_ROUTE_SELECT_ENTRY(moe_route_select_f32_e512, SPLASH_MOE_WIDE_EXPERT_SLOTS)
 inline bool moe_route_dropped(uint row, constant MoeGroupParams &params) {
   if (!params.lane_rows) return false;
   const uint lane_row = row % params.lane_rows;
-  return lane_row < params.first_row || (params.last_row && lane_row >= params.last_row);
+  const uint lane_last = row / params.lane_rows < SPLASH_MAXIMUM_BATCH_WIDTH ? params.last_rows[row / params.lane_rows] : 0;
+  const uint last = lane_last ? lane_last : params.last_row;
+  return lane_row < params.first_row || (last && lane_row >= last);
 }
 
 template <uint Slots>

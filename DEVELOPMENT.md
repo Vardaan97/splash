@@ -1717,6 +1717,12 @@ differ from drafting with the whole head, since the same acceptance uniform
 can keep a different token when the proposal differs. `SPLASH_MTP_DRAFT_VOCAB=0`
 drafts from the whole head at every step and writes no image.
 
+`SPLASH_MTP_LANES=1` (default off) lets concurrent MTP requests choose
+their own adaptive draft depth and draft-vocabulary gate. Stopped lanes keep
+their repeated proposal tails and read only initialized draft history. Mixed
+heads consume the shared reduced-head projection before whole-head fallbacks
+reuse its logits buffer. One request keeps the existing path.
+
 A draft's `config.json` states its layers, intermediate size, rotary base and
 the target layers whose outputs it reads (`dflash_config.target_layer_ids`,
 ascending, at most eight); its hidden size, vocabulary and mask token are its
@@ -3306,3 +3312,26 @@ while a server runs. Running it again upgrades; installed models stay. To try
 an archive before uploading it, serve `dist/` (`python3 -m http.server`) and
 run the installer with `SPLASH_BASE_URL` naming that server, `SPLASH_VERSION`
 and any `SPLASH_TOKEN`.
+
+## Per-lane MTP drafting
+
+`SPLASH_MTP_LANES=1` enables independent adaptive depth and draft-vocabulary
+gates for concurrent MTP lanes. It defaults off; a single lane uses the existing
+path. Verify geometry remains eight rows per lane. Each lane retains at most
+its own drafted prefix, stopped lanes read initialized history only, and mapped
+heads consume the shared projection before whole-head fallbacks reuse logits.
+Active context binding and proposal accounting follow each lane's actual depth.
+No confidence threshold or draft-to-verify host handoff is added.
+
+Tests: engine lane-order/depth helpers, native argument parsing, shader-validated
+GGUF MoE mixed and exhausted bounds, and Qwen4 mixed-head selectors with poisoned
+stopped-lane history.
+
+Measured on M5 Max 128 GB, Flash-Next UD-Q4_K_XL, the 2026-10-19 lanes-det
+round measured 98.9/124.5/155.8 aggregate tok/s at C=1/2/4. Against the first
+REF this is approximately +13/+11/+19%; against the report's launch-interpolated
+REF it is +11.0/+10.1/+14.3%. The brief's +11/+11/+19% combines comparison
+conventions, so it is not one consistent effect estimate. Short closed-loop
+gap p95 fell 2.2/13.3/31.1% versus interpolated REF. All short passes had zero
+request errors. This is one earlier round without confidence intervals, not a
+measurement of the c323 rebase.

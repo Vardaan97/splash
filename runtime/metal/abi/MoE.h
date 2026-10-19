@@ -7,6 +7,8 @@
 #include <stdint.h>
 #endif
 
+#include "ExecutionGeometry.h"
+
 // The expert slots of the routing kernels (ops::MoE): a row's router scores
 // take this many floats, the block's experts first, and the select and
 // grouping kernels run one thread per slot. A MoE block of at most
@@ -74,10 +76,12 @@ struct MoeGroupParams {
   uint32_t lane_rows;
   uint32_t first_row;
   uint32_t last_row;
+  // A nonzero lane bound overrides last_row; zero uses the scalar bound.
+  uint32_t last_rows[SPLASH_MAXIMUM_BATCH_WIDTH];
 };
 
-static_assert(sizeof(MoeGroupParams) == 36,
-              "MoE grouping parameters are 36 bytes on both sides");
+static_assert(sizeof(MoeGroupParams) == 52,
+              "MoE grouping parameters are 52 bytes on both sides");
 
 // What the grouping writes besides the tiles: their count, which every pass
 // over them reads first, and the grids (column tiles, tiles, 1) of the
