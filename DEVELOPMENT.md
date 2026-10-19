@@ -209,7 +209,7 @@ routed experts load with their layers where that leaves KV its allowance, and
 otherwise stream through a store of all that the allowance and the PLE
 table's share leave ([streamed experts](#streamed-experts)); the PLE table
 loads where the rest holds it, and otherwise streams through a row cache of
-its share, 2 GiB at most ([PLE table streaming](#ple-table-streaming)); KV and
+its share, 512 MiB at most ([PLE table streaming](#ple-table-streaming)); KV and
 the states take what remains. The allowance is the KV of a context, in the
 fewest pages whose extents hold it as one request's KV capacity rounds them:
 a block-sparse target's first 64K tokens, kept in memory. A dense target keeps
@@ -284,7 +284,10 @@ image is written, and the weights shrink by the stored table size. Startup
 memory requirements also include the cache and Metal staging buffers. The
 rows each command gathers are read through a host cache with a SIZE-byte
 cache and working-memory reservation, auto's share of the budget, at most
-2 GiB; the engine refuses a SIZE that holds no row, and a SIZE that holds the
+512 MiB: the cache hits only rows read before, and a request reads few
+distinct rows (a 128K-token prompt about 1.1M, a quarter of what 512 MiB
+holds), so a larger one hits no more often and leaves streamed experts less.
+The engine refuses a SIZE that holds no row, and a SIZE that holds the
 whole table loads it with the weights instead, as `--ple-memory off` does. A
 table whose rows the GGUF does not store as the gathers read them (NVFP4,
 which the loader rebuilds, or any table of a rotated GGUF) loads with the

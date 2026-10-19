@@ -486,7 +486,7 @@ void testHotBlockCacheIsDefinedOnce() {
 
 // The priorities on the three Macs: the floors, then Flash-Next's experts
 // take all that the KV allowance (the first 64K tokens, resident) and the
-// PLE table's 2 GiB leave, all of them on the M5 Pro; the table its 2 GiB;
+// PLE table's 512 MiB leave, all of them on the M5 Pro; the table its 512 MiB;
 // the hot cache stays at its floor. The context spilling serves is the
 // window where memory and the SSD cache's room hold it, the room's on the M6.
 void testFlashNextOnTheThreeMacs() {
@@ -495,8 +495,8 @@ void testFlashNextOnTheThreeMacs() {
     const StreamedMemoryInputs inputs = kFlashNext.inputs(mac);
     const StreamedMemoryPlan plan = requirePlan(inputs);
     const KvSpillPlan &spill = plan.spill;
-    require(spill.enabled && plan.tableBytes == 2 * kGiB, std::string("Flash-Next's table on the ") + mac.name +
-                                                              " does not stream through its 2 GiB");
+    require(spill.enabled && plan.tableBytes == 512 * kMiB, std::string("Flash-Next's table on the ") + mac.name +
+                                                                " does not stream through its 512 MiB");
     // The floors, the arenas, the stores and the KV of the first 64K tokens
     // and their speculative rows (2,049 pages), in the fewest pages whose
     // extents hold them as one request's capacity, the runway among them,
@@ -642,7 +642,7 @@ void testOverridesAndRefusals() {
   StreamedMemoryInputs inputs = kFlashNext.inputs(kStudio);
   inputs.experts.setting = {StreamedSetting::Mode::Size, 12 * kGiB};
   const StreamedMemoryPlan explicitExperts = requirePlan(inputs);
-  require(explicitExperts.expertBytes == 12 * kGiB && explicitExperts.tableBytes == 2 * kGiB,
+  require(explicitExperts.expertBytes == 12 * kGiB && explicitExperts.tableBytes == 512 * kMiB,
           "an explicit --expert-memory was not its store");
   inputs.experts.setting = {StreamedSetting::Mode::Size, kFlashNext.experts.allBytes};
   require(!planStreamedMemory(inputs).plan, "experts that do not fit loaded whole");

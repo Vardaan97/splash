@@ -18,10 +18,11 @@ namespace {
 // stores take the rest of the budget, and a dense target too once its
 // experts stream: requests up to it never spill while they decode alone.
 constexpr uint64_t kResidentAllowanceTokens = 65'536;
-// The streamed PLE table's row cache before the experts take the rest: a
-// prefill's stages and the decode cycles' rows hit it nearly as often as a
-// larger one.
-constexpr uint64_t kTableShareBytes = 2 * kGiB;
+// The streamed PLE table's row cache before the experts take the rest. It
+// hits only rows read before, and a request reads few distinct rows: a
+// 128K-token prompt about 1.1M, a quarter of what 512 MiB holds. A larger
+// cache hits no more often and leaves streamed experts less.
+constexpr uint64_t kTableShareBytes = 512 * kMiB;
 // A Spill request's tail window: the pages before its open page that it
 // keeps Full. A decode selects about a tenth of its blocks in its last 64
 // pages.

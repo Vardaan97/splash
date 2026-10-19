@@ -199,7 +199,7 @@ struct StreamedMemoryResult final {
 // floors at the context spilling serves. Then the routed experts load whole
 // where that leaves KV its allowance, and otherwise stream through all that
 // the allowance and the PLE table's share leave; the table loads whole where
-// the rest holds it, and otherwise streams through its share, at most 2 GiB.
+// the rest holds it, and otherwise streams through its share, 512 MiB at most.
 // The allowance is the KV of a context in the fewest pages whose whole
 // extents hold it, as one request's capacity rounds them (kvCapacityPagesFor):
 // a spill-capable target's first 64K tokens; a dense target's --max-context,
