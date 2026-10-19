@@ -3219,3 +3219,27 @@ in the dense QSA regime (up to 2048 tokens); verify partitions remain position-i
 up to 32K tokens. Sparse QSA unions, reuse inside previously generated history, sampled
 decoding and other model families are outside this guarantee. Performance costs await
 owner-window measurements; no speed claim is made from untimed correctness tests.
+
+## Deterministic mode integration on Flash-Next
+
+This branch is based directly on c3232319 and needs neither MTP nor per-lane
+drafting. The same dense projection planner, dense paged attention, scheduler
+alignment and startup policy serve the 27B path. This establishes code coverage,
+not a real-model reproduction or verified fix of issue #483 on 27B or main.
+The MoE routing bounds support the identity tests without requiring MTP.
+
+Measured on M5 Max 128 GB, Flash-Next UD-Q4_K_XL, the 2026-10-19 lanes-det
+round gave DET and DET-LANE 48/48 greedy identity in all recorded cold/warm
+C=1/2/4 comparisons, with warm checks reporting 47 hits and one miss per pass.
+The final REF had 17–21/48 identity on the corresponding warm/cold comparisons.
+The first REF warm-cache assertion failed, so it is excluded from that claim.
+Long-prompt TTFT cost was about +2–9%; single-stream short decode throughput
+was approximately unchanged (+1.4% DET aggregate in this round). These are
+earlier measurements, not performance or model-identity results for this rebase.
+
+The default is off. Enable all controls with `SPLASH_DETERMINISTIC=1` or `all`,
+fp32 state and ANE FFN off. Parts are `moe,dense,prefill,float,attention,align`.
+Partial sets are diagnostic and do not promise whole-runtime identity. Fixed
+weights, device, build and decoding policy are part of the scope; sampled
+requests and cross-build identity are not guaranteed. Deterministic policy
+separates persistent-cache namespaces. Startup rejects incompatible state/ANE.
