@@ -22,6 +22,7 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <iomanip>
 #include <limits>
 #include <mutex>
 #include <new>
@@ -498,9 +499,10 @@ struct BackendAsyncState {
 // that keeps the GPU awake the runner raises the backend's release counter to
 // the step's value, which ends the GPU's spin through it (host_step_wait),
 // and then runs the step's `then` once its work returned. Each step runs
-// unless the command buffer before it failed; the first step that throws
-// names the command's failure, and a `then` that throws marks the backend
-// unhealthy (EventStep). The runner notes when it took each
+// unless the command buffer before it failed or an earlier step of its
+// command did not run or threw (halted); the first step that throws names the
+// command's failure, and a `then` that throws marks the backend unhealthy
+// (EventStep). The runner notes when it took each
 // step up and when its work returned, which the command's completion reports
 // (timed) against the GPU times of the buffers before and after the step,
 // and each is the command's progress for the watchdog (CommandWatchdog).
@@ -533,6 +535,9 @@ struct HostSteps {
     // Whether report() handed the round trips on: a command whose late
     // callback the watchdog recovered finishes twice.
     bool reported = false;
+    // Whether a step did not run or threw, after which the runner runs none
+    // of the command's steps (the runner's alone).
+    bool halted = false;
 
     void fail(std::string message) {
         std::lock_guard lock(mutex);
@@ -567,6 +572,37 @@ struct HostSteps {
             step.timed(timing);
         }
         return waited;
+    }
+    // A failed command's account of the steps that ran: how many, the longest
+    // work, and the longest pickup (from the end of the GPU work before a
+    // step to its start, which a runner held up by earlier work lengthens),
+    // each with its step, counted from 1; empty when none ran.
+    std::string longest() {
+        std::lock_guard lock(mutex);
+        double work = 0.0, pickup = 0.0;
+        size_t ran = 0, workStep = 0, pickupStep = 0;
+        for (size_t index = 0; index < steps.size(); ++index) {
+            const Step &step = steps[index];
+            if (!step.done) continue;
+            ++ran;
+            if (!workStep || step.done - step.pickup > work) {
+                work = step.done - step.pickup;
+                workStep = index + 1;
+            }
+            id<MTLCommandBuffer> before = step.before;
+            const double ended = before ? before.GPUEndTime : 0.0;
+            if (ended > 0.0 && (!pickupStep || step.pickup - ended > pickup)) {
+                pickup = step.pickup - ended;
+                pickupStep = index + 1;
+            }
+        }
+        if (!ran) return {};
+        std::ostringstream text;
+        text << std::fixed << std::setprecision(3) << " (host steps: " << ran << " of " << steps.size()
+             << " ran; the longest worked " << work << " s, step " << workStep;
+        if (pickupStep) text << "; the longest pickup " << pickup << " s, step " << pickupStep;
+        text << ')';
+        return text.str();
     }
 };
 
@@ -647,8 +683,11 @@ private:
                 id<MTLCommandBuffer> before = step.before;
                 bool worked = false;
                 std::optional<double> returned;
-                if (before && reached(event, step.ready, before) &&
-                    before.status != MTLCommandBufferStatusError) {
+                // A halted command's step still waits for the work before
+                // it, which the event's value then follows.
+                const bool ready = before && reached(event, step.ready, before) &&
+                                   before.status != MTLCommandBufferStatusError;
+                if (ready && !steps.halted) {
                     const double pickup = awakeSeconds();
                     steps.backend->progressSubmission(steps.sequence, pickup);
                     try {
@@ -664,6 +703,7 @@ private:
                 } else if (stopping_) {
                     steps.fail("host step not run: the backend stopped");
                 }
+                if (!worked) steps.halted = true;
                 event.signaledValue = step.ready + 1;
                 if (step.release) release(steps.releases, *step.release);
                 // The step's return moves the deadline once the GPU went on.
@@ -753,6 +793,7 @@ struct CommandTicket::State {
             if (failed && failed.error) {
                 message << ": " << errorDescription(failed.error);
             }
+            if (hostSteps) message << hostSteps->longest();
             error = message.str();
         }
         if (hostSteps && error.empty()) {
