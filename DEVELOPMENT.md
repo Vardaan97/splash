@@ -2740,8 +2740,12 @@ and write-behind wakes when the budget has room again.
 Writes happen when RAM reclamation selects a victim. States copy through one
 staging buffer, freeing their RAM immediately. KV leaves needed by a state
 on them or below them are written straight from their extents and released
-after the write succeeds. Unneeded tails are dropped without writing, before any
-state, together with any disk copies below them. A restored page is read
+after the write succeeds; only then is the block above such a leaf a leaf. A
+chain whose newest blocks have no copy, as a finished request's prompt past the
+chain it restored, so leaves RAM one write at a time, and an allocation refused
+meanwhile waits for each write while that chain holds more to take. Unneeded
+tails are dropped without writing, before any state, together with any disk
+copies below them. A restored page is read
 straight into its extent. Either way the transfer runs on the file's IO worker
 beside whatever command the model runs: a cached page is never written by a
 command, and no command uses a page before its read has landed. While a step

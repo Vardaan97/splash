@@ -589,7 +589,8 @@ public:
   // recurrent state. keepRunway leaves one empty extent allocated, for the
   // next request. For an allocation that was refused (`refused`), the
   // transfer in flight that holds back what is in use, and is reported
-  // pending, is one that returns what the allocation lacks (refusalPending).
+  // pending, is one that returns what the allocation lacks (refusalPending),
+  // or a demotion that holds back the leaf it takes next (demotionHoldsLeaf).
   [[nodiscard]] CacheReclaimResult reclaimOne(CacheReclaimMode mode, ReclaimClass upTo,
                                               bool keepResumePoint = false,
                                               bool keepRunway = false, bool refused = false);
@@ -613,7 +614,7 @@ public:
   // empties, so leaves go until one is released, and only while one can be
   // (extentWithinReach(upTo)); otherwise only a state goes
   // (reclaimStateForLane). It makes progress when anything goes, memory
-  // back or not, and is pending as a refused allocation is (refusalPending).
+  // back or not, and is pending as reclaimOne is for a refused allocation.
   [[nodiscard]] CacheReclaimResult reclaimForMemory(ReclaimClass upTo, bool keepRunway);
   // The most pages of the form reclaimForPages(pages, mode, upTo, form) can
   // leave free: every allocated page of the form no request holds, but with
@@ -759,6 +760,13 @@ private:
   // (admitPages, reclaimForPages): they cover it, or it does not wait for
   // them. Only what transfersInFlight() reports is.
   [[nodiscard]] bool refusalPending(CacheReclaimMode mode) const noexcept;
+  // Whether a demotion in flight holds back a KV leaf of the class (upTo):
+  // its block keeps its page until the copy lands, and only then is the
+  // block above it a leaf (KvCache::uncovered), which a refused allocation
+  // takes next. A cached chain whose newest blocks have no copy, as a
+  // finished lane's prompt past what it restored, leaves memory so, one
+  // landing at a time, the blocks with a copy at once after them.
+  [[nodiscard]] bool demotionHoldsLeaf(ReclaimClass upTo) const;
   // One reclaimOldest scan: the class it takes (what is in use, or the
   // ordinary class), whether it keeps the resume point, what becomes of a
   // state whose write cannot start now, how long the caller can wait for KV

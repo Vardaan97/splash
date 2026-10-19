@@ -537,11 +537,12 @@ CacheReclaimResult Cache::evictOne(CacheReclaimMode mode, ReclaimClass upTo, boo
   const bool pagesOnly = mode == CacheReclaimMode::ReusePages;
   // Whether a transfer in flight returns, as it lands, what this step needs
   // first, before anything in use: for a pass any; for an allocation that
-  // was refused a leaf the scan found waiting for one, or what
-  // refusalPending names.
+  // was refused a leaf the scan found waiting for one, a leaf of the class
+  // taken a demotion holds back, or what refusalPending names.
   bool waited = false;
-  const auto returns = [&] {
-    return refused ? waited || refusalPending(mode) : transfersInFlight();
+  const auto returns = [&](ReclaimClass taken) {
+    return refused ? waited || demotionHoldsLeaf(taken) || refusalPending(mode)
+                   : transfersInFlight();
   };
   // Disposable checkpoints go first, except in a page scan, to which their
   // buffers give no page; one whose write must wait for the one in flight
@@ -558,7 +559,7 @@ CacheReclaimResult Cache::evictOne(CacheReclaimMode mode, ReclaimClass upTo, boo
   for (const bool inUse : {false, true}) {
     if (inUse && upTo == ReclaimClass::Ordinary)
       break;
-    if (inUse && returns())
+    if (inUse && returns(ReclaimClass::Ordinary))
       return {.pending = true};
     if (const auto victim = reclaimOldest({.inUse = inUse,
                                            .keepResumePoint = keepResumePoint,
@@ -570,7 +571,7 @@ CacheReclaimResult Cache::evictOne(CacheReclaimMode mode, ReclaimClass upTo, boo
   }
   // Nothing to reclaim now. Transfers land only in pollTransfers(), so what
   // was in flight during the pass still is, and comes back.
-  return {.pending = returns()};
+  return {.pending = returns(upTo)};
 }
 
 CacheReclaimResult Cache::reclaimForPages(uint32_t pages, CacheReclaimMode mode,
@@ -887,6 +888,13 @@ bool Cache::transfersInFlight() const noexcept {
   // that spills once its copy lands returns something.
   return !restores_.empty() || writes(WriteClass::Reclaim) || writes(WriteClass::Persist) ||
          states_.writing() || spillingWrites();
+}
+
+bool Cache::demotionHoldsLeaf(ReclaimClass upTo) const {
+  return std::ranges::any_of(writes_, [&](const Write &write) {
+    const uint64_t above = write.write == WriteClass::Reclaim ? kv_.uncovered(write.block) : 0;
+    return above && (upTo == ReclaimClass::InUse || !kvNeededByStateInUse(above));
+  });
 }
 
 bool Cache::refusalPending(CacheReclaimMode mode) const noexcept {

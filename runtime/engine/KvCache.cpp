@@ -379,9 +379,19 @@ uint32_t KvCache::idlePagesOnChains(std::span<const uint64_t> blocks, kv::PageFo
 }
 
 bool KvCache::residentLeaf(uint64_t blockId) const {
+  return leafBut(block(blockId), 0);
+}
+
+uint64_t KvCache::uncovered(uint64_t blockId) const {
   const Block &entry = block(blockId);
-  return entry.page != noPage && !entry.residentChildren && !entry.activeUsers &&
-         !entry.held && entry.transfer == Transfer::None && !entry.poisoned;
+  if (entry.page == noPage || !entry.parent)
+    return 0;
+  return leafBut(block(entry.parent), 1) ? entry.parent : 0;
+}
+
+bool KvCache::leafBut(const Block &entry, uint32_t residentChildren) noexcept {
+  return entry.page != noPage && entry.residentChildren == residentChildren &&
+         !entry.activeUsers && !entry.held && entry.transfer == Transfer::None && !entry.poisoned;
 }
 
 void KvCache::setTransfer(uint64_t blockId, Transfer transfer) {

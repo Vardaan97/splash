@@ -165,6 +165,9 @@ public:
   [[nodiscard]] uint32_t idlePagesOnChains(std::span<const uint64_t> blocks, kv::PageForm form) const;
   // Resident, without resident children, users or holders: its page can go.
   [[nodiscard]] bool residentLeaf(uint64_t blockId) const;
+  // The block above a resident one that is a resident leaf once this one's
+  // page has gone, as when its demotion lands; 0 for none.
+  [[nodiscard]] uint64_t uncovered(uint64_t blockId) const;
   // Starts a transfer of the block's page, or ends it with None; one at a
   // time.
   void setTransfer(uint64_t blockId, Transfer transfer);
@@ -265,6 +268,9 @@ private:
 
   [[nodiscard]] Block &block(uint64_t blockId);
   [[nodiscard]] const Block &block(uint64_t blockId) const;
+  // A resident leaf (residentLeaf) but for `residentChildren` resident
+  // children, which have yet to leave RAM.
+  [[nodiscard]] static bool leafBut(const Block &entry, uint32_t residentChildren) noexcept;
   // Places the block in the orders its state calls for.
   void reindex(Block &entry) noexcept;
   void giveDiskCopy(Block &entry, std::shared_ptr<KvDiskSlot> slot);

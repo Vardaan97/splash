@@ -8613,6 +8613,64 @@ void testRefusedModelMemoryTakesWhatGivesMemoryBack() {
           "the lane refused its floor did not run once it had it");
 }
 
+// A cached chain leaves memory leaf first, and a leaf a state on the SSD
+// needs is written before it goes: its block keeps its page until the copy
+// lands, and only then is the block above it a leaf. So a chain whose newest
+// blocks have no copy, as a finished lane's prompt past the chain it restored
+// or a cancelled cold prompt, gives its memory back one landed write at a
+// time, the blocks with a copy at once after them. A Spill lane refused its
+// floor of the hot block cache, left alone by such a neighbour, waits for
+// those writes rather than fail while the memory it lacks comes back.
+void testALoneLaneWaitsForTheChainANeighbourLeft() {
+  for (const bool restored : {true, false}) {
+    // Extents of 16 pages, which the requests share. Every state goes
+    // straight to the SSD.
+    Spilling spill(1024, true, Spilling::Extent{16});
+    spill.model.deniedReservations = std::numeric_limits<uint32_t>::max();
+    spill.model.stateTier = std::make_shared<OffloadControl>();
+    spill.model.stateTier->ready = true;
+    spill.model.restoreControl->ready = true;
+    // An earlier turn leaves its chain spilled, its copies written through.
+    if (restored) {
+      spill.engine.submit(Spilling::prompt(1, 1, 40, 1));
+      spill.runUntilIdle();
+    }
+    // The neighbour starts Resident, as a request does while the SSD cache
+    // takes no writes: it restores that chain into Full pages, its copies
+    // kept, or none, and runs eight pages of prompt past it.
+    spill.tier.writableFile = false;
+    spill.engine.submit(Spilling::prompt(2, 1, 48, 10000));
+    spill.runUntil([&] { return spill.events.outputs.contains(2); }, "the neighbour did not decode");
+    spill.tier.writableFile = true;
+    // The Spill lane's floor fits once two extents have left memory since it
+    // first asked for it.
+    std::optional<uint64_t> limit;
+    spill.model.spilledReadsRoom = [&](uint64_t id) {
+      if (id != 3)
+        return true;
+      if (!limit)
+        limit = spill.storage.allocatedBytes() - 2 * 16 * 100;
+      return spill.storage.allocatedBytes() <= *limit;
+    };
+    spill.engine.submit(Spilling::prompt(3, 3, 20, 8));
+    spill.runUntil([&] { return limit.has_value(); }, "the Spill lane did not ask for its floor");
+    // The neighbour finishes, or is cancelled.
+    if (restored)
+      spill.model.decodeFinishes = true;
+    else
+      spill.engine.cancel(2);
+    spill.runUntilIdle();
+    require(spill.events.failedCount == 0 && spill.events.outputs.contains(3),
+            restored ? "a lone lane refused its floor failed while a finished neighbour's chain was written"
+                     : "a lone lane refused its floor failed while a cancelled neighbour's chain was written");
+    require(std::ranges::count_if(spill.tier.writes,
+                                  [](const test::TestKvTier::Write &write) {
+                                    return write.write == WriteClass::Reclaim;
+                                  }) > 1,
+            "the neighbour's chain left memory without writes one after another");
+  }
+}
+
 // A Spill lane whose pages the SSD cache takes no more of keeps them Full.
 // Alone at the memory wall, a decoding lane then ends with Length, as at
 // the end of its context, and a prefilling one fails naming the SSD cache;
@@ -11352,6 +11410,7 @@ int main() {
     testDecodeLeavesOutALaneRefusedItsHotFloor();
     testARefusedDecodeTakesThePrefillLanesMemory();
     testRefusedModelMemoryTakesWhatGivesMemoryBack();
+    testALoneLaneWaitsForTheChainANeighbourLeft();
     testLoneSpillLaneEndsAtTheWall();
     testHotCacheGrowthTakesNoModelCache();
     testStreamingLaneSizesItsCommandsByItsReads();
