@@ -554,9 +554,10 @@ public:
     return statesLacked ? statesLacked() : 0;
   }
   // The production model reserves a decoding lane's floor of the hot block
-  // cache, which the fake refuses for the requests in refusedSpilledReads.
+  // cache, which the fake refuses for the requests in refusedSpilledReads,
+  // and while spilledReadsRoom reports no memory for the request's.
   model::ModelMemoryAdmission reserveSpilledReads(uint64_t id) override {
-    if (refusedSpilledReads.contains(id))
+    if (refusedSpilledReads.contains(id) || (spilledReadsRoom && !spilledReadsRoom(id)))
       return {.allocationFailure = metal::AllocationFailure::EngineBudget};
     return {.ok = true};
   }
@@ -781,6 +782,7 @@ public:
   // Requests whose floor of the hot block cache is refused
   // (reserveSpilledReads).
   std::unordered_set<uint64_t> refusedSpilledReads;
+  std::function<bool(uint64_t)> spilledReadsRoom;
   std::optional<metal::AllocationFailure> refusedGrowth;
   uint32_t growthAttempts = 0;
   // Blocks of KV the SSD cache holds that each request's next step reports

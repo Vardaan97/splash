@@ -587,10 +587,12 @@ public:
   // publication holds and costs the next request a replay of its whole
   // prompt, because a hybrid model cannot resume from cached KV without the
   // recurrent state. keepRunway leaves one empty extent allocated, for the
-  // next request.
+  // next request. For an allocation that was refused (`refused`), the
+  // transfer in flight that holds back what is in use, and is reported
+  // pending, is one that returns what the allocation lacks (refusalPending).
   [[nodiscard]] CacheReclaimResult reclaimOne(CacheReclaimMode mode, ReclaimClass upTo,
                                               bool keepResumePoint = false,
-                                              bool keepRunway = false);
+                                              bool keepRunway = false, bool refused = false);
   // The reclaim step for a KV admission the pool denied: evicts in
   // reclaimOne(mode, upTo)'s order, mode being KeepExtents, or ReusePages
   // while the host refuses growth, until the free pages and the pages whose
@@ -636,11 +638,11 @@ public:
   // Recycles one unpinned state, preferring checkpoints, for a lane that
   // takes the state's buffers, taking nothing of a class above upTo. For
   // running work (InUse) a state in use goes once no other state is left and
-  // no transfer in flight can return what is needed first; a start that a
-  // resident lane holds back (Ordinary) takes nothing in use. A state the
-  // tier could take once the write in flight has finished stays and is
-  // reported pending, as in reclaimOne. evictableStates(upTo) are those it
-  // can take.
+  // no transfer in flight holds a leaf or a state that could go first
+  // (refusalPending); a start that a resident lane holds back (Ordinary)
+  // takes nothing in use. A state the tier could take once the write in
+  // flight has finished stays and is reported pending, as in reclaimOne.
+  // evictableStates(upTo) are those it can take.
   [[nodiscard]] CacheReclaimResult reclaimStateForLane(ReclaimClass upTo);
   [[nodiscard]] uint32_t evictableStates(ReclaimClass upTo) const noexcept {
     return states_.evictableStates(upTo == ReclaimClass::InUse);
@@ -732,10 +734,20 @@ private:
   [[nodiscard]] TokenAdmission admitPages(uint32_t count, std::vector<uint32_t> &pages,
                                           kv::PageForm form = kv::PageForm::Full);
   // One eviction: checkpoints first, then the ordinary class's
-  // reclaimOldest, then, up to InUse, that of what is in use. pagesOnly
-  // (CacheReclaimMode::ReusePages) skips the checkpoints and scans for pages.
-  [[nodiscard]] CacheReclaimResult evictOne(ReclaimClass upTo, bool keepResumePoint,
-                                            bool pagesOnly);
+  // reclaimOldest, then, up to InUse, that of what is in use, as reclaimOne
+  // describes. ReusePages skips the checkpoints and scans for pages.
+  [[nodiscard]] CacheReclaimResult evictOne(CacheReclaimMode mode, ReclaimClass upTo,
+                                            bool keepResumePoint, bool refused);
+  // Whether a transfer in flight returns what an allocation that was refused
+  // lacks as it lands, beside the leaves a scan found waiting for one
+  // (VictimScan::waited): a leaf or a state it holds, which a reclaim takes
+  // then (a restore, a persistence write, the state write), or, for memory
+  // the governor funds (ReleaseExtents), the extent that the Full pages
+  // demotions and spills free fill with the free ones. A refused page
+  // allocation counts those pages against what it lacks itself
+  // (admitPages, reclaimForPages): they cover it, or it does not wait for
+  // them. Only what transfersInFlight() reports is.
+  [[nodiscard]] bool refusalPending(CacheReclaimMode mode) const noexcept;
   // One reclaimOldest scan: the class it takes (what is in use, or the
   // ordinary class), whether it keeps the resume point, what becomes of a
   // state whose write cannot start now, how long the caller can wait for KV
@@ -746,6 +758,9 @@ private:
     StateCache::Unwritten unwritten;
     ReclaimTiming timing;
     bool pagesOnly;
+    // Set, if given, when a leaf waits for a transfer in flight
+    // (LeafReclaim::Pending), which may take it once that has landed.
+    bool *waited = nullptr;
   };
   // Gives up one victim of the scan's class. The ordinary class first gives
   // the oldest KV leaf no state restores through (oldestDeadKvLeaf). Then

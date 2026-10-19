@@ -510,7 +510,7 @@ CacheReclaimResult Cache::evictAll() {
   uint64_t released = releaseEmptyExtents(false);
   bool evicted = false;
   // Everything unpinned goes before anything moves.
-  while (evictOne(ReclaimClass::InUse, false, false).madeProgress)
+  while (evictOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse, false, false).madeProgress)
     evicted = true;
   do {
     released += releaseEmptyExtents(false);
@@ -519,21 +519,30 @@ CacheReclaimResult Cache::evictAll() {
 }
 
 CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode, ReclaimClass upTo,
-                                     bool keepResumePoint, bool keepRunway) {
+                                     bool keepResumePoint, bool keepRunway, bool refused) {
   const bool release = mode == CacheReclaimMode::ReleaseExtents;
   if (release) {
     if (const CacheReclaimResult released = releaseExtent(keepRunway);
         released.madeProgress)
       return released;
   }
-  CacheReclaimResult evicted =
-      evictOne(upTo, keepResumePoint, mode == CacheReclaimMode::ReusePages);
+  CacheReclaimResult evicted = evictOne(mode, upTo, keepResumePoint, refused);
   if (evicted.madeProgress && release)
     evicted.reclaimedBytes += pool_.reclaimEmptyExtents(keepRunway, 1);
   return evicted;
 }
 
-CacheReclaimResult Cache::evictOne(ReclaimClass upTo, bool keepResumePoint, bool pagesOnly) {
+CacheReclaimResult Cache::evictOne(CacheReclaimMode mode, ReclaimClass upTo, bool keepResumePoint,
+                                   bool refused) {
+  const bool pagesOnly = mode == CacheReclaimMode::ReusePages;
+  // Whether a transfer in flight returns, as it lands, what this step needs
+  // first, before anything in use: for a pass any; for an allocation that
+  // was refused a leaf the scan found waiting for one, or what
+  // refusalPending names.
+  bool waited = false;
+  const auto returns = [&] {
+    return refused ? waited || refusalPending(mode) : transfersInFlight();
+  };
   // Disposable checkpoints go first, except in a page scan, to which their
   // buffers give no page; one whose write must wait for the one in flight
   // stays and holds back nothing else.
@@ -549,18 +558,19 @@ CacheReclaimResult Cache::evictOne(ReclaimClass upTo, bool keepResumePoint, bool
   for (const bool inUse : {false, true}) {
     if (inUse && upTo == ReclaimClass::Ordinary)
       break;
-    if (inUse && transfersInFlight())
+    if (inUse && returns())
       return {.pending = true};
     if (const auto victim = reclaimOldest({.inUse = inUse,
                                            .keepResumePoint = keepResumePoint,
                                            .unwritten = StateCache::Unwritten::Wait,
                                            .timing = ReclaimTiming::CanWait,
-                                           .pagesOnly = pagesOnly}))
+                                           .pagesOnly = pagesOnly,
+                                           .waited = &waited}))
       return {.madeProgress = true, .evictedState = !victim->kv};
   }
   // Nothing to reclaim now. Transfers land only in pollTransfers(), so what
   // was in flight during the pass still is, and comes back.
-  return {.pending = transfersInFlight()};
+  return {.pending = returns()};
 }
 
 CacheReclaimResult Cache::reclaimForPages(uint32_t pages, CacheReclaimMode mode,
@@ -587,7 +597,7 @@ CacheReclaimResult Cache::reclaimForPages(uint32_t pages, CacheReclaimMode mode,
   // Leaves of either form go, oldest first: an idle spilled chain's Index
   // leaves go before the Full pages of its dense history above them.
   while (pool_.freePageCount(form) + pendingPages(form) < pages) {
-    const CacheReclaimResult step = reclaimOne(mode, upTo);
+    const CacheReclaimResult step = reclaimOne(mode, upTo, false, false, true);
     if (!step.madeProgress) {
       total.pending = step.pending;
       break;
@@ -646,6 +656,8 @@ std::optional<Cache::Victim> Cache::reclaimOldest(const VictimScan &scan) {
       // The tier takes no demotion until a transfer lands: the leaves that
       // need one wait with this one, and those whose page frees now go.
       timing = ReclaimTiming::Immediate;
+      if (scan.waited)
+        *scan.waited = true;
       [[fallthrough]];
     case LeafReclaim::Impossible:
       kv = oldestKvLeaf(kv->id, scan.inUse, scan.pagesOnly);
@@ -702,10 +714,10 @@ CacheReclaimResult Cache::reclaimStateForLane(ReclaimClass upTo) {
   std::optional<CacheEvictionCandidate> state = states_.checkpointCandidate(false);
   if (!state)
     state = states_.ordinaryCandidate(false);
-  if (!state && upTo == ReclaimClass::InUse && !transfersInFlight())
+  if (!state && upTo == ReclaimClass::InUse && !refusalPending(CacheReclaimMode::ReusePages))
     state = states_.inUseCandidate();
   if (!state)
-    return {.pending = transfersInFlight()};
+    return {.pending = refusalPending(CacheReclaimMode::ReusePages)};
   const StateEviction eviction = states_.reclaim(state->id, StateCache::Unwritten::Wait);
   return {.madeProgress = eviction.evicted,
           .pending = eviction.pending,
@@ -845,6 +857,13 @@ bool Cache::transfersInFlight() const noexcept {
   // that spills once its copy lands returns something.
   return !restores_.empty() || writes(WriteClass::Reclaim) || writes(WriteClass::Persist) ||
          states_.writing() || spillingWrites();
+}
+
+bool Cache::refusalPending(CacheReclaimMode mode) const noexcept {
+  const uint32_t freed = pendingPages(kv::PageForm::Full);
+  return !restores_.empty() || writes(WriteClass::Persist) || states_.writing() ||
+         (mode == CacheReclaimMode::ReleaseExtents && freed &&
+          pool_.freePageCount(kv::PageForm::Full) + freed >= pool_.extentPages());
 }
 
 uint64_t Cache::pendingBytes() const noexcept {

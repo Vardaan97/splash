@@ -2540,7 +2540,10 @@ requests takes what is in use after everything else. Two kinds of work take
 nothing in use. A start that a resident lane holds back waits for that lane. And
 when no lane's growth fits, the lane that yields first, such as one just started
 beside a decoding lane, pays for the memory with its own suspension; while other
-lanes fit, it waits for them, resident. A prefill command captures the state of
+lanes fit, it waits for them, resident. It pays the same way when it holds its
+memory outside the command of a lane that would yield after it and was refused
+memory no transfer in flight returns, such as a decoding lane's share of the hot
+block cache beside a prompt's staging. A prefill command captures the state of
 each boundary it reaches, in buffers reserved before it runs. A junction or a
 checkpoint retires its lane's checkpoint once published, and a checkpoint the
 same command would capture before it is not captured at all; the prompt's

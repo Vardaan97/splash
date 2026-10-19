@@ -8033,16 +8033,21 @@ void testUnwritableTierKeepsRequestsResident() {
 
 // A target whose requests may spill (EngineConfig::spill), on a cache with a
 // spill policy: Full pages of 100 bytes and Index pages of 10, four to an
-// extent, with the Index runway allocated; a tier of 100-byte slots whose
-// quota, active KV's limit included, holds `slots` of them; and a dense
-// history and a tail window of a page each. With `always`, every request
-// spills (--kv-spill always); otherwise every request starts Resident, as
-// the planner's geometry (SpillGeometry) is the planner's to test. The
-// tier's transfers land as the fixture ticks on, and decode runs to each
-// request's output limit.
+// extent unless `extent` says, with the Index runway allocated; a tier of
+// 100-byte slots whose quota, active KV's limit included, holds `slots` of
+// them; and a dense history and a tail window of a page each. With
+// `always`, every request spills (--kv-spill always); otherwise every
+// request starts Resident, as the planner's geometry (SpillGeometry) is the
+// planner's to test. The tier's transfers land as the fixture ticks on, and
+// decode runs to each request's output limit.
 struct Spilling {
-  explicit Spilling(uint32_t slots, bool always = true)
-      : budget(std::make_shared<model::DiskBudget>(uint64_t{slots} * 100)),
+  // The pages of an extent, of a type of its own for a call to name.
+  struct Extent final {
+    uint32_t pages;
+  };
+  explicit Spilling(uint32_t slots, bool always = true, Extent extent = {4})
+      : storage(256, 100, extent.pages, 10),
+        budget(std::make_shared<model::DiskBudget>(uint64_t{slots} * 100)),
         cache(pool, &tier, budget, CacheSpillPolicy{1, 1}),
         engine(config(always, &paused, &serving), cache, model, events) {
     tier.budget = budget;
@@ -8094,7 +8099,7 @@ struct Spilling {
     tier.writeLimits[static_cast<size_t>(WriteClass::Spill)] = allowed ? 32 : 0;
   }
 
-  test::TestKvStorage storage{256, 100, 4, 10};
+  test::TestKvStorage storage;
   KvPool pool{storage, 0};
   test::TestKvTier tier;
   std::shared_ptr<model::DiskBudget> budget;
@@ -8502,6 +8507,75 @@ void testDecodeLeavesOutALaneRefusedItsHotFloor() {
   spill.runUntilIdle();
   require(spill.events.completedCount == 2 && spill.events.usage.at(2).second == 20,
           "the lane refused its hot floor did not run once it had it");
+}
+
+// A prefill lane holds memory between its commands that a Spill lane's
+// first decode may need for its floor of the hot block cache, as a
+// streaming prompt holds its history's staging. Refused it beside a lane
+// that decodes, the lane takes it from the prefill lane, which yields before
+// it, as when no lane fits: it decodes while the prompt waits, rather than
+// once the decoding lane or the prompt has ended. It does not wait for the
+// pages written through after each command either, which a prompt keeps in
+// flight and which free too few pages to empty an extent: they return no
+// memory.
+void testARefusedDecodeTakesThePrefillLanesMemory() {
+  for (const bool writesInFlight : {false, true}) {
+    // With writes in flight, extents of 64 pages, which the requests share.
+    Spilling spill(1024, true, Spilling::Extent{writesInFlight ? 64u : 4u});
+    // Lane 3's floor fits only while the prompt's lane is not resident.
+    spill.model.spilledReadsRoom = [&](uint64_t id) {
+      const auto prompt = spill.model.requests.find(2);
+      return id != 3 || prompt == spill.model.requests.end() || !prompt->second.resident;
+    };
+    // Prefill takes 4 ms a row: beside a decoding lane, a command runs 64
+    // rows, two pages.
+    spill.model.commandTimes = [](const BatchPlan &plan, std::span<const ModelBatchItem>) {
+      uint32_t rows = 0;
+      for (const BatchItem &item : plan.items)
+        rows += item.tokenCount;
+      return test::CommandTimes{plan.kind == WorkKind::Decode ? 10.0 : 4.0 * rows};
+    };
+    // With writes in flight, the tier lands every transfer but the writes of
+    // the pages the prompt's lane holds, which stay in flight. No restore
+    // runs: its writes and transfers pair up in order.
+    std::unordered_set<uint32_t> promptPages;
+    const auto run = [&](const std::function<bool()> &done, const char *message) {
+      for (uint32_t step = 0; step < 2000 && !done(); ++step) {
+        static_cast<void>(spill.engine.tick(spill.now++));
+        const auto prompt = spill.model.requests.find(2);
+        if (writesInFlight && prompt != spill.model.requests.end() && prompt->second.resident)
+          for (const uint32_t page : spill.cache.pageTable(2).pages)
+            promptPages.insert(page);
+        for (size_t index = 0; index < spill.tier.writes.size(); ++index)
+          spill.tier.transfers.at(index)->ready =
+              !promptPages.contains(spill.tier.writes[index].page);
+      }
+      require(done(), message);
+    };
+    spill.engine.submit(Spilling::prompt(1, 1, 5, 200));
+    run([&] { return spill.events.outputs.contains(1); }, "the decoding lane did not start");
+    // The prompt runs three commands, whose pages but its first and last
+    // the tier would spill.
+    spill.engine.submit(Spilling::prompt(2, 2, 40, 1));
+    run([&] { return spill.model.prefillChunks[2] >= 3; }, "the prompt did not run");
+    spill.engine.submit(Spilling::prompt(3, 3, 5, 8));
+    run(
+        [&] {
+          return spill.events.outputs.contains(3) || spill.events.usage.contains(1) ||
+                 spill.events.usage.contains(2);
+        },
+        "no request decoded or ended");
+    require(spill.events.outputs.contains(3) && !spill.events.usage.contains(1) &&
+                !spill.events.usage.contains(2) &&
+                spill.engine.snapshot().resourceSuspensions == 1,
+            writesInFlight
+                ? "a lane refused its hot floor waited for writes that return no memory"
+                : "a lane refused its hot floor waited for the decoding lane or the prompt to end");
+    spill.runUntilIdle();
+    require(spill.events.completedCount == 3 && spill.events.failedCount == 0 &&
+                spill.events.usage.at(3).second == 8,
+            "the lanes did not all complete once the prompt had yielded");
+  }
 }
 
 // A Spill lane whose pages the SSD cache takes no more of keeps them Full.
@@ -10300,10 +10374,11 @@ void testLimitOutlivedByProgressDoesNotWakeTheLoop() {
 }
 
 // A lane waits to grow into pages whose demotion is in flight, and a request
-// admitted meanwhile starts and decodes. Once the pages land the waiting
-// lane still lacks one and is suspended. The later lane was resident at its
-// suspension and holds memory its resume waits for: while it works, the
-// wait's limit restarts, and once it finishes the suspended lane resumes.
+// admitted meanwhile starts and decodes. Once the pages still in flight
+// cannot cover what the waiting lane lacks, it is suspended. The later lane
+// was resident at its suspension and holds memory its resume waits for:
+// while it works, the wait's limit restarts, and once it finishes, and the
+// last page has landed, the suspended lane resumes.
 void testLaneAdmittedBeforeASuspensionHoldsTheWaitOpen() {
   test::TestKvStorage storage(16, 4096, 4);
   storage.budgetPages = 8;
@@ -10347,15 +10422,18 @@ void testLaneAdmittedBeforeASuspensionHoldsTheWaitOpen() {
     static_cast<void>(engine.tick(now++));
   }
   require(executor.suspensions == 1 && executor.prefillRows == 40,
-          "the waiting lane was not suspended once the pages landed");
+          "the waiting lane was not suspended once the pages in flight fell short");
   for (const double end = now + 400; now < end;) {
     static_cast<void>(engine.tick(now += 10));
     require(events.failedCount == 0 && engine.snapshot().resourceResumptions == 0,
             "a lane resident at a suspension did not hold the wait open");
   }
   executor.decodeFinishes = true;
-  tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
-  require(events.completedCount == 2 && events.failedCount == 0 &&
+  for (uint32_t step = 0; step < 1000 && !idle(engine); ++step) {
+    tier.complete();
+    static_cast<void>(engine.tick(now++));
+  }
+  require(idle(engine) && events.completedCount == 2 && events.failedCount == 0 &&
               engine.snapshot().resourceResumptions == 1,
           "the suspended lane did not resume once the lane beside it finished");
 }
@@ -11237,6 +11315,7 @@ int main() {
     testSpillMovesThroughTheHostPause();
     testSpillResumeCommitsAgain();
     testDecodeLeavesOutALaneRefusedItsHotFloor();
+    testARefusedDecodeTakesThePrefillLanesMemory();
     testLoneSpillLaneEndsAtTheWall();
     testHotCacheGrowthTakesNoModelCache();
     testStreamingLaneSizesItsCommandsByItsReads();

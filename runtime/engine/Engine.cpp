@@ -1621,6 +1621,24 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
     // A lane that runs is waiting for nothing.
     active.resourceWait = {};
   }
+  // A lane refused memory that no transfer in flight returns takes it from
+  // the lane that yields first, as when no lane fits, if that lane holds its
+  // memory outside this command and yields before the refused one. Run
+  // without it, the others would leave it refused for as long as they fit,
+  // and a refusal they do not share, as of the model's memory for a lane's
+  // reads of spilled KV, lasts as long as they run.
+  if (yielding && std::ranges::none_of(plan.items, [&](const BatchItem &item) {
+        return item.requestId == yielding->request.id;
+      })) {
+    const auto refused = std::ranges::find_if(denied, [&](const Denied &entry) {
+      return !entry.denial.pending && yieldsBefore(*yielding, request(entry.requestId));
+    });
+    if (refused != denied.end()) {
+      suspendForGrowth(*yielding, kvCapacity(yielding->request.id),
+                       refused->denial.allocationFailure, now);
+      return Prepared::Yielded;
+    }
+  }
   // Admission may have converted a lane to Spill, whose history then
   // streams (streamsHistory), at once where its restored chain's copies had
   // landed: the plan, made before, did not know. The command takes the
@@ -2008,7 +2026,7 @@ CacheReclaimResult Engine::reclaimForState(ReclaimClass upTo, bool forLater) {
                                       : model::IdleMemory::BuffersThenCaches))
     return {true, 0};
   const CacheReclaimResult reclaimed =
-      cache_.reclaimOne(CacheReclaimMode::ReleaseExtents, upTo, false, forLater);
+      cache_.reclaimOne(CacheReclaimMode::ReleaseExtents, upTo, false, forLater, true);
   if (reclaimed.madeProgress)
     signalResourceProgress();
   return reclaimed;
