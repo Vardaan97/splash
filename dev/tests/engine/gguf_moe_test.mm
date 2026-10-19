@@ -476,7 +476,7 @@ void checkGrouping(const MoeScratch &scratch, const MoePlan &plan, const std::st
   const uint64_t rowBytes = uint64_t{kHidden} * 2,
                  scoreBytes = uint64_t{rows} * MoeShape{kHidden, kExperts, kTopK, kIntermediate}.routerWidth() * 4;
   for (uint32_t tile = 0; tile < tileCount; ++tile) {
-    const uint32_t live = tiles[tile].rows;
+    const uint32_t live = moe_tile_rows(tiles[tile].rows);
     require(live > 0 && live <= tileRows, label + ": invalid tile live row count");
     const uint32_t matmul = std::min(tileRows, live <= 8 ? 8u : live <= 16 ? 16u : tileRows);
     const uint32_t read =
@@ -999,8 +999,7 @@ void identityMoe(MetalBackend &backend, splash::ops::DeterminismPolicy policy) {
   const auto x = activations(uint64_t{total} * hidden), residual = activations(uint64_t{total} * hidden);
   uint64_t compared = 0, different = 0, across = 0;
   struct Result { std::vector<uint16_t> output; std::vector<bool> column; };
-  const auto execute = [&](const MoePlan &plan, const std::vector<uint32_t> &order,
-                           uint32_t first = 0, uint32_t last = 0, std::span<const uint32_t> ends = {}, bool defaultMode = false) {
+  const auto execute = [&](const MoePlan &plan, const std::vector<uint32_t> &order, bool defaultMode = false) {
     Buffers b;
     std::vector<float> input, res;
     for (uint32_t row : order) {
@@ -1012,13 +1011,16 @@ void identityMoe(MetalBackend &backend, splash::ops::DeterminismPolicy policy) {
     b.moe.output = zeros(backend, uint64_t{order.size()} * hidden * 2, "identity-output");
     allocate(backend, b, plan);
     CommandGraph graph;
-    MoE::add(graph, b.moe, weights, plan, first, last, ends, policy.moe && !defaultMode ? 2u : 0u);
+    MoE::add(graph, b.moe, weights, plan, policy.moe && !defaultMode);
     (void)backend.submitCommandAsync(graph.dispatches()).wait();
     const auto *tiles = static_cast<const MoeTileDescriptor *>(b.moe.scratch.tileDescriptors.contents());
     const uint32_t count = *static_cast<const uint32_t *>(b.moe.scratch.tileCount.contents());
-    if (policy.moe && !defaultMode)
-      for (uint32_t t = 0; t < count; ++t)
-        require(tiles[t].reference_rows == 0xffffffffu, "identity routed/shared tile missed staged sentinel");
+    for (uint32_t t = 0; t < count; ++t) {
+      require(bool(tiles[t].rows & MOE_TILE_PRESERVE_KIND) == (policy.moe && !defaultMode),
+              "identity routed/shared tile has the wrong staged-kind bit");
+      require(moe_tile_rows(tiles[t].rows) > 0 && moe_tile_rows(tiles[t].rows) <= plan.tileRows(),
+              "identity tile lost its live row count");
+    }
     Result result;
     const auto *out = static_cast<const uint16_t *>(b.moe.output.contents());
     result.output.assign(out, out + uint64_t{order.size()} * hidden);
@@ -1031,18 +1033,15 @@ void identityMoe(MetalBackend &backend, splash::ops::DeterminismPolicy policy) {
   std::vector<uint32_t> order(total); std::iota(order.begin(), order.end(), 0);
   const auto whole = execute(plans.moePrefill(shape, total), order);
   if (policy.moe) {
-    const auto baseline = execute(plans.moePrefill(shape, total), order, 0, 0, {}, true);
+    const auto baseline = execute(plans.moePrefill(shape, total), order, true);
     require(std::none_of(baseline.column.begin(), baseline.column.end(), [](bool v) { return v; }),
             "full-occupancy identity reference unexpectedly chose a column tile");
     require(whole.output == baseline.output, "forced staged MoE changed the full-occupancy default output");
     std::cout << "T1 forced staged vs full-occupancy default bitwise PASS\n";
   }
 
-  const auto compare = [&](const Result &a, const Result &b, const std::vector<uint32_t> &indices,
-                           uint32_t first = 0, uint32_t last = 0, std::span<const uint32_t> ends = {}) {
+  const auto compare = [&](const Result &a, const Result &b, const std::vector<uint32_t> &indices) {
     for (uint32_t row = 0; row < indices.size(); ++row) {
-      const uint32_t end = ends.empty() ? last : ends[row / 8];
-      if (row % 8 < first || (end && row % 8 >= end)) continue;
       ++compared;
       different += !std::equal(a.output.begin() + uint64_t{row} * hidden,
                                 a.output.begin() + uint64_t{row + 1} * hidden,
@@ -1065,13 +1064,23 @@ void identityMoe(MetalBackend &backend, splash::ops::DeterminismPolicy policy) {
     std::vector<uint32_t> indices(order.begin(), order.begin() + lanes * 8);
     const auto plan = plans.moeDecode(shape, lanes);
     compare(execute(plan, indices), widest, indices);
+    // Exercise the same subsets as separate commands. Row selection belongs
+    // to the fixture, not to the standalone MoE routing API.
+    const auto subset = [&](uint32_t first, uint32_t last, std::span<const uint32_t> ends = {}) {
+      std::vector<uint32_t> selected;
+      for (uint32_t row = 0; row < indices.size(); ++row) {
+        const uint32_t end = ends.empty() ? last : ends[row / 8];
+        if (row % 8 >= first && (!end || row % 8 < end)) selected.push_back(indices[row]);
+      }
+      if (!selected.empty())
+        compare(execute(plans.moePrefill(shape, selected.size()), selected), widest, selected);
+    };
     for (uint32_t first : {0U, 1U, 3U})
-      for (uint32_t last : {4U, 8U})
-        compare(execute(plan, indices, first, last), widest, indices, first, last);
+      for (uint32_t last : {4U, 8U}) subset(first, last);
     const std::array<uint32_t, 4> ends{1, 3, 5, 8};
-    compare(execute(plan, indices, 0, 0, ends), widest, indices, 0, 0, ends);
+    subset(0, 0, ends);
     const std::array<uint32_t, 4> exhausted{2, 3, 5, 8};
-    compare(execute(plan, indices, 2, 0, exhausted), widest, indices, 2, 0, exhausted);
+    subset(2, 0, exhausted);
     std::reverse(indices.begin(), indices.end());
     compare(execute(plan, indices), widest, indices);
   }

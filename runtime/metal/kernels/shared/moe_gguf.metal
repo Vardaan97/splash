@@ -26,16 +26,17 @@ inline void moe_gguf_expert_tile(device bfloat *input, device const MoeTileDescr
                                  threadgroup half2 *tl) {
   if (group.y >= *tile_count) return;
   const MoeTileDescriptor tile = tiles[group.y];
+  const uint live = moe_tile_rows(tile.rows);
   const MoeGgufSegment s = moe_gguf_segment(tile.expert, p, slots, w0, w1, meta, sw0, sw1, smeta);
   device bfloat *x = input + ulong(group.y) * Rows * p.input_size;
   const ulong out = ulong(group.y) * Rows * p.output_size;
   const uint origin = group.x * GGUF_TILE_COLUMNS + simd_group * GGUF_STAGED_COLUMNS;
   if (moe_column_tile(tiles, group.y)) {
     float sums[MOE_GGUF_COLUMN_ROWS];
-    column_dot_any<MOE_GGUF_COLUMN_ROWS>(s.format, x, tile.rows, p.input_size, s.w0, s.w1, s.meta, origin + simd_lane,
+    column_dot_any<MOE_GGUF_COLUMN_ROWS>(s.format, x, live, p.input_size, s.w0, s.w1, s.meta, origin + simd_lane,
                                          0, p.input_size / 32, tl, simd_group * 32 + simd_lane, GGUF_STAGED_THREADS,
                                          sums);
-    for (uint row = 0; row < tile.rows; ++row) {
+    for (uint row = 0; row < live; ++row) {
       const ulong o = out + ulong(row) * p.output_size + origin + simd_lane;
       output[o] = gguf_epilogue<Ep>(sums[row], aux, o);
     }
@@ -53,7 +54,7 @@ inline void moe_gguf_expert_tile(device bfloat *input, device const MoeTileDescr
       output[o] = gguf_epilogue<Ep>(v, aux, o);
     });
   };
-  moe_live_rows<Rows>(tile.rows, run);
+  moe_live_rows<Rows>(live, run);
 }
 template <ushort Rows, GgufEpilogue Ep>
 kernel void moe_expert_gguf(device bfloat *input [[buffer(0)]], device const MoeTileDescriptor *tiles [[buffer(1)]],
@@ -131,6 +132,7 @@ kernel void moe_expert_gguf_gate_up(device bfloat *input [[buffer(0)]],
   threadgroup half stage[kStagedStages]; threadgroup half2 tl[Tables * kQuantPairTableEntries];
   if (group.y >= *tile_count) return;
   const MoeTileDescriptor tile = tiles[group.y];
+  const uint live = moe_tile_rows(tile.rows);
   const bool up = simd_group == 1;
   const MoeGgufSegment gs = moe_gguf_segment(tile.expert, p.experts, p.input_size, p.output_size, p.gate_routed_format,
                                              p.gate_shared_format, slots, gw0, gw1, gmeta, gsw0, gsw1, gsmeta);
@@ -155,7 +157,7 @@ kernel void moe_expert_gguf_gate_up(device bfloat *input [[buffer(0)]],
   threadgroup half *my = stage + simd_group * kStagedSimdgroupStage;
   threadgroup bfloat *gate = reinterpret_cast<threadgroup bfloat *>(stage);
   if (moe_column_tile(tiles, group.y)) {
-    moe_gate_up_column(x, tile.rows, K, N, s, origin, simd_lane, table, up, gate, output, out);
+    moe_gate_up_column(x, live, K, N, s, origin, simd_lane, table, up, gate, output, out);
     return;
   }
   const auto run = [&](auto rows) {
@@ -176,7 +178,7 @@ kernel void moe_expert_gguf_gate_up(device bfloat *input [[buffer(0)]],
             bfloat(float(bfloat(v)) * splash_silu(float(gate[row * GGUF_STAGED_COLUMNS + column])));
       });
   };
-  moe_live_rows<Rows>(tile.rows, run);
+  moe_live_rows<Rows>(live, run);
 }
 using MoeExpertGgufGateUpKernel = void(device bfloat *, device const MoeTileDescriptor *, device const uint *,
                                        device uchar *, device uchar *, device uchar *, device uchar *, device uchar *,

@@ -94,6 +94,20 @@ void checkMoe(splash::ops::MoeWorkspace workspace,
 
 void moe() {
   using namespace splash::ops;
+  // The pin must not enlarge descriptors or change occupancy-driven default
+  // choices, and its flag must never become part of a live row count.
+  static_assert(sizeof(MoeTileDescriptor) == 8 && sizeof(MoeGroupParams) == 24);
+  for (uint32_t rows = 1; rows <= 32; ++rows) {
+    MoeTileDescriptor tiles[]{{0, rows}, {0, rows}, {1, rows}};
+    require(moe_column_tile(tiles, 0) == (rows <= MOE_GGUF_COLUMN_ROWS) &&
+                !moe_column_tile(tiles, 1) &&
+                moe_column_tile(tiles, 2) == (rows <= MOE_GGUF_COLUMN_ROWS),
+            "default MoE column tile choice changed");
+    for (auto &tile : tiles) tile.rows |= MOE_TILE_PRESERVE_KIND;
+    for (uint32_t t = 0; t < 3; ++t)
+      require(!moe_column_tile(tiles, t) && moe_tile_rows(tiles[t].rows) == rows,
+              "deterministic MoE tile pin changed its live row count or arithmetic");
+  }
   for (const MoeShape shape : {MoeShape{256, 8, 2, 512},
                                MoeShape{2048, 256, 8, 512}}) {
     for (uint32_t rows = 1; rows <= 2048; ++rows)

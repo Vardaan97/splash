@@ -3232,7 +3232,11 @@ This branch is based directly on c3232319 and needs neither MTP nor per-lane
 drafting. The same dense projection planner, dense paged attention, scheduler
 alignment and startup policy serve the 27B path. This establishes code coverage,
 not a real-model reproduction or verified fix of issue #483 on 27B or main.
-The MoE routing bounds support the identity tests without requiring MTP.
+MoE keeps the upstream 8-byte tile descriptors and 24-byte grouping parameters.
+A separate deterministic grouping entry point pins staged arithmetic with a spare
+row-count bit; the default entry point retains occupancy-based tile selection.
+Identity fixtures select row subsets before routing, without per-lane bounds in
+production MoE.
 
 Measured on M5 Max 128 GB, Flash-Next UD-Q4_K_XL, the 2026-10-19 lanes-det
 round gave DET and DET-LANE 48/48 greedy identity in all recorded cold/warm

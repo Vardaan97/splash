@@ -272,25 +272,12 @@ struct MoE final {
   // grouping into tiles), the load of its streamed experts, and its routed
   // work (addRouted: the gather, the expert passes and the combine). Steps
   // that share a load run their routings, one load of the union, then their
-  // routed work, each in its own scratch.
-  // With `firstRow`, a decode plan's lanes route their rows before it to no
-  // expert, and with `lastRow` those from it on neither (MoeGroupParams::
-  // first_row, last_row); those rows' outputs are not theirs.
-  // A per-lane last row equal to firstRow routes no expert work for that lane.
+  // routed work, each in its own scratch. With preserveTileKind, every
+  // routed and shared tile uses the staged arithmetic regardless of occupancy.
   static void add(metal::CommandGraph &graph, const MoeBuffers &buffers,
-                  const BlockMoeWeights &weights, const MoePlan &plan, uint32_t firstRow = 0,
-                  uint32_t lastRow = 0, std::span<const uint32_t> lastRows = {}, uint32_t preserveTileKind = 0);
+                  const BlockMoeWeights &weights, const MoePlan &plan, bool preserveTileKind = false);
   static void addRouting(metal::CommandGraph &graph, const MoeBuffers &buffers,
-                         const BlockMoeWeights &weights, const MoePlan &plan, uint32_t firstRow = 0,
-                         uint32_t lastRow = 0, std::span<const uint32_t> lastRows = {}, uint32_t preserveTileKind = 0);
-  static void add(metal::CommandGraph &graph, const MoeBuffers &buffers,
-                  const BlockMoeWeights &weights, const MoePlan &plan, std::span<const uint32_t, 4> lastRows) {
-    add(graph, buffers, weights, plan, 0, 0, lastRows);
-  }
-  static void addRouting(metal::CommandGraph &graph, const MoeBuffers &buffers,
-                         const BlockMoeWeights &weights, const MoePlan &plan, std::span<const uint32_t, 4> lastRows) {
-    addRouting(graph, buffers, weights, plan, 0, 0, lastRows);
-  }
+                         const BlockMoeWeights &weights, const MoePlan &plan, bool preserveTileKind = false);
   static void addRouted(metal::CommandGraph &graph, const MoeBuffers &buffers,
                         const BlockMoeWeights &weights, const MoePlan &plan);
   // The routing of `rows` rows of `input` by a block's `router` and

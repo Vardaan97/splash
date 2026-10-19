@@ -26,7 +26,8 @@ inline uint moe_matmul_rows(uint rows, uint tile_rows) {
 // 1-row tile).
 // The rows of tile t that the staged expert passes read.
 inline uint moe_staged_rows(device const MoeTileDescriptor *tiles, uint t, uint tile_rows) {
-  return moe_column_tile(tiles, t) ? tiles[t].rows : moe_matmul_rows(tiles[t].rows, tile_rows);
+  const uint rows = moe_tile_rows(tiles[t].rows);
+  return moe_column_tile(tiles, t) ? rows : moe_matmul_rows(rows, tile_rows);
 }
 
 // Runs the pass `run` on the matmul rows of a Max-row tile:
