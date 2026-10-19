@@ -500,6 +500,8 @@ struct Runtime::Impl {
   // The listener of the last cycle's signal, whose callback reads
   // plePrefetchTokens: the next cycle's copy waits for it, as does the end.
   std::future<void> plePrefetched;
+  // Held until submission succeeds; a failed step cancels its listener.
+  std::shared_ptr<Qwen4PlePrefetchCompletion> plePrefetchPending;
   void waitPlePrefetch() {
     if (plePrefetched.valid()) plePrefetched.get();
   }
@@ -537,24 +539,26 @@ struct Runtime::Impl {
     for (uint32_t lane = 0; lane < lanes; ++lane)
       laneInputs.push_back(qwen4PlePrefetchInput(items[lane].logicalPosition, entries[lane]->tokens,
                                                *entries[lane]->pendingToken, geometry.target.pleNgram));
-    auto done = std::make_shared<std::promise<void>>();
-    plePrefetched = done->get_future();
+    auto done = std::make_shared<Qwen4PlePrefetchCompletion>();
+    plePrefetched = done->future();
+    plePrefetchPending = done;
     plePrefetchEvent.notify(
         draft.prefetchValue,
         [this, lanes, step, laneInputs = std::move(laneInputs), tokens = plePrefetchTokens, done]() noexcept {
-          try {
-            std::vector<uint32_t> ids;
-            const auto *proposals = static_cast<const uint32_t *>(tokens.contents());
-            for (uint32_t lane = 0; lane < lanes; ++lane)
-              plePrefetchRows(laneInputs[lane].position, {proposals + lane * kDraftProposalTokens, step},
-                              laneInputs[lane].history, ids);
-            pleStore->prefetch(ids);
-          } catch (const std::exception &error) {
-            std::fprintf(stderr, "PLE draft prefetch hint failed: %s\n", error.what());
-          } catch (...) {
-            std::fprintf(stderr, "PLE draft prefetch hint failed: unknown exception\n");
-          }
-          done->set_value();
+          done->run([&]() noexcept {
+            try {
+              std::vector<uint32_t> ids;
+              const auto *proposals = static_cast<const uint32_t *>(tokens.contents());
+              for (uint32_t lane = 0; lane < lanes; ++lane)
+                plePrefetchRows(laneInputs[lane].position, {proposals + lane * kDraftProposalTokens, step},
+                                laneInputs[lane].history, ids);
+              pleStore->prefetch(ids);
+            } catch (const std::exception &error) {
+              std::fprintf(stderr, "PLE draft prefetch hint failed: %s\n", error.what());
+            } catch (...) {
+              std::fprintf(stderr, "PLE draft prefetch hint failed: unknown exception\n");
+            }
+          });
         });
   }
   [[nodiscard]] bool useDraftVocabulary(std::span<Request *const> entries) const {
@@ -3081,6 +3085,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
       impl_->decodeArena->batchSlice(DecodeTensor::RopeSin, width),
       impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeCos, width),
       impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeSin, width));
+  Qwen4PlePrefetchSubmission prefetchSubmission(impl_->plePrefetchPending);
   // Without a DFlash2 draft the MTP head drafts the proposals.
   if (impl_->draftModel) {
     impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::DraftInputTokens,
@@ -3091,8 +3096,10 @@ Runtime::decodeAsync(const BatchPlan &plan,
     impl_->encodeMtpDraft(commandGraph, entries, items, lanes, {maximumRetained.data(), width});
   }
   if (constrained) {
-    return std::make_unique<Impl::ConstrainedDecodeTicket>(
+    auto ticket = std::make_unique<Impl::ConstrainedDecodeTicket>(
         *impl_, std::move(lanes), items, commandGraph, std::move(completion));
+    prefetchSubmission.submitted();
+    return ticket;
   }
   impl_->encodeBatchVerifyInput(commandGraph, width);
   impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::InputTokens,
@@ -3108,6 +3115,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
   };
   CommandTicket command = impl_->backend.submitCommandAsync(
       commandGraph.command(), std::move(completion));
+  prefetchSubmission.submitted();
   return std::make_unique<DeferredMetalTicket>(std::move(command),
                                                std::move(finish));
 }
