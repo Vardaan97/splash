@@ -270,7 +270,7 @@ void checkMtpYarnGeometry() {
     const auto fewer = model::Qwen4Steps::scratchBytes(weights, twelve, g.prefillChunks);
     const uint64_t keyLayerBytes = uint64_t{model::kLaneCount} * model::kDecodeRows *
                                    BLOCK_INDEXER_DIMENSION * sizeof(uint16_t);
-    require(g.targetScratch.decode == fewer.decode + keyLayerBytes,
+    require(g.targetScratch.decode == fewer.decode + alignUp(13 * keyLayerBytes) - alignUp(12 * keyLayerBytes),
             "MTP decode scratch did not reserve the thirteenth layer's raw keys");
     const uint32_t capacity = model::qwen4IndexerMaskWords(t.contextTokens()) * 32;
     for (uint32_t remaining = 2; remaining <= SPLASH_TARGET_VERIFY_ROWS; ++remaining) {
