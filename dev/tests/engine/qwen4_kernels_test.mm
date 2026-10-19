@@ -779,7 +779,9 @@ void qsaScratchCoversWindow(MetalBackend &backend) {
   constexpr uint32_t kChunk = 2048, kVerify = 8, kLanes = 4;
   const model::Qwen4ExpWeights weights;
   const std::array<uint32_t, 1> captured{47};
-  const model::QwenTargetGeometry native(model::Qwen4ExpLayout{}, captured);
+  model::QwenTargetGeometry native(model::Qwen4ExpLayout{}, captured);
+  native.kvLayout = weights.layout.kvLayout();
+  native.stateLayout = weights.layout.gdnStateLayout();
   model::QwenTargetGeometry scaled = native;
   scaled.ropeScaling = {4.0, 262144};
   const model::QwenTargetGeometry &yarn = scaled;
@@ -787,6 +789,11 @@ void qsaScratchCoversWindow(MetalBackend &backend) {
   fractional.ropeScaling = {1.9999771118164062, 262144};
   model::QwenTargetGeometry fractionalTail = native;
   fractionalTail.ropeScaling = {double(524409) / 262144, 262144};
+  auto mtpYarn = scaled, mtpFractional = fractional;
+  for (auto *g : {&mtpYarn, &mtpFractional}) {
+    g->mtpLayers = 1;
+    ++g->kvLayout.attentionLayers;
+  }
   const MetalBuffer table = scratch(backend, 8);
   const auto selects = [&](const model::Qwen4Scratch &s, uint32_t rows, std::vector<uint32_t> firsts) {
     const std::vector<MetalBuffer> tables(firsts.size(), table);
@@ -802,12 +809,17 @@ void qsaScratchCoversWindow(MetalBackend &backend) {
   const model::QwenTargetGeometry &fractionalWindow = fractional, &fractionalTailWindow = fractionalTail;
   uint64_t nativeScores = 0;
   for (const auto &[geometry, window] : {std::pair{&native, 262'144U}, std::pair{&yarn, 1'010'000U},
-                                       std::pair{&fractionalWindow, 524'282U}, std::pair{&fractionalTailWindow, 524'409U}}) {
+                                       std::pair{&fractionalWindow, 524'282U}, std::pair{&fractionalTailWindow, 524'409U},
+                                       std::pair{static_cast<const model::QwenTargetGeometry *>(&mtpYarn), 1'010'000U},
+                                       std::pair{static_cast<const model::QwenTargetGeometry *>(&mtpFractional), 524'282U}}) {
     const model::Qwen4Steps steps(weights, *geometry, backend, 1);
     const model::Qwen4Scratch prefill = steps.prefillScratch(0), verify = steps.verifyScratch(kLanes * kVerify);
     const uint64_t scores = uint64_t{prefill.scoreRows} * prefill.scoreStride;
     if (!nativeScores) nativeScores = scores;
-    check(geometry->contextTokens() == window && selects(prefill, kChunk, {window - kChunk}) &&
+    check(geometry->contextTokens() == window &&
+              verify.qsaKeys.sizeBytes() == uint64_t{geometry->kvLayout.attentionLayers} * kLanes * kVerify *
+                                                BLOCK_INDEXER_DIMENSION * sizeof(uint16_t) &&
+              selects(prefill, kChunk, {window - kChunk}) &&
               selects(verify, kVerify, std::vector<uint32_t>(kLanes, window - kVerify)) &&
               selects(verify, kVerify, std::vector<uint32_t>(kLanes, window - 2)) && scores <= nativeScores,
           "QSA scratch of a " + std::to_string(window) + "-token window: its last rows, within the native scores");
