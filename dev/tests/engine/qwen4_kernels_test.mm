@@ -779,9 +779,10 @@ void qsaScratchCoversWindow(MetalBackend &backend) {
   constexpr uint32_t kChunk = 2048, kVerify = 8, kLanes = 4;
   const model::Qwen4ExpWeights weights;
   const std::array<uint32_t, 1> captured{47};
-  model::QwenTargetGeometry native(model::Qwen4ExpLayout{}, captured);
-  native.kvLayout = weights.layout.kvLayout();
-  native.stateLayout = weights.layout.gdnStateLayout();
+  model::QwenTargetGeometry unscaled(model::Qwen4ExpLayout{}, captured);
+  unscaled.kvLayout = weights.layout.kvLayout();
+  unscaled.stateLayout = weights.layout.gdnStateLayout();
+  const model::QwenTargetGeometry native = unscaled;
   model::QwenTargetGeometry scaled = native;
   scaled.ropeScaling = {4.0, 262144};
   const model::QwenTargetGeometry &yarn = scaled;
