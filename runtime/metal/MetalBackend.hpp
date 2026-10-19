@@ -199,10 +199,12 @@ enum class HostStepGpu : uint8_t {
 // it, and a signal is delivered even when the work before it fails.
 //
 // A Host step runs `work` on the CPU once all earlier work has completed and
-// holds all later work until it returned, through a shared event the backend
-// creates for the command's host steps (the step's event and value are
-// unused): the work reads what the GPU wrote before it and writes Shared
-// buffers the GPU reads after it. With HostStepGpu::Awake, one GPU
+// holds all later work until it returned, through two shared events the
+// backend creates for the command's host steps, one the GPU raises and one the
+// backend's runner raises, so that no write of one side puts back a value of
+// the other (the step's event and value are unused): the work reads what the
+// GPU wrote before it and writes Shared buffers the GPU reads after it. With
+// HostStepGpu::Awake, one GPU
 // thread spins through the step so the GPU stays awake and starts the work
 // after it at once and at full clocks: for steps about as short as the GPU's
 // wake-up (a streamed decode load), not for long ones, where the spin saves

@@ -494,18 +494,24 @@ struct BackendAsyncState {
 };
 
 // The host steps of one command (EventStep::Kind::Host), which the backend
-// raises through an event of their own: the work before step i has completed
-// at 2i + 1 (ready), and step i has run at 2i + 2; past the event of a step
-// that keeps the GPU awake the runner raises the backend's release counter to
-// the step's value, which ends the GPU's spin through it (host_step_wait),
-// and then runs the step's `then` once its work returned. Each step runs
-// unless the command buffer before it failed or an earlier step of its
-// command did not run or threw (halted); the first step that throws names the
-// command's failure, and a `then` that throws marks the backend unhealthy
-// (EventStep). The runner notes when it took each
-// step up and when its work returned, which the command's completion reports
-// (timed) against the GPU times of the buffers before and after the step,
-// and each is the command's progress for the watchdog (CommandWatchdog).
+// raises through two events of their own, each written by one side: the GPU
+// raises readyEvent to i + 1 once the work before step i has completed, and
+// the runner raises ranEvent to i + 1 once step i ran or was skipped, which
+// the work after it waits for. A shared event holds the value written last,
+// and a GPU signal can land after a later value the CPU wrote to the same
+// event (M5 Max, macOS 27: about once in a million steps), which puts it back
+// and holds the work waiting for the CPU's value until Metal fails it after 5
+// s ("Caused GPU Timeout Error"). Past ranEvent of a step that keeps the GPU
+// awake the runner raises the backend's release counter to the step's value,
+// which ends the GPU's spin through it (host_step_wait), and then runs the
+// step's `then` once its work returned. Each step runs unless the command
+// buffer before it failed or an earlier step of its command did not run or
+// threw (halted); the first step that throws names the command's failure, and
+// a `then` that throws marks the backend unhealthy (EventStep). The runner
+// notes when it took each step up and when its work returned, which the
+// command's completion reports (timed) against the GPU times of the buffers
+// before and after the step, and each is the command's progress for the
+// watchdog (CommandWatchdog).
 struct HostSteps {
     struct Step {
         uint64_t ready = 0;
@@ -521,7 +527,7 @@ struct HostSteps {
         // through it.
         std::optional<uint32_t> release;
     };
-    __strong id<MTLSharedEvent> event = nil;
+    __strong id<MTLSharedEvent> readyEvent = nil, ranEvent = nil;
     std::shared_ptr<BackendAsyncState> backend;
     // The command's submission (BackendAsyncState::beginSubmission).
     uint64_t sequence = 0;
@@ -679,13 +685,12 @@ private:
             @autoreleasepool {
                 HostSteps &steps = *queued.steps;
                 HostSteps::Step &step = *queued.step;
-                id<MTLSharedEvent> event = steps.event;
                 id<MTLCommandBuffer> before = step.before;
                 bool worked = false;
                 std::optional<double> returned;
                 // A halted command's step still waits for the work before
                 // it, which the event's value then follows.
-                const bool ready = before && reached(event, step.ready, before) &&
+                const bool ready = before && reached(steps.readyEvent, step.ready, before) &&
                                    before.status != MTLCommandBufferStatusError;
                 if (ready && !steps.halted) {
                     const double pickup = awakeSeconds();
@@ -704,7 +709,7 @@ private:
                     steps.fail("host step not run: the backend stopped");
                 }
                 if (!worked) steps.halted = true;
-                event.signaledValue = step.ready + 1;
+                steps.ranEvent.signaledValue = step.ready;
                 if (step.release) release(steps.releases, *step.release);
                 // The step's return moves the deadline once the GPU went on.
                 if (returned) steps.backend->progressSubmission(steps.sequence, *returned);
@@ -1137,20 +1142,21 @@ struct MetalBackend::Impl {
     // command's `steps`, creating them with its first, appends it (and the
     // buffer that spins through an awake step) to `leading` and commits it,
     // hands the step to the runner (HostStepRunner), and returns the command
-    // buffer after them, which waits for the step: the event reaches 2i + 1
-    // once the work before step i has completed, or from the CPU when it
-    // failed, which skips the step; the runner then runs the step and raises
-    // the event to 2i + 2. Between the two, for an awake step, a buffer of one
-    // host_step_wait spins until the runner raises the release counter past
-    // the step, which keeps the GPU awake: a GPU idle through a step starts the
-    // work after it 75-80 us after the release (M5 Max, M5 Pro; M3 Max 100
-    // us), and after 3-10 ms of idling 0.4-0.7 ms after it, at low clocks for
-    // 2-3 ms more; awake it starts in 12-22 us (M3 Max 70-80 us). The spin
-    // orders nothing: the work after the step starts in a buffer of its own
-    // that waits for the event, and only a buffer's start makes what the CPU
-    // wrote visible (a wait inside a buffer that the GPU reaches after the
-    // signal leaves stale lines). An awake step spins only once the spin was
-    // seen to end at its release (checkHostStepSpin).
+    // buffer after them, which waits for the step: the GPU raises readyEvent
+    // to i + 1 once the work before step i has completed (a failure skips the
+    // step); the runner then runs the step and raises ranEvent to i + 1, which
+    // the buffer after it waits for (HostSteps). Between the two, for an awake
+    // step, a buffer of one host_step_wait spins until the runner raises the
+    // release counter past the step, which keeps the GPU awake: a GPU idle
+    // through a step starts the work after it 75-80 us after the release (M5
+    // Max, M5 Pro; M3 Max 100 us), and after 3-10 ms of idling 0.4-0.7 ms
+    // after it, at low clocks for 2-3 ms more; awake it starts in 12-22 us
+    // (M3 Max 70-80 us). The spin orders nothing: the work after the step
+    // starts in a buffer of its own that waits for ranEvent, and only a
+    // buffer's start makes what the CPU wrote visible (a wait inside a buffer
+    // that the GPU reaches after the signal leaves stale lines). An awake step
+    // spins only once the spin was seen to end at its release
+    // (checkHostStepSpin).
     template <class Fail>
     id<MTLCommandBuffer> encodeHostStep(id<MTLCommandBuffer> command, std::vector<id<MTLCommandBuffer>> &leading,
                                         std::shared_ptr<HostSteps> &steps, uint64_t sequence, const EventStep &step,
@@ -1159,12 +1165,12 @@ struct MetalBackend::Impl {
             steps = std::make_shared<HostSteps>();
             steps->backend = asyncState;
             steps->sequence = sequence;
-            steps->event = [device newSharedEvent];
-            if (!steps->event) failEncoding("unable to create Metal shared event");
+            steps->readyEvent = [device newSharedEvent];
+            steps->ranEvent = [device newSharedEvent];
+            if (!steps->readyEvent || !steps->ranEvent) failEncoding("unable to create Metal shared event");
         }
-        id<MTLSharedEvent> event = steps->event;
-        const uint64_t ready = 2 * steps->steps.size() + 1;
-        [command encodeSignalEvent:event value:ready];
+        const uint64_t ready = steps->steps.size() + 1;
+        [command encodeSignalEvent:steps->readyEvent value:ready];
         leading.push_back(command);
         std::optional<uint32_t> released;
         if (step.gpu == HostStepGpu::Awake && hostStepSpin) {
@@ -1176,7 +1182,7 @@ struct MetalBackend::Impl {
         }
         id<MTLCommandBuffer> next = [queue commandBuffer];
         if (!next) failEncoding("unable to create Metal command buffer");
-        [next encodeWaitForEvent:event value:ready + 1];
+        [next encodeWaitForEvent:steps->ranEvent value:ready];
         steps->steps.push_back({ready, step.work, step.timed, step.then, command, next, 0.0, 0.0, released});
         for (auto buffer = leading.end() - (released ? 2 : 1); buffer != leading.end(); ++buffer)
             [*buffer commit];
