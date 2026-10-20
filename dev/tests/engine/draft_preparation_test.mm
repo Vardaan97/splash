@@ -69,8 +69,7 @@ void checkImage(const std::vector<uint8_t> &image, const model::gguf::Image &pla
     const Fmt f = Fmt(step.format);
     native.resize(size_t(step.rows) * rowBytes(f, uint32_t(step.columns)), 0);
     const Packed planes = repack(f, native, uint32_t(step.rows), uint32_t(step.columns), nullptr);
-    check(holds(image, step.plane0, planes.w0) && holds(image, step.meta, planes.meta) &&
-              (planes.w1.empty() || holds(image, step.plane1, planes.w1)),
+    check(holdsPackedPlanes(image, step, planes),
           plan.name + " " + step.sources.front().name + ": exact packed planes of independent native rows");
     std::vector<uint8_t> actual(native.size(), 0xFF);
     model::readRepackRows(step, 0, step.rows, actual.data());

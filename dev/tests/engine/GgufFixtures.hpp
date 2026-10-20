@@ -104,6 +104,19 @@ inline void check(bool ok, const std::string &what) {
   failures += !ok;
 }
 
+// Only the format's real planes belong to the image. The reference keeps a
+// 16-byte dummy w1 for GPU buffer bindings when the format has no plane1;
+// the plan's plane1 offset is then 0, where the image header lives.
+inline bool holdsPackedPlanes(std::span<const uint8_t> image, const model::gguf::Repack &step,
+                              const gguf_reference::Packed &planes) {
+  const auto holds = [&](uint64_t offset, const std::vector<uint8_t> &bytes) {
+    return offset <= image.size() && bytes.size() <= image.size() - offset &&
+           std::equal(bytes.begin(), bytes.end(), image.begin() + offset);
+  };
+  return holds(step.plane0, planes.w0) && holds(step.meta, planes.meta) &&
+         (!kQuantFormats[step.format].plane1_bytes || holds(step.plane1, planes.w1));
+}
+
 // Runs one group of checks; an exception fails the group, not the rest.
 template <class F> void guarded(const std::string &what, F run) {
   try {

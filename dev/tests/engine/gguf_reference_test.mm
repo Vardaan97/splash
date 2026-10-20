@@ -22,6 +22,41 @@ namespace {
 // NVFP4 blockNvfp4Fixture(kRows, kColumns, kSeed + GGUF_FMT_NVFP4).
 constexpr uint32_t kRows = 256, kColumns = 1024, kSeed = 7;
 
+// Compare real planes in an image with its nonzero header intact. A dummy
+// reference w1 must be ignored, but corruption of any real plane must fail.
+void checkPackedPlaneComparison() {
+  constexpr uint32_t rows = QUANT_TILE_ROWS, columns = 256;
+  for (Fmt f : {Fmt(GGUF_FMT_AF4G64), Fmt(GGUF_FMT_AF8G64), BF16, Q5K}) {
+    const Packed planes = repack(f, fixture(f, rows, columns, kSeed + f), rows, columns, nullptr);
+    model::gguf::ImageBuilder builder("comparison.bin", 0, 0);
+    const model::gguf::Repack step = builder.planes(f, rows, columns, "projection");
+    const auto plan = builder.finish();
+    std::vector<uint8_t> image(plan.bytes, 0);
+    for (const auto &fill : plan.fills)
+      std::copy(fill.bytes.begin(), fill.bytes.end(), image.begin() + fill.offset);
+    std::copy(planes.w0.begin(), planes.w0.end(), image.begin() + step.plane0);
+    std::copy(planes.meta.begin(), planes.meta.end(), image.begin() + step.meta);
+    const bool hasPlane1 = kQuantFormats[f].plane1_bytes != 0;
+    if (hasPlane1) std::copy(planes.w1.begin(), planes.w1.end(), image.begin() + step.plane1);
+    const std::string label = std::string(fmtName(f)) + ": packed-plane comparison ";
+    if (!hasPlane1)
+      check(step.plane1 == 0 && planes.w1 == std::vector<uint8_t>(16, 0) &&
+                !std::equal(planes.w1.begin(), planes.w1.end(), image.begin()),
+            label + "has dummy w1 over a nonzero header");
+    check(holdsPackedPlanes(image, step, planes), label + "accepts exact real planes");
+    const auto rejectsCorruption = [&](uint64_t offset, const char *name) {
+      image[offset] ^= 1;
+      check(!holdsPackedPlanes(image, step, planes), label + "rejects corrupt " + name);
+      image[offset] ^= 1;
+    };
+    rejectsCorruption(step.plane0, "plane0");
+    rejectsCorruption(step.meta, "metadata");
+    if (hasPlane1) rejectsCorruption(step.plane1, "plane1");
+    check(!holdsPackedPlanes(std::span<const uint8_t>(image).first(step.meta), step, planes),
+          label + "rejects a truncated image");
+  }
+}
+
 void checkFormat(void *ggml, const Goldens &hashes, Fmt f) {
   const std::vector<uint8_t> native = fixture(f, kRows, kColumns, kSeed + f);
   std::vector<float> values;
@@ -130,6 +165,7 @@ int main(int argc, char **argv) {
     checkBlockNvfp4(ggml, hashes);
     checkQ8_0Quantization(ggml, goldens(argv[1], @"gguf_quantization"));
     checkMlx(argv[2]);
+    checkPackedPlaneComparison();
     std::printf("%s (%d failures)\n", failures ? "GGUF reference tests FAILED" : "GGUF reference tests passed",
                 failures);
     return failures ? 1 : 0;
