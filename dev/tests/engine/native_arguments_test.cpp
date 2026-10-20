@@ -376,6 +376,15 @@ int main(int argc, char **argv) {
   }
   modelConfigs = argv[2];
   try {
+    using Format = model::DraftProjectionFormat;
+    require(engine::parseDraftProjectionFormat(std::nullopt) == Format::Af4g64 &&
+                engine::parseDraftProjectionFormat("af4g64") == Format::Af4g64 &&
+                engine::parseDraftProjectionFormat("af8g64") == Format::Af8g64 &&
+                engine::parseDraftProjectionFormat("bf16") == Format::Bfloat16,
+            "draft projection selection did not preserve its explicit/default recipe");
+    for (const char *value : {"", "AF8G64", "af8", " bf16", "bf16 ", "f16", "af4g32", "af4g64x"})
+      rejects([&] { (void)engine::parseDraftProjectionFormat(value); },
+              "SPLASH_DFLASH_PROJECTION_FORMAT requires", "invalid projection format accepted");
     testServerCommandLines(argv[1]);
     testNeuralEngine();
     testVerifyRows();

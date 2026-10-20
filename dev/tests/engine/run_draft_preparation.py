@@ -1,6 +1,5 @@
-"""A small DFlash2 draft checkpoint and the af4g64 rows MLX's affine
-quantization rounds each of its projections to, an independent oracle of the
-draft's prepared planes, then the golden hashes of its images."""
+"""A small draft checkpoint and independent native rows for af4g64,
+af8g64 and stored BF16, followed by GPU image/loader/restoration checks."""
 
 import argparse
 import math
@@ -35,13 +34,12 @@ def half_away(value):
     return math.copysign(math.floor(abs(value) + 0.5), value)
 
 
-def quantized_group(weights):
-    """64 weights quantized to 4 bits as MLX's affine quantization rounds them
-    (mlx.core.quantize, its Metal kernel, whose maximum starts at 0), as a
-    native af4g64 block: the scale and bias as BF16, then the packed codes."""
+def quantized_group(weights, bits=4):
+    """Independent float32 affine oracle: BF16 metadata and unsigned codes."""
+    limit = (1 << bits) - 1
     low, high = min(weights), max(0.0, *weights)
     low_edge = abs(low) > abs(high)
-    scale = max(f32(f32(high - low) / 15), f32(1e-7))
+    scale = max(f32(f32(high - low) / limit), f32(1e-7))
     if not low_edge:
         scale = -scale
     edge = low if low_edge else high
@@ -50,18 +48,21 @@ def quantized_group(weights):
     if q0 != 0:
         scale, bias = f32(edge / q0), edge
     codes = [
-        int(min(max(half_away(f32(f32(w - bias) / scale)), 0), 15)) for w in weights
+        int(min(max(half_away(f32(f32(w - bias) / scale)), 0), limit)) for w in weights
     ]
-    packed = bytes(codes[i] | codes[i + 1] << 4 for i in range(0, len(codes), 2))
+    packed = (
+        bytes(codes)
+        if bits == 8
+        else bytes(codes[i] | codes[i + 1] << 4 for i in range(0, len(codes), 2))
+    )
     return struct.pack("<HH", bf16(scale), bf16(bias)) + packed
 
 
-def draft_fixture(root):
-    """A two-layer DFlash2 checkpoint of width 256, its BF16 safetensors as
-    its repository releases them, and expected/native.safetensors: each
-    projection's native af4g64 rows, as MLX's affine quantization rounds
-    them."""
-    tensors, values, expected = {}, {}, {}
+def draft_fixture(root, extremes=False):
+    """Two-layer checkpoint, preserving the original default golden inputs."""
+    root.mkdir(parents=True, exist_ok=True)
+    tensors, values = {}, {}
+    expected = {"expected": {}, "expected-af8g64": {}, "expected-bf16": {}}
 
     def add(name, shape, data=None):
         count = math.prod(shape)
@@ -75,11 +76,20 @@ def draft_fixture(root):
     def projection(name, rows, columns, data=None):
         add(name + ".weight", [rows, columns], data)
         weights = values[name + ".weight"]
-        native = b"".join(
-            quantized_group(weights[start : start + 64])
-            for start in range(0, len(weights), 64)
-        )
-        expected[name] = ([rows, columns // 64 * 36], "U8", native)
+        if extremes:
+            raw = bytearray(tensors[name + ".weight"][2])
+            # Stored BF16 preparation must preserve values outside F16 range.
+            struct.pack_into("<8H", raw, 0, 1, 0x8001, 0x0080, 0x7F7F, 0xFF7F, 0x8000, 0, 0x3F81)
+            tensors[name + ".weight"] = ([rows, columns], "BF16", bytes(raw))
+        else:
+            for bits, directory in ((4, "expected"), (8, "expected-af8g64")):
+                native = b"".join(
+                    quantized_group(weights[start : start + 64], bits)
+                    for start in range(0, len(weights), 64)
+                )
+                block_bytes = 4 + 64 * bits // 8
+                expected[directory][name] = ([rows, columns // 64 * block_bytes], "U8", native)
+        expected["expected-bf16"][name] = ([rows, 2 * columns], "U8", tensors[name + ".weight"][2])
 
     for layer in range(2):
         p = f"layers.{layer}."
@@ -121,8 +131,10 @@ def draft_fixture(root):
     add("candidate_selector.predecessor_codebook", [256, 256])
     add("candidate_selector.successor_codebook", [256, 256])
     write_safetensors(root / "model.safetensors", tensors)
-    (root / "expected").mkdir()
-    write_safetensors(root / "expected" / "native.safetensors", expected)
+    for directory, native in expected.items():
+        if native:
+            (root / directory).mkdir()
+            write_safetensors(root / directory / "native.safetensors", native)
 
 
 def main():
@@ -134,6 +146,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="splash-draft-preparation-") as directory:
         root = Path(directory)
         draft_fixture(root)
+        draft_fixture(root / "bf16-extremes", extremes=True)
         command = [
             str(args.binary.resolve()),
             str(args.metallib.resolve()),

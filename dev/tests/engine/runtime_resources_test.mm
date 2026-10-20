@@ -503,6 +503,71 @@ void testPersistentCacheNamespace() {
           "factors alike to six digits shared a cache namespace");
 }
 
+// Recipe identity affects composite states and their persistent file tag,
+// even for equal-size images; target-only identity remains stable.
+void testDraftPrecisionCacheCpu() {
+  using Format = model::DraftProjectionFormat;
+  const auto descriptor = model::makeModelDescriptor(
+      "precision-cache", model::Qwen3_8Layout{}, test::qwen3_8Draft(), test::qwen3_8Vision(),
+      model::TargetSource::Safetensors, model::VisionSource::None);
+  const model::WeightFileRecord target{"target/model.bin", "MDGG0001", 0, 0, 16384, "source"};
+  const auto targetManifest = model::weightManifestFingerprint(std::array{target});
+  const auto identity = [&](Format format, uint32_t version = 1) {
+    const auto combined = model::weightManifestFingerprint(std::array{target,
+        model::WeightFileRecord{"draft/model.bin", "MDGG0001", 0, 1, 16384,
+                                model::draftProjectionIdentity("source", format, version)}});
+    return makeRuntimeCacheIdentity(combined, targetManifest, "same-build", descriptor.targetKvLayout, {});
+  };
+  const auto name = [&](Format format, uint32_t version = 1) {
+    return persistentCacheNamespace(identity(format, version), descriptor.stateLayout);
+  };
+  const std::array formats{Format::Af4g64, Format::Af8g64, Format::Bfloat16};
+  const test::TemporaryDirectory directory("splash-precision-cache");
+  constexpr uint64_t slotBytes = 16384;
+  for (auto source : formats) {
+    const auto persistence = [&](Format format, uint32_t version = 1) {
+      const std::string key = name(format, version);
+      const auto tag = std::as_bytes(std::span(key));
+      return model::SlotFile::Persistence{directory.path() / "state.slots", directory.path() / "state.records",
+                                          {tag.begin(), tag.end()}, 8};
+    };
+    const auto fill = [&] {
+      model::SlotFile file(slotBytes, std::make_shared<model::DiskBudget>(2 * slotBytes), persistence(source));
+      file.finishAdoption();
+      auto slot = file.acquire();
+      const std::vector<std::byte> payload(slotBytes, std::byte{0x35});
+      require(slot && file.write(slot, {payload}, {})->wait(), "precision state fixture could not be written");
+      file.label(slot, std::vector<std::byte>(8, std::byte{1}));
+      require(file.synchronize({})->wait(), "precision state fixture did not synchronize");
+      file.seal();
+    };
+    fill();
+    {
+      model::SlotFile same(slotBytes, std::make_shared<model::DiskBudget>(2 * slotBytes), persistence(source));
+      require(same.records().size() == 1, "same-recipe composite state could not be taken back");
+      same.seal();
+    }
+    for (auto destination : formats) {
+      require(identity(source).targetModelSha256 == identity(destination).targetModelSha256,
+              "projection format changed the target-only identity");
+      if (source == destination) continue;
+      require(name(source) != name(destination), "different draft formats shared a cache namespace");
+      fill();
+      // Force the same paths to check the file tag as well as namespace
+      // selection: a foreign composite state must not be offered for restore.
+      model::SlotFile foreign(slotBytes, std::make_shared<model::DiskBudget>(2 * slotBytes), persistence(destination));
+      require(foreign.records().empty(), "cross-format composite state was accepted for restoration");
+    }
+    if (source != Format::Af4g64) {
+      require(name(source) == name(source) && name(source) != name(source, 2),
+              "same-size recipe version did not change the cache namespace");
+      fill();
+      model::SlotFile revised(slotBytes, std::make_shared<model::DiskBudget>(2 * slotBytes), persistence(source, 2));
+      require(revised.records().empty(), "a revised same-size recipe accepted an old composite state");
+    }
+  }
+}
+
 void testWeightBudgetBeforeLoading(const char *metallibPath) {
   const test::TemporaryDirectory root("splash-budget");
   RuntimeResourcesConfig config = budgetConfig(metallibPath, root.path());
@@ -1128,7 +1193,15 @@ void testEngineFollowsTheGovernor(const char *metallibPath) {
 int main(int argc, char **argv) {
   @autoreleasepool {
     try {
+      if (argc == 2 && std::string_view(argv[1]) == "--cpu") {
+        testLoadedVisionIsRequiredOnlyWithVision();
+        testPersistentCacheNamespace();
+        testDraftPrecisionCacheCpu();
+        std::cout << "runtime resources CPU tests passed\n";
+        return EXIT_SUCCESS;
+      }
       require(argc == 2, "expected metallib path");
+      testDraftPrecisionCacheCpu();
       testLoadedVisionIsRequiredOnlyWithVision();
       testPersistentCacheNamespace();
       testWeightBudgetBeforeLoading(argv[1]);

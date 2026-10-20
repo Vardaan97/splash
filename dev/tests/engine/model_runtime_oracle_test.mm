@@ -4,6 +4,7 @@
 #include "ane/ProgramInstrumentation.hpp"
 #include "engine/KvPool.hpp"
 #include "engine/RuntimeResources.hpp"
+#include "engine/NativeArguments.hpp"
 #include "engine/MemoryGovernor.hpp"
 #include "engine/MemoryPlan.hpp"
 #include "engine/NativeArguments.hpp"
@@ -3783,6 +3784,9 @@ int main(int argc, char **argv) {
         maxContext = static_cast<uint32_t>(parsed);
       } else fail("unknown model-runtime-oracle option");
     }
+    const char *projectionFormat = std::getenv("SPLASH_DFLASH_PROJECTION_FORMAT");
+    const auto draftFormat = engine::parseDraftProjectionFormat(
+        projectionFormat ? std::optional<std::string_view>(projectionFormat) : std::nullopt);
     metal::MetalBackend backend(argv[1]);
     const auto &device = backend.capabilities();
     if (const auto error = device.validationError())
@@ -3795,7 +3799,10 @@ int main(int argc, char **argv) {
     require(hostAvailableBytes.has_value(),
             "cannot measure available host memory before loading the oracle model");
     const std::filesystem::path modelRoot(argv[2]);
-    const auto descriptor = model::servedFor(model::inspectModelRoot(modelRoot), maxContext);
+    auto descriptor = model::servedFor(model::inspectModelRoot(modelRoot), maxContext);
+    descriptor.draftProjectionFormat = draftFormat;
+    model::requireDraftProjectionGeometry(descriptor.draft, draftFormat);
+    std::cout << "draft_projection_format=" << model::draftProjectionFormatName(draftFormat) << '\n';
     // Production's weight byte count with a different bound. Production checks
     // it only against the Metal hard budget, then guards host headroom at every
     // Metal operation while loading. This oracle has no such guard, so the

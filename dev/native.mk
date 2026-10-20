@@ -72,6 +72,7 @@ TEST_MEMORY_AUDIT_ASAN := $(ENGINE_SANITIZER_BUILD)/memory-audit-asan-ubsan
 TEST_STATUS_ASAN := $(ENGINE_SANITIZER_BUILD)/runtime-status-asan-ubsan
 TEST_MEMORY_TEST := $(ENGINE_TEST_BUILD)/engine-memory-plan
 TEST_VISION_PREPARATION := $(ENGINE_TEST_BUILD)/vision-preparation
+TEST_AFFINE_BFLOAT16 := $(ENGINE_TEST_BUILD)/affine-bfloat16
 TEST_DRAFT_PREPARATION := $(ENGINE_TEST_BUILD)/draft-preparation
 TEST_SAFETENSORS_CHECKPOINT := $(ENGINE_TEST_BUILD)/safetensors-checkpoint
 TEST_MODEL_CONFIGURATION := $(ENGINE_TEST_BUILD)/model-configuration
@@ -188,7 +189,7 @@ TEST_CACHE_DIRECTORY := $(ENGINE_TEST_BUILD)/cache-directory
 TEST_DISK_SPACE := $(ENGINE_TEST_BUILD)/disk-space
 TEST_PERSISTENT_CACHE := $(ENGINE_TEST_BUILD)/persistent-cache
 
-TEST_CPU_TARGETS := $(TEST_SLOT_FILE) $(TEST_SPARSE_ROW_STORE) $(TEST_SSD_READERS) $(TEST_SLOT_RECYCLER) \
+TEST_CPU_TARGETS := $(TEST_MODEL_LOADING_TEST) $(TEST_RESOURCES_TEST) $(TEST_AFFINE_BFLOAT16) $(TEST_SLOT_FILE) $(TEST_SPARSE_ROW_STORE) $(TEST_SSD_READERS) $(TEST_SLOT_RECYCLER) \
 	$(TEST_VERIFY_BUDGET) $(TEST_CONTEXT_LOOKUP) \
 	$(TEST_CACHE_DIRECTORY) $(TEST_DISK_SPACE) $(TEST_LEGACY_WEIGHT_CACHE) $(TEST_VISION_PREPARATION) $(TEST_SAFETENSORS_CHECKPOINT) $(TEST_WEIGHT_SOURCE) $(TEST_OPERATOR_WORKSPACE) \
 	$(TEST_MODEL_CONFIGURATION) \
@@ -302,6 +303,7 @@ $(ENGINE_TEST_BUILD) $(ENGINE_SANITIZER_BUILD):
 # CPU tests built from the runtime sources they check, without the engine
 # library or a framework. Those that also run under the sanitizers list their
 # sources with the sanitizer builds.
+$(TEST_AFFINE_BFLOAT16): dev/tests/engine/affine_bfloat16_test.cpp runtime/model/AffineBfloat16.cpp
 $(TEST_WEIGHT_SOURCE): dev/tests/engine/weight_source_test.cpp runtime/model/WeightSource.cpp
 $(TEST_CONTEXT_LOOKUP): dev/tests/engine/draft_context_lookup_test.cpp runtime/model/DraftContextLookup.cpp \
 		runtime/model/DraftContextLookup.hpp runtime/metal/abi/DraftContextLookup.h \
@@ -326,7 +328,7 @@ $(TEST_MEMORY_GOVERNOR_TEST): runtime/metal/DeviceCapabilities.cpp \
 $(TEST_Q8_CPU_TEST): dev/tests/engine/q8_paged_kv_test.cc
 $(TEST_LEGACY_WEIGHT_CACHE): dev/tests/engine/legacy_weight_cache_test.cpp
 
-$(TEST_WEIGHT_SOURCE) $(TEST_GGUF_FILE) $(TEST_MEMORY_TEST) $(TEST_KV_PAGE_CACHE_TEST) \
+$(TEST_AFFINE_BFLOAT16) $(TEST_WEIGHT_SOURCE) $(TEST_GGUF_FILE) $(TEST_MEMORY_TEST) $(TEST_KV_PAGE_CACHE_TEST) \
 		$(TEST_DRAFT_CONTEXT_PLAN_TEST) $(TEST_RAGGED_SCHEDULER_TEST) \
 		$(TEST_ELASTIC_KV_TEST) $(TEST_NATIVE_LOOP_TEST) $(TEST_METRICS_TEST) \
 		$(TEST_MEMORY_AUDIT_TEST) $(TEST_MEMORY_GOVERNOR_TEST) $(TEST_STATUS_TEST) \
@@ -533,6 +535,9 @@ METAL_TEST_ENV := MTL_SHADER_VALIDATION=1
 test-engine: test-engine-cpu test-engine-metal
 
 test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TEST_BACKEND_BENCHMARK)
+	$(BUILD_ID_PYTHON) dev/tests/engine/run_affine_bfloat16.py $(TEST_AFFINE_BFLOAT16)
+	$(TEST_MODEL_LOADING_TEST) --cpu
+	$(TEST_RESOURCES_TEST) --cpu
 	$(TEST_SLOT_FILE)
 	$(TEST_KV_SLOT_FORMAT)
 	$(TEST_KV_PAGE_TIER_HOST)

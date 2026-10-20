@@ -735,6 +735,102 @@ void prefill(MetalBackend &backend, const Linear &linear, uint32_t K, const std:
           "8-32 rows (S 1 and " + std::to_string(splitChunk) + ") within fp64, equal to the 128-row tiles");
 }
 
+// ---------------------------------------------------------------- draft precision
+// Precision recipes at the released draft's actual matrix shapes. Sparse
+// BF16 inputs keep an independent oracle cheap even for context fc; each
+// output is still checked, including the K/V subview of fused QKV planes.
+// Stored BF16 and mathematical results have different contracts: staged
+// execution uses the existing half-conversion bound, register execution the
+// direct-operand bound. Storage bit equality is tested by draft-preparation.
+void draftPrecision(MetalBackend &backend, const Linear &linear) {
+  struct Shape { uint32_t n, k; const char *name; LinearEpilogue epilogue; };
+  constexpr std::array shapes{
+      Shape{640, 2560, "dynamic convolution", LinearEpilogue::None},
+      Shape{6144, 2560, "QKV", LinearEpilogue::None},
+      Shape{2560, 4096, "attention output", LinearEpilogue::Residual},
+      Shape{7680, 2560, "MLP gate/up", LinearEpilogue::GateUp},
+      Shape{2560, 7680, "MLP down", LinearEpilogue::Residual},
+      Shape{2560, 12800, "context fc", LinearEpilogue::None},
+      Shape{256, 2560, "selector hidden", LinearEpilogue::None}};
+  for (auto format : {Fmt(GGUF_FMT_AF4G64), Fmt(GGUF_FMT_AF8G64), BF16})
+    for (const auto shape : shapes) {
+      const Tensor weights = tensor(backend, format, shape.n, shape.k);
+      const auto exercise = [&](const Tensor &w, const std::string &name, LinearEpilogue epilogue, bool context) {
+        const Projection p = projection({&w}, w.N);
+        const bool gated = epilogue == LinearEpilogue::GateUp;
+        const Tensor gate = gated ? tensor(backend, format, w.N, w.K) : Tensor{};
+        const Projection gateProjection = gated ? projection({&gate}, w.N) : Projection{};
+        constexpr uint32_t maximumRows = 129;
+        std::vector<float> x(uint64_t{maximumRows} * w.K, 0.0F);
+        for (uint32_t r = 0; r < maximumRows; ++r)
+          x[uint64_t{r} * w.K + (r * 271 + 17) % w.K] = r % 2 ? -0.5F : 1.0F;
+        const auto oracle = [&](const Tensor &t) {
+          std::vector<Dot> dots(uint64_t{maximumRows} * t.N);
+          Dot *out = dots.data();
+          const uint32_t inputs = t.K;
+          const Fmt kind = t.format;
+          const uint8_t *native = t.native.data();
+          const uint32_t columns = t.N;
+          dispatch_apply(columns, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t n) {
+            std::vector<float> row(inputs);
+            rowValues(kind, native + n * rowBytes(kind, inputs), inputs, row.data());
+            double largest = 0;
+            for (float value : row) largest = std::max(largest, double(std::fabs(value)));
+            for (uint32_t r = 0; r < maximumRows; ++r) {
+              const double input = r % 2 ? -0.5 : 1.0;
+              const double product = input * row[(r * 271 + 17) % inputs];
+              out[uint64_t{r} * columns + n] = {product, std::fabs(product), std::fabs(input), largest};
+            }
+          });
+          return dots;
+        };
+        const auto dots = oracle(w);
+        const auto gateDots = gated ? oracle(gate) : std::vector<Dot>{};
+        const auto residual = residuals(maximumRows, w.N);
+        for (uint32_t lanes = 1; lanes <= 4; ++lanes)
+          for (const auto tile : {LinearTile::GgufRegister, LinearTile::GgufStaged})
+            for (uint32_t splits : {1U, 4U}) {
+              const auto workload = decode({w.N, w.K}, lanes, epilogue);
+              const auto plan = Linear::plan(workload, config(tile, workload, splits), FloatOutput::BFloat16);
+              const auto aux = storageRows(residual, w.N, workload.rows, plan.storageRows());
+              const std::string label = "draft " + std::string(fmtName(format)) + " " + name + " " + tileName(tile) +
+                  " lanes=" + std::to_string(lanes) + " splits=" + std::to_string(splits);
+              const auto result = run(backend, linear, plan, p, gated ? &gateProjection : nullptr,
+                  storageRows(x, w.K, workload.rows, plan.storageRows()), aux, kPoisonNaN, w.N, label);
+              checkValues(result, dots, gateDots, aux, workload, workload.rows, w.N,
+                          tile == LinearTile::GgufStaged, label);
+            }
+        if (context)
+          for (uint32_t rows : {17U, 33U, 129U}) {
+            const LinearWorkload workload{{w.N, w.K}, rows, LinearPhase::Prefill, LinearEpilogue::None};
+            const auto plan = linear.prefillPlan(p, rows, LinearEpilogue::None);
+            const std::string label = "draft " + std::string(fmtName(format)) + " " + name +
+                " prefill=" + std::to_string(rows);
+            const auto result = run(backend, linear, plan, p, nullptr,
+                storageRows(x, w.K, rows, plan.storageRows()), {}, kPoisonFinite, w.N, label);
+            checkValues(result, dots, {}, {}, workload, rows, w.N, true, label);
+          }
+      };
+      exercise(weights, shape.name, shape.epilogue, shape.k == 12800);
+      if (shape.n == 6144) {
+        // Exactly the zero-copy view used by draft context projection.
+        constexpr uint32_t start = 4096, count = 2048;
+        const auto view = [&](const MetalBuffer &plane) {
+          if (!plane) return MetalBuffer{};
+          const uint64_t row = plane.sizeBytes() / weights.N;
+          return backend.view(plane, start * row, count * row);
+        };
+        const size_t row = rowBytes(format, shape.k);
+        Tensor kv{format, count, shape.k,
+                  {weights.native.begin() + start * row, weights.native.end()},
+                  QuantizedSegment::planes(format, count, shape.k, view(weights.segment.plane0),
+                                            view(weights.segment.plane1), view(weights.segment.meta))};
+        exercise(kv, "QKV K/V view", LinearEpilogue::None, true);
+      }
+    }
+  section("draft precision: actual shapes, all outputs, K/V views, gate/up, context chunks and lanes 1/2/3/4");
+}
+
 // ---------------------------------------------------------------- leading inputs
 // A view of the leading inputs of a projection's rows (Projection::leadingInputs), as the ANE FFN split runs down's GPU
 // share: its residual prefill (gguf_prefill_<format>_r_leading_inputs) equals bit for bit the residual prefill of
@@ -1056,13 +1152,15 @@ void gatherExtents(MetalBackend &backend) {
 
 int main(int argc, char **argv) {
   @autoreleasepool {
-    if (argc != 2) {
-      std::cerr << "usage: gguf-projection <production-and-test.metallib>\n";
+    if (argc != 2 && !(argc == 3 && std::string_view(argv[2]) == "--draft-precision")) {
+      std::cerr << "usage: gguf-projection <production-and-test.metallib> [--draft-precision]\n";
       return 2;
     }
     try {
       MetalBackend backend(argv[1]);
       const Linear linear(backend.capabilities());
+      draftPrecision(backend, linear);
+      if (argc == 3) return failures ? 1 : 0;
       for (const LinearTile tile : {LinearTile::GgufRegister, LinearTile::GgufStaged}) {
         decodeTile(backend, linear, tile, false, decodeInputs(false), tileFormats(tile));
         fusedDecode(backend, linear, tile, false);

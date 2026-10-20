@@ -105,6 +105,18 @@ void testBf16BudgetAndStatus() {
 
 // The memory status names the recurrent state's format, and a profile without
 // one is refused.
+void testDraftProjectionFormatStatus() {
+  using Format = model::DraftProjectionFormat;
+  for (auto format : {Format::Af4g64, Format::Af8g64, Format::Bfloat16}) {
+    auto profile = model();
+    profile.draftProjectionFormat = format;
+    const auto plan = test::requireMemoryPlan(device(), profile);
+    require(plan.toStatusJson().find("\"draft_projection_format\":\"" +
+                std::string(model::draftProjectionFormatName(format)) + "\"") != std::string::npos,
+            "status did not report the immutable draft projection recipe");
+  }
+}
+
 void testStateFormatStatus() {
   auto profile = model();
   profile.stateFormat = ops::GdnStateFormat::BFloat16;
@@ -896,6 +908,7 @@ int main() {
     testUnifiedElasticBudget();
     testBf16BudgetAndStatus();
     testStateFormatStatus();
+    testDraftProjectionFormatStatus();
     testMinimumHoldsTheWarmupRunway();
     testMinimumRequiredBytesIsThePlans();
     testUserCeilingAndFailure();

@@ -199,6 +199,66 @@ void checkLaneScratch(const model::LoadedModel &loaded) {
     }
 }
 
+// The actual released projection shapes and formats, on every supported
+// lane width. All plans are CPU metadata; no device or buffers are created.
+void checkDraftPrecisionScratch() {
+  auto loaded = loadedModel<model::Qwen4ExpWeights>();
+  const std::array<uint32_t, 5> captures{4, 12, 20, 28, 36};
+  const auto draft = model::draftLayout(2560, 248320, 5, 7680, 10'000'000.0F, captures);
+  loaded.draft.layout = draft;
+  loaded.descriptor = model::makeModelDescriptor("draft precision scratch", model::Qwen4ExpLayout{}, draft,
+      ops::VisionLayout{.outputHiddenSize = 2560}, model::TargetSource::Gguf, model::VisionSource::None);
+  const auto geometry = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32);
+  const std::array<ops::LinearMatrix, 8> matrices{{
+      {640, 2560}, {6144, 2560}, {2048, 2560}, {2560, 4096},
+      {7680, 2560}, {2560, 7680}, {256, 2560}, {2560, 12800}}};
+  const auto covers = [](ops::LinearScratchSize bound, ops::LinearScratchSize need) {
+    require(bound.input >= need.input && bound.sums >= need.sums && bound.partials >= need.partials &&
+                bound.counters >= need.counters && bound.rotated >= need.rotated,
+            "draft precision plan exceeded the shape-based linear scratch bound");
+  };
+  for (uint32_t family : {9U, 10U, 11U})
+    for (uint32_t cores : {12U, 20U, 40U, 80U}) {
+      DeviceCapabilities device;
+      device.appleGpuFamily = family;
+      device.gpuCoreCount = cores;
+      const ops::ExecutionPlans plans(device);
+      const auto bound = model::DecodeArena::linearScratchSize(geometry, plans);
+      const auto prefill = model::prefillTensorBytes(geometry, plans);
+      const auto gateBound = model::DecodeArena::gateScratchBytes(geometry, plans);
+      for (auto format : {GGUF_FMT_AF4G64, GGUF_FMT_AF8G64, GGUF_FMT_BF16})
+        for (auto matrix : matrices) {
+          const ops::Projection projection(matrix.outputSize, matrix.inputSize,
+              ops::BlockWeights{{ops::QuantizedSegment::planes(format, matrix.outputSize, matrix.inputSize, {}, {}, {})}});
+          for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
+            const auto storage = plans.linear().decodeStorageRows(lanes * 8, projection.shape());
+            require(storage % 8 == 0 && storage >= lanes * 8 && storage <= 32,
+                    "draft precision storage rows exceed the four-lane arena");
+            const auto actualEpilogue = matrix.outputSize == draft.intermediateSize ? ops::LinearEpilogue::GateUp
+                : matrix.outputSize == draft.hiddenSize && matrix.inputSize != draft.targetHiddenSize()
+                    ? ops::LinearEpilogue::Residual : ops::LinearEpilogue::None;
+            for (auto epilogue : {actualEpilogue}) {
+              const auto plan = plans.linear().decodePlan(projection, lanes, epilogue,
+                  epilogue == ops::LinearEpilogue::GateUp ? &projection : nullptr);
+              covers(bound, plan.scratchSize());
+              require(plan.storageRows() <= storage && plan.gateScratchBytes() <= gateBound,
+                      "draft precision plan exceeded storage or gate scratch");
+            }
+          }
+          // Context fc and K/V are the only draft prefill projections.
+          if (!((matrix.outputSize == 2560 && matrix.inputSize == 12800) || matrix.outputSize == 2048)) continue;
+          for (uint32_t rows : {1U, 7U, 8U, 17U, 24U, 32U, 33U, 127U, 128U, 129U, 2048U}) {
+            const auto plan = plans.linear().prefillPlan(projection, rows, ops::LinearEpilogue::None);
+            const auto need = plan.scratchSize();
+            require(prefill[uint32_t(model::PrefillTensor::LinearPartials)] >= need.partials &&
+                        prefill[uint32_t(model::PrefillTensor::LinearCounters)] >= need.counters &&
+                        plan.storageRows() <= model::kPrefillRows,
+                    "draft context prefill plan exceeded the arena");
+          }
+        }
+    }
+}
+
 // A model served with YaRN reaches the runtime's geometry with its scaling
 // and the window it serves, which everything sized by the context follows; a
 // descriptor whose window is not the one its scaling serves is refused.
@@ -329,6 +389,7 @@ int main() {
     checkCaptureLayers();
     checkGdnWidths();
     checkGateUpLayers();
+    checkDraftPrecisionScratch();
     checkYarnGeometry();
     checkIndexTables();
     checkSpilledKvGeometry();

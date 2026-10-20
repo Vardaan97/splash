@@ -3,6 +3,8 @@
 #include "TestChecks.hpp"
 #include "TestCheckpoint.hpp"
 #include "model/GgufImageLayout.hpp"
+#include "model/DraftCheckpoint.hpp"
+#include "model/GgufPreparation.hpp"
 #include "model/ModelFactory.hpp"
 #include "model/ModelSizing.hpp"
 #include "model/SafetensorsImage.hpp"
@@ -901,7 +903,343 @@ void testSyntheticBlockMoeModel(MetalBackend &backend, const std::filesystem::pa
             "streamableWeights is not what an MLX block MoE target loads");
 }
 
+// Source metadata, native rows and recipe identities can all be checked
+// without constructing a backend. The large checkpoint below is sparse.
+void testDraftPrecisionCpu(const std::filesystem::path &root) {
+    using namespace splash::model;
+    using Format = DraftProjectionFormat;
+    const std::array<uint32_t, 5> captures{4, 12, 20, 28, 36};
+    const auto layout = draftLayout(2560, 248320, 5, 7680, 10'000'000.0F, captures);
+    splash::test::writeSyntheticShard(root / "model.safetensors", splash::test::draftTensors(layout));
+    const SafetensorsCheckpoint checkpoint(root);
+    const auto defaults = planDraftImages(checkpoint, layout);
+    const std::array formats{Format::Af4g64, Format::Af8g64, Format::Bfloat16};
+    constexpr std::array<uint64_t, 3> totals{523436032, 761331712, 1214840832};
+    for (size_t mode = 0; mode < formats.size(); ++mode) {
+        const auto format = formats[mode];
+        ModelDescriptor descriptor;
+        descriptor.draft = layout;
+        descriptor.draftProjectionFormat = format;
+        const auto captured = descriptor; // the copied immutable preparation recipe
+        descriptor.draftProjectionFormat = Format::Af4g64;
+        const auto plans = planDraftImages(checkpoint, captured.draft, captured.draftProjectionFormat);
+        uint64_t total = 0, projections = 0, copied = 0;
+        for (size_t index = 0; index < plans.size(); ++index) {
+            const auto &plan = plans[index], &baseline = defaults[index];
+            total += plan.bytes;
+            require(plan.name == baseline.name && plan.magic == baseline.magic && plan.layer == baseline.layer &&
+                        plan.type == baseline.type && plan.bytes % kWeightFileAlignment == 0,
+                    "draft image component or aligned geometry changed");
+            require(plan.copies.size() == baseline.copies.size(), "draft stored tensor count changed");
+            for (size_t c = 0; c < plan.copies.size(); ++c) {
+                const auto &source = plan.copies[c].source, &old = baseline.copies[c].source;
+                require(source.name == old.name && source.offset == old.offset && source.type == old.type &&
+                            source.rowBytes == old.rowBytes && source.rows == old.rows && source.file == old.file &&
+                            plan.copies[c].conversion == baseline.copies[c].conversion,
+                        "a norm, base convolution or codebook changed with projection format");
+                copied += source.rows * source.rowBytes;
+            }
+            size_t descriptors = 0;
+            for (const auto &fill : plan.fills) {
+                if (fill.bytes.size() != GgufTensorDescriptor::kBytes) continue;
+                const auto d = GgufTensorDescriptor::decode(
+                    std::span<const uint8_t, GgufTensorDescriptor::kBytes>(fill.bytes.data(), fill.bytes.size()));
+                const auto &repack = plan.repacks[descriptors++];
+                const auto &q = kQuantFormats[draftProjectionFormatId(format)];
+                const auto sizes = ggufPlaneBytes(q, repack.rows, repack.columns);
+                require(d.type == q.ggml_type && d.outputSize == repack.rows && d.inputSize == repack.columns &&
+                            d.p0 == q.plane0_bytes && d.p1 == q.plane1_bytes && d.metaBytes == q.meta_bytes &&
+                            d.metaGroups == q.meta_groups && d.plane0Bytes == sizes.plane0 &&
+                            d.plane1Bytes == sizes.plane1 && d.metaTotalBytes == sizes.meta,
+                        "a projection descriptor does not describe its recipe's exact planes");
+                require(repack.plane0 % kWeightFileAlignment == 0 && repack.meta % kWeightFileAlignment == 0 &&
+                            repack.plane0 + sizes.plane0 <= plan.bytes && repack.meta + sizes.meta <= plan.bytes,
+                        "projection planes are not aligned inside their image");
+            }
+            require(descriptors == plan.repacks.size(), "draft did not describe every projection");
+            for (size_t p = 0; p < plan.repacks.size(); ++p) {
+                const auto &step = plan.repacks[p], &old = baseline.repacks[p];
+                require(step.format == draftProjectionFormatId(format) && step.rows == old.rows &&
+                            step.columns == old.columns && step.sources.size() == old.sources.size(),
+                        "a projection lost its format or trained shape");
+                ++projections;
+                uint64_t rows = 0;
+                for (const auto &source : step.sources) {
+                    const auto &tensor = checkpoint.require(source.name + ".weight");
+                    require(tensor.shape == std::vector<uint64_t>{source.rows, step.columns} &&
+                                source.rowBytes == ggufRowBytes(kQuantFormats[step.format], step.columns),
+                            "projection sources do not keep their shapes and row bytes");
+                    if (format == Format::Bfloat16)
+                        require(!source.safetensors.bfloat16 && source.validateBfloat16 && source.file == tensor.file &&
+                                    source.offset == tensor.offset,
+                                "stored BF16 source lost its actual file/offset or invoked quantization");
+                    else
+                        require(source.safetensors.bfloat16 == &tensor && !source.validateBfloat16,
+                                "affine projection did not capture its BF16 source");
+                    rows += source.rows;
+                }
+                require(rows == step.rows, "fused projection omitted or padded source rows");
+                if (format == Format::Af4g64)
+                    require(step.plane0 == old.plane0 && step.plane1 == old.plane1 && step.meta == old.meta,
+                            "explicit af4 differs from the default plan");
+            }
+            if (format == Format::Af4g64) {
+                require(plan.bytes == baseline.bytes && plan.fills.size() == baseline.fills.size(),
+                        "explicit af4 changed default image sizes");
+                for (size_t f = 0; f < plan.fills.size(); ++f)
+                    require(plan.fills[f].offset == baseline.fills[f].offset &&
+                                plan.fills[f].bytes == baseline.fills[f].bytes,
+                            "explicit af4 changed default descriptor bytes");
+            }
+        }
+        require(projections == 37 && copied == 254548480 && total == totals[mode] &&
+                    draftImageBytes(root, layout, format) == total,
+                "released draft aligned byte accounting differs from the independent totals");
+    }
+    auto bad = layout;
+    bad.intermediateSize += 64;
+    requireDraftProjectionGeometry(bad, Format::Af4g64);
+    requireDraftProjectionGeometry(bad, Format::Af8g64);
+    rejects([&] { requireDraftProjectionGeometry(bad, Format::Bfloat16); }, "multiple of 256",
+            "tiled BF16 accepted an FFN width aligned only to 64");
+    bad = layout; --bad.dynamicSize;
+    rejects([&] { requireDraftProjectionGeometry(bad, Format::Af8g64); }, "output rows",
+            "a draft with partial output tiles was accepted");
+    bad = layout; bad.hiddenSize += 32;
+    rejects([&] { requireDraftProjectionGeometry(bad, Format::Af4g64); }, "output rows",
+            "a draft with partial affine groups was accepted");
+    rejects([&] { requireDraftProjectionGeometry(layout, static_cast<Format>(99)); }, "unknown",
+            "an invalid recipe enum reached allocation");
+
+    // Shape/dtype checks fail during planning, before any image allocation.
+    auto tensors = splash::test::draftTensors(layout);
+    for (auto &tensor : tensors)
+        if (tensor.name == "layers.0.self_attn.q_proj.weight") tensor.dtype = "F16";
+    splash::test::writeSyntheticShard(root / "bad-dtype" / "model.safetensors", tensors);
+    const SafetensorsCheckpoint badDtype(root / "bad-dtype");
+    for (auto format : formats)
+        rejects([&] { (void)planDraftImages(badDtype, layout, format); }, "type or shape",
+                "non-BF16 source tensor reached allocation");
+    tensors = splash::test::draftTensors(layout);
+    for (auto &tensor : tensors)
+        if (tensor.name == "layers.0.self_attn.q_proj.weight") tensor.shape = {layout.hiddenSize, layout.attentionSize};
+    splash::test::writeSyntheticShard(root / "bad-shape" / "model.safetensors", tensors);
+    const SafetensorsCheckpoint badShape(root / "bad-shape");
+    for (auto format : formats)
+        rejects([&] { (void)planDraftImages(badShape, layout, format); }, "type or shape",
+                "wrong tensor shape reached allocation");
+}
+
+// Native affine rows from actual checkpoint offsets, using literal expected
+// blocks. Constant positive groups have scale -1e-7, bias equal to the
+// stored BF16 value and all-zero codes in both formats.
+void testAffineDraftRowsCpu(const std::filesystem::path &root) {
+    using namespace splash::model;
+    const auto layout = syntheticDraft(syntheticTarget());
+    auto tensors = splash::test::draftTensors(layout);
+    for (size_t index = 0; index < tensors.size(); ++index) {
+        auto &tensor = tensors[index];
+        if (tensor.shape.size() != 2 || !tensor.name.ends_with(".weight")) continue;
+        tensor.data.resize(tensor.shape[0] * tensor.shape[1] * 2);
+        for (size_t at = 0; at < tensor.data.size(); at += 2) {
+            const uint16_t value = uint16_t(0x3E80 + (index * 7 + at / 128) % 128);
+            std::memcpy(tensor.data.data() + at, &value, 2);
+        }
+    }
+    splash::test::writeSyntheticShard(root / "model.safetensors", tensors);
+    const SafetensorsCheckpoint checkpoint(root);
+    for (auto format : {DraftProjectionFormat::Af4g64, DraftProjectionFormat::Af8g64}) {
+        const auto plans = planDraftImages(checkpoint, layout, format);
+        const size_t block = kQuantFormats[draftProjectionFormatId(format)].block_bytes;
+        for (const auto &plan : plans)
+            for (const auto &step : plan.repacks) {
+                const uint64_t rowBytes = step.columns / 64 * block;
+                std::vector<uint8_t> expected;
+                std::vector<uint64_t> boundaries{0};
+                for (const auto &source : step.sources) {
+                    const auto &tensor = checkpoint.require(source.name + ".weight");
+                    std::vector<uint8_t> weights(tensor.bytes);
+                    tensor.read(0, weights);
+                    const size_t first = expected.size();
+                    expected.resize(first + weights.size() / 128 * block, 0);
+                    for (size_t group = 0; group < weights.size() / 128; ++group) {
+                        auto *native = expected.data() + first + group * block;
+                        native[0] = 0xD7; native[1] = 0xB3;
+                        native[2] = weights[group * 128]; native[3] = weights[group * 128 + 1];
+                    }
+                    boundaries.push_back(boundaries.back() + source.rows);
+                }
+                std::vector<uint8_t> actual(expected.size(), 0xFF);
+                readRepackRows(step, 0, step.rows, actual.data());
+                require(actual == expected, "affine checkpoint rows differ from literal native blocks");
+                for (auto boundary : boundaries) {
+                    if (boundary == 0 || boundary == step.rows) continue;
+                    actual.resize(3 * rowBytes);
+                    readRepackRows(step, boundary - 1, 3, actual.data());
+                    require(std::equal(actual.begin(), actual.end(), expected.begin() + (boundary - 1) * rowBytes),
+                            "affine fused-source boundary read the wrong rows or block offsets");
+                }
+                actual.resize(5 * rowBytes);
+                readRepackRows(step, 17, 5, actual.data());
+                require(std::equal(actual.begin(), actual.end(), expected.begin() + 17 * rowBytes),
+                        "affine nonzero first row read the wrong source offset");
+            }
+    }
+}
+
+void testStoredDraftBfloat16Cpu(const std::filesystem::path &root) {
+    using namespace splash::model;
+    const std::array<uint32_t, 1> captures{0};
+    const auto layout = draftLayout(2048, 256, 1, 256, 10'000'000.0F, captures);
+    auto tensors = splash::test::draftTensors(layout);
+    // Tiny, huge and signed-zero BF16 values intentionally do not round-trip
+    // through F16. Place them in every projection, after preceding tensors.
+    const std::array<uint16_t, 8> values{0x0001, 0x8001, 0x7F7F, 0xFF7F, 0x0080, 0x8000, 0, 0x3F81};
+    for (auto &tensor : tensors)
+        if (tensor.shape.size() == 2 && tensor.name.ends_with(".weight")) {
+            tensor.data.resize(tensor.shape[0] * tensor.shape[1] * 2);
+            for (size_t at = 0; at < tensor.data.size(); at += 2)
+                std::memcpy(tensor.data.data() + at, &values[(at/2) % values.size()], 2);
+        }
+    splash::test::writeSyntheticShard(root / "model.safetensors", tensors);
+    const SafetensorsCheckpoint checkpoint(root);
+    const auto plans = planDraftImages(checkpoint, layout, DraftProjectionFormat::Bfloat16);
+    for (const auto &image : plans)
+        for (const auto &step : image.repacks) {
+            std::vector<uint8_t> expected;
+            for (const auto &source : step.sources) {
+                const auto &tensor = checkpoint.require(source.name + ".weight");
+                const size_t at = expected.size();
+                expected.resize(at + tensor.bytes);
+                tensor.read(0, std::span(expected).subspan(at));
+            }
+            std::vector<uint8_t> actual(expected.size(), 0xFF);
+            readRepackRows(step, 0, step.rows, actual.data());
+            require(actual == expected, "stored BF16 projection did not preserve released bits");
+            // Read across every fused-source boundary and from nonzero rows.
+            uint64_t row = 0;
+            for (const auto &source : step.sources) {
+                if (row) {
+                    actual.resize(2 * source.rowBytes);
+                    readRepackRows(step, row - 1, 2, actual.data());
+                    require(std::equal(actual.begin(), actual.end(), expected.begin() + (row - 1) * source.rowBytes),
+                            "BF16 fused QKV boundary changed stored rows");
+                }
+                row += source.rows;
+            }
+        }
+    // The stored branch must retain the affine path's finite-input contract.
+    for (auto &tensor : tensors)
+        if (tensor.name == "fc.weight") {
+            const uint16_t infinity = 0x7F80;
+            std::memcpy(tensor.data.data() + tensor.data.size() - 2, &infinity, 2);
+        }
+    splash::test::writeSyntheticShard(root / "nonfinite" / "model.safetensors", tensors);
+    const SafetensorsCheckpoint nonfinite(root / "nonfinite");
+    const auto bad = planDraftImages(nonfinite, layout, DraftProjectionFormat::Bfloat16).back().repacks.front();
+    std::vector<uint8_t> row(bad.columns * 2);
+    rejects([&] { readRepackRows(bad, bad.rows - 1, 1, row.data()); }, "non-finite",
+            "stored BF16 preparation silently accepted infinity");
+}
+
+void testDraftPlannerPropagationCpu(const std::filesystem::path &root) {
+    using namespace splash::model;
+    const auto target = syntheticTarget();
+    const auto draft = syntheticDraft(target);
+    splash::test::writeSyntheticCheckpoints(root, target, draft);
+    auto descriptor = makeModelDescriptor("precision planner", target, draft, syntheticVision(),
+                                         TargetSource::Safetensors, VisionSource::None);
+    const uint64_t defaultDraft = draftImageBytes(root / "draft", draft);
+    const uint64_t fixedTarget = streamableWeights(root, descriptor, {}).loadedBytes - defaultDraft;
+    for (auto format : {DraftProjectionFormat::Af4g64, DraftProjectionFormat::Af8g64, DraftProjectionFormat::Bfloat16}) {
+        descriptor.draftProjectionFormat = format;
+        const auto captured = descriptor;
+        descriptor.draftProjectionFormat = DraftProjectionFormat::Af4g64;
+        require(streamableWeights(root, captured, {}).loadedBytes ==
+                    fixedTarget + draftImageBytes(root / "draft", draft, format),
+                "resource planner did not consume the copied draft projection recipe");
+    }
+}
+
+void testDraftRecipeIdentityCpu() {
+    using namespace splash::model;
+    using Format = DraftProjectionFormat;
+    const WeightFileRecord target{"target/layer-0.bin", "MDGG0001", 0, 0, 16384, "source"};
+    const std::array targetOnly{target};
+    const auto manifest = [&](Format format, uint32_t version = 1) {
+        // Deliberately equal declared sizes: the recipe alone must isolate states.
+        return weightManifestFingerprint(std::array{target,
+            WeightFileRecord{"draft/layer-0.bin", "MDGG0001", 0, 0, 16384,
+                             draftProjectionIdentity("source", format, version)}});
+    };
+    require(draftProjectionIdentity("source", Format::Af4g64) == "source" &&
+                manifest(Format::Af4g64) == weightManifestFingerprint(std::array{target,
+                    WeightFileRecord{"draft/layer-0.bin", "MDGG0001", 0, 0, 16384, "source"}}), "default draft identity changed");
+    require(manifest(Format::Af4g64) != manifest(Format::Af8g64) &&
+                manifest(Format::Af8g64) != manifest(Format::Bfloat16) &&
+                manifest(Format::Af4g64) != manifest(Format::Bfloat16) &&
+                manifest(Format::Af8g64) != manifest(Format::Af8g64, 2) &&
+                manifest(Format::Bfloat16) != manifest(Format::Bfloat16, 2),
+            "format or same-size recipe change did not isolate the combined manifest");
+    const auto targetDigest = weightManifestFingerprint(targetOnly);
+    for (auto format : {Format::Af4g64, Format::Af8g64, Format::Bfloat16}) {
+        (void)manifest(format);
+        require(weightManifestFingerprint(targetOnly) == targetDigest, "draft recipe changed target-only identity");
+    }
+}
+
+// Actual loaded manifests also isolate recipes while retaining the target's
+// original identity. This path is part of the GPU suite only.
+void testSyntheticPrecisionModel(MetalBackend &backend, const std::filesystem::path &root) {
+    using namespace splash::model;
+    const auto target = syntheticTarget();
+    const auto draft = syntheticDraft(target);
+    splash::test::writeSyntheticCheckpoints(root, target, draft);
+    auto descriptor = makeModelDescriptor("precision loader", target, draft, syntheticVision(),
+                                         TargetSource::Safetensors, VisionSource::None);
+    descriptor.sourceIdentity = "precision-sources";
+    std::string targetManifest, defaultManifest;
+    for (auto format : {DraftProjectionFormat::Af4g64, DraftProjectionFormat::Af8g64, DraftProjectionFormat::Bfloat16}) {
+        descriptor.draftProjectionFormat = format;
+        const uint64_t planned = streamableWeights(root, descriptor, {}).loadedBytes;
+        const auto loaded = loadModel(backend, root, descriptor);
+        require(loaded.descriptor.draftProjectionFormat == format && loaded.draft.actualAllocatedBytes ==
+                    draftImageBytes(root / "draft", draft, format) &&
+                    loaded.targetActualAllocatedBytes() + loaded.draft.actualAllocatedBytes == planned,
+                "actual loaded precision weights differ from the descriptor's memory plan");
+        if (targetManifest.empty()) {
+            targetManifest = loaded.targetManifestFingerprint();
+            defaultManifest = loaded.manifestFingerprintSha256;
+        } else {
+            require(loaded.targetManifestFingerprint() == targetManifest &&
+                        loaded.manifestFingerprintSha256 != defaultManifest,
+                    "actual precision load changed the target or reused the default composite identity");
+        }
+        for (const auto &record : loaded.targetFiles())
+            require(record.contentIdentity == descriptor.sourceIdentity, "a target image acquired the draft recipe key");
+        for (const auto &record : loaded.draft.files)
+            require(record.contentIdentity == draftProjectionIdentity(descriptor.sourceIdentity, format),
+                    "a draft image omitted its captured recipe identity");
+    }
+}
+
 int main(int argc, const char *argv[]) {
+    if (argc == 2 && std::string_view(argv[1]) == "--cpu") {
+        try {
+            TempDirectory temporary;
+            testStartupCapabilities();
+            testDraftPrecisionCpu(temporary.path() / "released");
+            testStoredDraftBfloat16Cpu(temporary.path() / "stored");
+            testAffineDraftRowsCpu(temporary.path() / "affine-rows");
+            testDraftRecipeIdentityCpu();
+            testDraftPlannerPropagationCpu(temporary.path() / "planner");
+            std::cout << "model loading CPU tests passed\n";
+            return 0;
+        } catch (const std::exception &error) {
+            std::cerr << error.what() << '\n';
+            return 1;
+        }
+    }
     if (argc != 3) {
         std::cerr << "usage: model_loading_test <test.metallib> <splash.metallib>\n";
         return 2;
@@ -916,6 +1254,7 @@ int main(int argc, const char *argv[]) {
         // Block images are repacked by the production library's kernel.
         MetalBackend production(argv[2]);
         testSyntheticModel(production, temporary.path() / "model");
+        testSyntheticPrecisionModel(production, temporary.path() / "precision-model");
         testSyntheticBlockModel(production, temporary.path() / "block-model");
         testSyntheticBlockMoeModel(production, temporary.path() / "block-moe-model");
         for (const auto checkpoint : {splash::test::FloatCheckpoint::ModelOptimizer,
