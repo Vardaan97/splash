@@ -42,6 +42,53 @@ additional preparation, identity and validation work for af8g64 draft
 projections, and a speculative PLE prefetch design. Use `--verify-rows all`
 to compare against verifying every row.
 
+### Draft context lookup
+
+`SPLASH_DRAFT_CONTEXT_LOOKUP=1` in the engine's environment lets a greedy
+DFlash2 cycle propose text copied from the request's prompt and generated
+tokens. Unset, `0`, or another value leaves lookup off: the draft graph,
+random draws and model state follow the existing path. Restart to change it.
+
+The last tokens, including the pending anchor, match the longest n-gram
+from `SPLASH_DRAFT_CONTEXT_LOOKUP_MIN` through
+`SPLASH_DRAFT_CONTEXT_LOOKUP_MAX` (defaults 3 and 8; both must be in 3–8,
+minimum no larger than maximum). The newest earlier occurrence wins at
+that length, even if an older occurrence has more continuation. Its next
+up to seven known tokens replace the proposal prefix; the remaining
+positions keep the neural proposal. Overlapping matches can copy only
+known tokens, including the current anchor, without extrapolating a repeat.
+
+The target verifies that merged block with its usual acceptance and state
+commit. Lookup adds no verify rows, no second target pass and no host wait.
+The adaptive budget still chooses rows from the neural confidence and
+measured cycle costs; a lane with a replacement supplies no neural
+acceptance labels. This preserves the budget but does not calibrate it for
+lookup, so a match may receive few verify rows. `SPLASH_VERIFY_EVERY_ROW=1`
+remains available for a separate controlled arm. Sampled cycles and cycles
+with a thinking cutoff keep their neural proposals and probabilities.
+Greedy target correction remains authoritative; this does not promise
+identical floating-point output across different speculative inputs.
+
+`SPLASH_DRAFT_CONTEXT_LOOKUP_WINDOW` bounds the indexed occurrence ends
+(default 32768 tokens; range 8–262144). Exact hash keys distinguish token
+sequences even when hashes collide. An index holds at most `window` keys
+per configured length, with no second history copy. Its first fill scans
+only that window; later cycles index newly committed tokens and expire old
+occurrences. At the defaults there are at most 196608 map nodes per request;
+allocator and hash-bucket overhead adds to their storage. Only requests
+that draft allocate an index. Suspension releases it, resume rebuilds from
+the request history, and request completion releases it. Tokens older than
+the window can miss lookup; the target still reads its full context.
+
+`/status` reports `draft_context_lookup`: `hits` counts successfully
+committed cycles with a lookup prefix, `proposals` counts lookup token slots
+inside their chosen verify rows, and `accepted_tokens` counts lookup tokens
+actually retained after target acceptance and output limits. A hit can
+verify zero lookup tokens when only the anchor is budgeted. These counters
+cover the model lifetime, including warmup. No-match and skipped lanes add
+nothing. CPU index, parser and merge cases run in `make test-engine-cpu`,
+or build and run `build/engine-tests/draft-context-lookup` directly.
+
 ### Engine restarts and sleep
 
 An engine that fails is restarted at once. If it fails again within 60 s of
@@ -1511,6 +1558,7 @@ Proxy consumers can use these fields; additional fields may be added:
 | --- | --- |
 | `requests.submitted`, `completed`, `cancelled`, `failed` | Native request counters since engine start |
 | `active_requests` | Each request the engine holds, ordered by `id`: its `id`, `phase` (`queued`, `waiting_resources`, `waiting_prefix`, `prefill`, `decode` or `waiting_mask`, and `failed` for one whose deadline passed while a cached state it restores was being read from disk, until that read drains), `priority`, `prompt_tokens` and how many of them are encoded (`prompt_processed`, cached ones included), `generated_tokens` of `max_new_tokens`, where a block-sparse target keeps its KV (`kv_mode`: `resident` or `spill`, only while its KV can go to the SSD), and `age_ms` since it arrived |
+| `draft_context_lookup` | Model-lifetime lookup `hits`, verified lookup `proposals`, and retained `accepted_tokens`; see [Draft context lookup](#draft-context-lookup). |
 | `memory_actual.current_bytes`, `peak_bytes` | Metal allocations, not process RSS |
 | `weights.idle_release_seconds`, `released`, `restoring`, `restores`, `restore_failures` | `--idle-release` in seconds (`null` for `off`), whether the weights' memory is released now, whether a request's restore of it is under way (it stays `released` until the last image is back), the times it was restored for a request since engine start, and the restores that gave up for want of memory |
 | `identity.cache.rope_scaling` | With a `--max-context` past 256K, the target's RoPE scaling, which every cached key went through: `type` `yarn`, its `factor` and `original_context_tokens`; `null` otherwise |

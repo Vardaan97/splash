@@ -4,6 +4,7 @@
 #include "model/RuntimeInstrumentation.hpp"
 #endif
 #include "AwakeClock.hpp"
+#include "model/DraftContextLookup.hpp"
 #include "model/KvBlockCache.hpp"
 #include "model/KvHistoryStream.hpp"
 #include "model/QwenState.hpp"
@@ -327,6 +328,8 @@ struct Runtime::Impl {
     // the prompt (with any replayed generation) and the emitted output, which
     // the target may read (QwenTargetRequest).
     std::vector<uint32_t> tokens;
+    std::unique_ptr<DraftContextLookup> contextLookup;
+    uint32_t lookupProposals = 0;
   };
 
   struct DecodeLaneResult final {
@@ -409,6 +412,7 @@ struct Runtime::Impl {
   // follow where the budget chooses them (budgetsVerifyRows); none where
   // the cycles verify every row.
   std::optional<VerifyBudget> verifyBudget;
+  const DraftContextLookupConfig contextLookupConfig = DraftContextLookupConfig::fromEnvironment();
   ops::AneFfn *aneFfn;
   // The readers of spilled K/V, when the target's K/V spills.
   KvBlockCache *blockCache;
@@ -477,6 +481,9 @@ struct Runtime::Impl {
     sampling.addVerify(graph, policies, samplingBuffers(2),
                        geometry.target.stopTokens[0],
                        geometry.target.stopTokens[1], penalties);
+    if (contextLookupConfig.enabled)
+      graph.add("draft_context_lookup", {decodeArena->batchSlice(DecodeTensor::ProposedTokens, 2)},
+                DraftContextLookupParams{}, {2, 1, 1}, {kDraftProposalTokens, 1, 1});
     backend.preparePipelines(graph.dispatches());
   }
 
@@ -1935,6 +1942,27 @@ struct Runtime::Impl {
     }
     ops::DraftSelector::addVerifyRows(graph, d(DecodeTensor::VerifyConfidence), d(DecodeTensor::VerifyRows),
                                       verify, maximumRows);
+    // Keep the budget's row decision; lookup adds no verify rows or host
+    // dependency. Neural confidence is not a label for a replaced prefix.
+    if (contextLookupConfig.enabled) {
+      DraftContextLookupParams lookup{};
+      bool any = false;
+      for (uint32_t lane = 0; lane < lanes; ++lane) {
+        Request &entry = *entries[lane];
+        entry.lookupProposals = 0;
+        if (policies[lane].samples() || policies[lane].thinkingCutoff) continue;
+        if (!entry.contextLookup)
+          entry.contextLookup = std::make_unique<DraftContextLookup>(contextLookupConfig);
+        entry.contextLookup->sync(entry.tokens);
+        const auto proposal = entry.contextLookup->propose(entry.tokens, anchors[lane]);
+        lookup.lane[lane] = contextLookupLane(proposal, maximumRows[lane], false, false);
+        entry.lookupProposals = lookup.lane[lane].count;
+        any |= entry.lookupProposals != 0;
+      }
+      if (any)
+        graph.add("draft_context_lookup", {d(DecodeTensor::ProposedTokens)},
+                  lookup, {lanes, 1, 1}, {kDraftProposalTokens, 1, 1});
+    }
     sampling.addThinkingDrafts(graph, std::span(policies).first(lanes),
                                d(DecodeTensor::ProposedTokens));
   }
@@ -2203,7 +2231,8 @@ struct Runtime::Impl {
         std::copy_n(confidence, kDraftProposalTokens, observed[lane].confidence.begin());
         observed[lane].verifyRows = lanes[lane].verifyRows;
         observed[lane].accepted = lanes[lane].accepted;
-        observed[lane].labels = lanes[lane].endDrafts == 0;
+        observed[lane].labels = lanes[lane].endDrafts == 0 &&
+                                lanes[lane].request->lookupProposals == 0;
       }
       verifyBudget->observe(std::span(observed).first(items.size()), constrained,
                             timing.wallSeconds * 1000.0);
@@ -2259,6 +2288,11 @@ struct Runtime::Impl {
       // speculation counts the ones the lane verified.
       const uint32_t accepted =
           std::min(laneResult.accepted, laneResult.retained - 1);
+      if (entry.lookupProposals) {
+        ++counters.contextLookupHits;
+        counters.contextLookupProposals += std::min(entry.lookupProposals, laneResult.verifyRows - 1);
+        counters.contextLookupAcceptedTokens += std::min(entry.lookupProposals, accepted);
+      }
       const uint32_t verified = laneResult.verifyRows - 1;
       results.push_back({entry.id,
                          0,
@@ -2519,6 +2553,8 @@ void Runtime::suspend(uint64_t requestId) {
   impl_->releaseImages(entry);
   entry.draftContextPlan.reset();
   entry.draftRebuild.reset();
+  entry.contextLookup.reset();
+  entry.lookupProposals = 0;
   entry.replayingGeneration |= entry.promptComplete;
   entry.promptComplete = false;
   entry.resident = false;
@@ -2545,6 +2581,8 @@ StateAdmission Runtime::resume(const ModelRequest &request) {
     entry.resident = true;
     entry.promptTokens = static_cast<uint32_t>(request.prompt.size());
     entry.tokens.assign(request.prompt.begin(), request.prompt.end());
+    if (entry.contextLookup) entry.contextLookup->reset();
+    entry.lookupProposals = 0;
     entry.maxNewTokens = request.maxNewTokens;
     entry.images = std::move(images);
     entry.restoredTokens = request.restoredTokens;

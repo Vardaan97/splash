@@ -191,6 +191,9 @@ void testCleanRuntimeStatus(const char *goldenPath) {
   executorTelemetry.draftContextRowsAvoided = 7921;
   executorTelemetry.draftStateRestoreSkipped = 1;
   executorTelemetry.draftStateResets = 2;
+  executorTelemetry.contextLookupHits = 11;
+  executorTelemetry.contextLookupProposals = 37;
+  executorTelemetry.contextLookupAcceptedTokens = 23;
   executorTelemetry.constrainedMaskOverlapBatches = 5;
   executorTelemetry.constrainedMaskOverlapRequests = 8;
   executorTelemetry.lastConstrainedTargetForwardGpuSeconds = 0.0725;

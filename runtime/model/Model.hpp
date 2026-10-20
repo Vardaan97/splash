@@ -648,6 +648,9 @@ struct ModelMemoryActual final {
 };
 
 struct ModelTelemetry final {
+  uint64_t contextLookupHits = 0;
+  uint64_t contextLookupProposals = 0;
+  uint64_t contextLookupAcceptedTokens = 0;
   uint64_t stateAllocatedBytes = 0;
   // Pooled state buffers no lane holds: GDN parity cells, draft rings and
   // context windows.

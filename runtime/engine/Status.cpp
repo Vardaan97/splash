@@ -469,6 +469,9 @@ std::string runtimeStatusJson(
       // budget chooses them, all where they are every row up to each lane's
       // retention limit.
       << ",\"verify_rows\":" << json::quote(executorTelemetry.verifyBudget ? "auto" : "all")
+      << ",\"draft_context_lookup\":{\"hits\":" << executorTelemetry.contextLookupHits
+      << ",\"proposals\":" << executorTelemetry.contextLookupProposals
+      << ",\"accepted_tokens\":" << executorTelemetry.contextLookupAcceptedTokens << "}"
       // Model-lifetime timings include warmup; request metrics do not.
       << ",\"model_timing\":{\"scope\":\"model_lifetime\""
       << ",\"prefill\":{\"last_gpu_ms\":"
