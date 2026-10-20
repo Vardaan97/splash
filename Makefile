@@ -281,6 +281,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/engine/DiskSpace.cpp \
 	runtime/engine/StateCache.cpp \
 	runtime/model/DraftContextPlan.cpp \
+	runtime/model/DraftContextLookup.cpp \
 	runtime/engine/Protocol.cpp \
 	runtime/engine/NativeRuntime.cpp \
 	runtime/engine/NativeArguments.cpp \
