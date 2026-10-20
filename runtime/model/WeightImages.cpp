@@ -21,7 +21,8 @@ WeightFile WeightImages::load(ImagePlan image) {
   metal::MetalBuffer buffer = backend_->allocateBuffer(image.bytes, metal::BufferStorage::Shared, image.component);
   image.write(contentsOf(buffer), buffer);
   WeightFile file(*backend_, buffer, image.component, image.magic, image.layer, image.type,
-                  image.declaredBytes ? image.declaredBytes : buffer.sizeBytes(), contentIdentity_);
+                  image.declaredBytes ? image.declaredBytes : buffer.sizeBytes(),
+                  image.contentIdentity.empty() ? contentIdentity_ : image.contentIdentity);
   images_.push_back({std::move(image.component), std::move(buffer), std::move(image.write)});
   return file;
 }

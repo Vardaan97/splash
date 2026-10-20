@@ -2,6 +2,7 @@
 
 #include "metal/abi/Gguf.h"
 #include "metal/abi/GgufRepack.h"
+#include "model/AffineBfloat16.hpp"
 #include "model/Bfloat16.hpp"
 #include "model/GgufImageLayout.hpp"
 #include "model/WeightImages.hpp"
@@ -45,7 +46,7 @@ void requireRange(uint64_t offset, uint64_t bytes, uint64_t available) {
 
 // How readRows reads a tensor's rows: as stored, or as its format's native
 // rows, which it builds from a quantized safetensors tensor's tensors, from
-// a GGUF's NVFP4 rows, or by quantizing a BF16 weight (into af4g64) or a
+// a GGUF's NVFP4 rows, or by quantizing a BF16 weight (into affine groups) or a
 // GGUF tensor of BF16 or F16 values (into Q8_0).
 enum class RowReader : uint8_t { Stored, Safetensors, GgufNvfp4, QuantizedBfloat16, QuantizedGgufFloat };
 RowReader rowReader(const gguf::TensorRows &rows) {
@@ -140,72 +141,24 @@ void readSafetensorsRows(const gguf::TensorRows &rows, uint64_t start, uint64_t 
   }
 }
 
-// The BF16 nearest a finite value, ties to even.
-uint16_t nearestBfloat16(float value) {
-  const uint32_t bits = std::bit_cast<uint32_t>(value);
-  return static_cast<uint16_t>((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16);
-}
-
-// A group of 64 BF16 weights as MLX's affine quantization rounds it to 4 bits
-// (mlx.core.quantize, its Metal kernel), in float, into a native af4g64
-// block: the range runs from the minimum to the maximum or 0, whichever is
-// greater, the end of the range farther from zero is the bias, the scale is
-// adjusted so that 0 falls on a code unless that code is 0, each code is
-// round((w - bias) / scale), halves away from zero, clamped to [0, 15], and
-// scale and bias are stored as BF16. The loops have no early exit, so they
-// vectorize; the sign of a zero minimum or maximum, which the order of a
-// vector reduction may change, does not reach any output.
-void quantizeGroup(const uint8_t *weights, uint8_t *block) {
-  std::array<float, 64> w;
-  bool finite = true;
-  for (size_t i = 0; i < w.size(); ++i) {
-    uint16_t bits;
-    std::memcpy(&bits, weights + 2 * i, 2);
-    w[i] = widenBfloat16(bits);
-    finite &= std::isfinite(w[i]);
-  }
-  if (!finite) throw GgufError("non-finite weight in a BF16 projection");
-  float minimum = w[0], maximum = w[0];
-  for (float value : w) {
-    minimum = std::min(minimum, value);
-    maximum = std::max(maximum, value);
-  }
-  maximum = std::max(0.0F, maximum);
-  const bool minimumEdge = std::fabs(minimum) > std::fabs(maximum);
-  float step = std::max((maximum - minimum) / 15.0F, 1e-7F);
-  if (!minimumEdge) step = -step;
-  const float edge = minimumEdge ? minimum : maximum;
-  const float q0 = std::round(edge / step);
-  float offset = 0.0F;
-  if (q0 != 0.0F) {
-    step = edge / q0;
-    offset = edge;
-  }
-  std::array<uint8_t, 64> code;
-  for (size_t i = 0; i < w.size(); ++i)
-    code[i] = static_cast<uint8_t>(std::clamp(std::round((w[i] - offset) / step), 0.0F, 15.0F));
-  const uint16_t scale = nearestBfloat16(step), bias = nearestBfloat16(offset);
-  std::memcpy(block, &scale, 2);
-  std::memcpy(block + 2, &bias, 2);
-  for (size_t i = 0; i < w.size(); i += 2) block[4 + i / 2] = static_cast<uint8_t>(code[i] | code[i + 1] << 4);
-}
-
-// Native af4g64 bytes [column, column + span) of `count` rows of a BF16
+// Native affine bytes [column, column + span) of `count` rows of a BF16
 // weight from source row `start` on, back to back, each group quantized as
-// MLX's affine quantization rounds it. One read per run of rows when they are
+// the selected affine recipe rounds it. One read per run of rows when they are
 // read whole, else per row.
 void quantizeRows(const gguf::TensorRows &rows, uint64_t start, uint64_t count, uint64_t column, uint64_t span,
                   uint8_t *to) {
-  const QuantFormat &format = kQuantFormats[GGUF_FMT_AF4G64];
-  if (gguf_format_of(rows.type) != GGUF_FMT_AF4G64 || column % format.block_bytes || span % format.block_bytes)
-    throw GgufError("a BF16 weight is quantized into whole af4g64 groups: " + rows.name);
+  const uint32_t id = gguf_format_of(rows.type);
+  if (id != GGUF_FMT_AF4G64 && id != GGUF_FMT_AF8G64)
+    throw GgufError("a BF16 weight is quantized into af4g64 or af8g64: " + rows.name);
+  const QuantFormat &format = kQuantFormats[id];
+  if (rows.rowBytes % format.block_bytes || column % format.block_bytes || span % format.block_bytes)
+    throw GgufError("a BF16 weight is quantized into whole affine groups of 64: " + rows.name);
   const uint64_t groupBytes = format.block_elements * 2, groups = rows.rowBytes / format.block_bytes;
   const uint64_t perRead = span == rows.rowBytes ? count : 1, spanGroups = span / format.block_bytes;
   std::vector<uint8_t> weights(perRead * spanGroups * groupBytes);
   for (uint64_t row = 0; row < count; row += perRead) {
     rows.safetensors.bfloat16->read(((start + row) * groups + column / format.block_bytes) * groupBytes, weights);
-    for (uint64_t group = 0; group < perRead * spanGroups; ++group)
-      quantizeGroup(weights.data() + group * groupBytes, to + row * span + group * format.block_bytes);
+    quantizeAffineBfloat16(weights, id, {to + row * span, perRead * span});
   }
 }
 
@@ -326,6 +279,7 @@ void readRows(const gguf::TensorRows &rows, uint64_t first, uint64_t count, uint
     case RowReader::QuantizedBfloat16: quantizeRows(rows, start, run, column, span, out); break;
     case RowReader::QuantizedGgufFloat: quantizeQ8_0Rows(rows, start, run, column, span, out); break;
     }
+    if (rows.validateBfloat16) validateFiniteBfloat16({out, run * span});
     row += run;
   }
 }
@@ -592,7 +546,7 @@ std::optional<StoredRows> storedRepackRows(const gguf::Repack &repack, uint64_t 
       const uint64_t row = first - start;
       // A permutation (RowOrder) leaves single rows where they are.
       if (count > tensor.rows - row || rowReader(tensor) != RowReader::Stored || tensor.rowBytes != rowBytes ||
-          !tensor.file || (count > 1 && tensor.order.from < row + count))
+          !tensor.file || tensor.validateBfloat16 || (count > 1 && tensor.order.from < row + count))
         return std::nullopt;
       return StoredRows{tensor.file, tensor.file->dataOffset() + tensor.offset + sourceRow(tensor, row) * rowBytes};
     }

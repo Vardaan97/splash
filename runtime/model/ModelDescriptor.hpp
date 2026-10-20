@@ -1,6 +1,7 @@
 #pragma once
 
 #include "DFlashDraft.hpp"
+#include "DraftCheckpoint.hpp"
 #include "Model.hpp"
 #include "Qwen3_6Moe.hpp"
 #include "Qwen3_8.hpp"
@@ -33,6 +34,7 @@ struct ModelDescriptor final {
   std::string name;
   TargetLayout target;
   DFlashDraftLayout draft;
+  DraftProjectionFormat draftProjectionFormat = DraftProjectionFormat::Af4g64;
   ops::VisionLayout vision;
   ModelCapabilities capabilities;
   kv::Layout targetKvLayout;

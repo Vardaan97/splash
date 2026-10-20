@@ -243,6 +243,7 @@ ENGINE_INSTRUMENTED_ANE_OBJECT := $(ENGINE_BUILD)/ane/ProgramInstrumented.o
 # the same way.
 ENGINE_INSTRUMENTED_RUNTIME_OBJECT := $(ENGINE_BUILD)/model/RuntimeInstrumented.o
 ENGINE_CPP_SOURCES := \
+	runtime/model/AffineBfloat16.cpp \
 	runtime/ops/AneFfn.cpp \
 	runtime/ops/AneFfnCalibration.cpp \
 	runtime/ops/AneFfnMeasurement.cpp \

@@ -79,7 +79,8 @@ LoadedModel loadModel(metal::MetalBackend &backend,
   // Every source's metadata is checked before the first image is written:
   // the vision tower's and the draft's here, the target's by its loader.
   const auto vision = planVisionLoader(root, result.descriptor);
-  DraftCheckpointLoader draft(backend, images, root / "draft", result.descriptor.draft);
+  DraftCheckpointLoader draft(backend, images, root / "draft", result.descriptor.draft,
+                              result.descriptor.draftProjectionFormat);
   // The weights that stream from their files read on the engine's readers.
   const ExpertStoreOptions experts{.memoryBytes = options.expertMemoryBytes, .readers = options.readers};
   result.target = std::visit(

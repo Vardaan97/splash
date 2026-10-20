@@ -44,8 +44,7 @@ struct RowOrder {
 // codes (GGUF_FMT_MXFP4); per 256 elements an nvfp4 tensor's E4M3 scales, its
 // row's tensor scale (TensorScale) and codes, or an fp8 tensor's row's tensor
 // scale and E4M3 values. Or a BF16 weight, which the writer quantizes into
-// native af4g64 rows as MLX's affine quantization rounds it (a DFlash2
-// draft's projections).
+// native af4g64 or af8g64 rows (a draft's affine projection recipes).
 struct SafetensorsSource {
   const SourceTensor *codes = nullptr, *scales = nullptr, *biases = nullptr;
   const SourceTensor *bfloat16 = nullptr;
@@ -92,6 +91,9 @@ struct TensorRows {
   uint32_t ggufFloatType = 0;
   uint64_t ggufFloatRowBytes = 0;
   uint64_t first = 0; // the source row of image row 0
+  // Stored BF16 projection rows keep their bits, but still reject infinities
+  // and NaNs before repacking. This is not a quantization source marker.
+  bool validateBfloat16 = false;
 };
 
 // Header and descriptor bytes.

@@ -41,6 +41,9 @@ struct ImagePlan final {
   uint64_t bytes = 0;
   ImageWriter write;
   uint64_t declaredBytes = 0;
+  // Empty uses the owner's source identity. Derived recipes override only
+  // their own images, leaving the target's manifest unchanged.
+  std::string contentIdentity{};
 };
 
 // A model's weights in memory: each image in a buffer of its own, written

@@ -84,7 +84,7 @@ StreamableWeights streamableWeights(const std::filesystem::path &root, const Mod
             streams);
       },
       descriptor.target);
-  result.loadedBytes += draftImageBytes(root / "draft", descriptor.draft);
+  result.loadedBytes += draftImageBytes(root / "draft", descriptor.draft, descriptor.draftProjectionFormat);
   if (descriptor.hasVision()) result.loadedBytes += visionImageBytes(descriptor.vision);
   return result;
 }

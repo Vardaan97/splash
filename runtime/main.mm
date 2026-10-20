@@ -196,6 +196,11 @@ bootstrapConfig(const engine::NativeArguments &arguments) {
       executablePath().parent_path() / "splash.metallib";
   config.resources.modelRoot = arguments.modelRoot;
   config.resources.model = arguments.model;
+  const char *projectionFormat = std::getenv("SPLASH_DFLASH_PROJECTION_FORMAT");
+  config.resources.model.draftProjectionFormat = engine::parseDraftProjectionFormat(
+      projectionFormat ? std::optional<std::string_view>(projectionFormat) : std::nullopt);
+  model::requireDraftProjectionGeometry(config.resources.model.draft, config.resources.model.draftProjectionFormat);
+  logLine("Draft projection format: ", model::draftProjectionFormatName(config.resources.model.draftProjectionFormat));
   config.resources.buildId = SPLASH_BUILD_ID;
   config.resources.maximumMemoryBytes = arguments.maxMemoryBytes;
   config.resources.cacheDisk = arguments.maxCacheDisk;

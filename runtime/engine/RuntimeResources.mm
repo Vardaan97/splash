@@ -914,7 +914,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     };
     ModelMemoryProfile modelProfile{
         loaded.name(), loaded.maximumContextTokens(), loaded.targetKvLayout(config.kvFormat), footprint,
-        config.stateFormat, streamed.plan ? streamed.plan->spill : KvSpillPlan{}};
+        config.stateFormat, streamed.plan ? streamed.plan->spill : KvSpillPlan{},
+        loaded.descriptor.draftProjectionFormat};
     EngineMemoryPlanResult result = evaluateEngineMemoryPlan(device, modelProfile, config.maximumMemoryBytes);
     if (streamed.plan || !result.plan)
       return result;

@@ -82,6 +82,10 @@ struct NativeArguments final {
 [[nodiscard]] NativeArguments parseNativeArguments(int argc,
                                                    const char *const *argv);
 
+// SPLASH_DFLASH_PROJECTION_FORMAT, resolved once before resource planning.
+// nullopt is unset; a set empty value is refused.
+[[nodiscard]] model::DraftProjectionFormat parseDraftProjectionFormat(std::optional<std::string_view> value);
+
 // SPLASH_GDN_CHECKPOINT_TOKENS, read once at native startup: zero, or a
 // multiple of the prefill chunk of at least two chunks.
 [[nodiscard]] uint32_t parseRetainedCheckpointTokens(std::string_view value);

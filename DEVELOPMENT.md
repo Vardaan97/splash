@@ -1900,6 +1900,49 @@ the parameters, `GgufFile` and the planner check the rest).
 
 ### Drafts
 
+`SPLASH_DFLASH_PROJECTION_FORMAT=af4g64|af8g64|bf16` selects the draft's
+projection preparation recipe at native startup. Unset and explicit `af4g64`
+retain the original four-bit image bytes and identity. Empty or unknown
+values fail before resource planning. The copied model descriptor carries
+this choice through sizing, loading and idle restoration; image writers do
+not read the environment. `/status` reports it at
+`memory_plan.model.draft_projection_format`.
+
+All draft projections follow the selection: context `fc`, both dynamic
+convolution projections, fused QKV, attention output, MLP gate/up/down and
+selector-hidden. Norms, base convolution kernels, selector codebooks and the
+target vocabulary head retain their existing preparation. Affine groups
+hold 64 weights with BF16 scale and bias: af4g64 uses 36 native bytes and
+packed nibbles; af8g64 uses 68 bytes, 255 intervals and unsigned byte codes.
+Tiled BF16 reads the released 16-bit values at their stored tensor offsets,
+validates finiteness and repacks them without quantization. All projections
+require output rows divisible by 64; affine inputs by 64, BF16 inputs by 256.
+
+For the released five-layer, hidden-2560, intermediate-7680 draft, the six
+16-KiB-aligned images occupy 523,436,032 / 761,331,712 / 1,214,840,832 bytes
+for af4g64 / af8g64 / tiled BF16. Plans count the actual descriptors, planes
+and unchanged copied tensors. Scratch bounds remain shape-based: the decode
+plans cover lanes 1–4, including storage padding and gate/up, and context
+prefill reserves split scratch for `fc` and the K/V view. Weight-byte growth
+does not imply scratch growth.
+
+Nondefault draft images derive content identities from the source identity,
+canonical format, preparation version, tiled layout and automatic linear
+execution recipe. The target-only manifest stays unchanged. Composite
+manifests already include declared image sizes; the explicit recipe key
+also isolates same-size numerical revisions. Persistent composite cache
+namespaces and file tags therefore differ across recipes. Idle restoration
+replays the captured writers; no persistent prepared-weight cache is added.
+
+Tiled BF16 preserves released weight bits in storage. Staged projection
+kernels convert operands to half, while register kernels read BF16 directly;
+this is not an exact-operand reference for all BF16 values. Strict row-major
+BF16 execution, including contiguous context K/V views and separate gate/up
+activation rounding, remains a follow-up with a distinct recipe identity.
+The draft's cached context remains Q4 and the selector shortlist remains
+unchanged. Higher projection precision does not by itself imply an
+acceptance or throughput improvement.
+
 Every model decodes with a DFlash2 draft. Each family names the repository
 of the DFlash2 checkpoint trained for it (`families.FAMILIES`), which holds
 it as the release publishes it: `config.json` and BF16 `model.safetensors`

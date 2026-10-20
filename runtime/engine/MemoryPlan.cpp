@@ -327,6 +327,8 @@ std::string modelStatusJson(const ModelMemoryProfile &model) {
       << model.targetKvLayout.elementsPerScale() << ','
       << "\"kv_page_bytes\":" << model.targetKvLayout.bytesPerModelPage() << ','
       << "\"state_format\":" << json::quote(ops::formatName(model.stateFormat)) << ','
+      << "\"draft_projection_format\":"
+      << json::quote(model::draftProjectionFormatName(model.draftProjectionFormat)) << ','
       << "\"memory\":{" << "\"target_weights_bytes\":"
       << model.footprint.targetWeightsBytes << ','
       << "\"draft_weights_bytes\":" << model.footprint.draftWeightsBytes << ','

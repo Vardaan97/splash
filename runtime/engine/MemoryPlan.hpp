@@ -1,6 +1,7 @@
 #pragma once
 
 #include "metal/DeviceCapabilities.hpp"
+#include "model/DraftCheckpoint.hpp"
 #include "model/Model.hpp"
 #include "ops/GDN.hpp"
 #include "ops/PagedKv.hpp"
@@ -127,6 +128,7 @@ struct ModelMemoryProfile final {
   ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
   // A spill-capable target's (planStreamedMemory); disabled for others.
   KvSpillPlan spill{};
+  model::DraftProjectionFormat draftProjectionFormat = model::DraftProjectionFormat::Af4g64;
 
   [[nodiscard]] std::optional<std::string> validationError() const;
   [[nodiscard]] uint64_t fixedRuntimeBytes() const;

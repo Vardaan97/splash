@@ -1,10 +1,12 @@
 # DFlash2 projection and PLE experiments
 
-These are design notes against e92c00c8 plus the opt-in serving controls.
-Neither experiment below is implemented or enabled by an environment
-variable. The released default still prepares af4g64 draft projections.
+These began as design notes against e92c00c8 plus the opt-in serving controls.
+This branch implements `SPLASH_DFLASH_PROJECTION_FORMAT=af4g64|af8g64|bf16`;
+see `DEVELOPMENT.md` under Drafts for the current recipe, memory accounting,
+identity and tiled-BF16 execution qualification. The default remains af4g64.
+The speculative PLE prefetch section below remains design only.
 
-## af8g64 draft projections
+## Original af8g64 design rationale
 
 Changing only the projection format in `DraftCheckpoint.cpp` is insufficient:
 `GgufPreparation.cpp::quantizeRows` accepts only af4g64, and its group writer

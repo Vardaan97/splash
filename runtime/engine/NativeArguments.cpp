@@ -105,6 +105,14 @@ std::filesystem::path requireModelRoot(std::string_view argument) {
 
 } // namespace
 
+model::DraftProjectionFormat parseDraftProjectionFormat(std::optional<std::string_view> value) {
+  using Format = model::DraftProjectionFormat;
+  if (!value || *value == "af4g64") return Format::Af4g64;
+  if (*value == "af8g64") return Format::Af8g64;
+  if (*value == "bf16") return Format::Bfloat16;
+  throw UsageError("SPLASH_DFLASH_PROJECTION_FORMAT requires af4g64, af8g64 or bf16");
+}
+
 uint32_t parseRetainedCheckpointTokens(std::string_view value) {
   if (value == "0") return 0;
   uint32_t result = 0;
