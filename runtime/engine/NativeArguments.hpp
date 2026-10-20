@@ -82,4 +82,8 @@ struct NativeArguments final {
 [[nodiscard]] NativeArguments parseNativeArguments(int argc,
                                                    const char *const *argv);
 
+// SPLASH_GDN_CHECKPOINT_TOKENS, read once at native startup: zero, or a
+// multiple of the prefill chunk of at least two chunks.
+[[nodiscard]] uint32_t parseRetainedCheckpointTokens(std::string_view value);
+
 } // namespace splash::engine

@@ -530,6 +530,26 @@ Restarts recompute everything unless `--persistent-cache` is on (see
 pages and states for the session only, in temporary files whose space returns
 when the engine exits.
 
+### Retained checkpoint grid
+
+`SPLASH_GDN_CHECKPOINT_TOKENS=16384` in the server's environment keeps a
+complete target and DFlash2 state every 16384 prompt tokens. Unset or `0`
+disables the grid; a set interval must be a multiple of 2048 of at least
+4096. Restart to change it. The native engine logs the enabled interval.
+Each crossed point is captured, including one crossed by a short append.
+A point shared with a rolling checkpoint becomes an ordinary cached state,
+which later rolling checkpoints never retire. An edit deep in an older turn
+can resume from the deepest surviving point below the edit.
+
+The grid uses the existing capture, replay, cache and write-behind paths for
+every target family. Its points count as ordinary junction publications;
+they consume state and draft-window memory, remain evictable, and a refused
+capture leaves the request running. A missing point falls back to an earlier
+one. Persistent storage follows the existing cache policy. No extra memory
+is reserved up front. fp32 GDN state survives a scan split bit for bit;
+bf16 state rounds at every split, so enabling the grid can change its
+numerics. The disabled path plans no additional boundaries.
+
 ### Persistent cache
 
 `--persistent-cache` keeps the SSD cache across restarts of the same model, so a

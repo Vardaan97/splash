@@ -64,6 +64,10 @@ struct EngineConfig final {
   uint64_t maximumPrefillAttentionPairs = std::numeric_limits<uint64_t>::max();
   // The prefill checkpoint interval and the resource wait limit.
   uint32_t prefillCheckpointTokens = kPrefillCheckpointTokens;
+  // Ordinary cached states along the prompt, never retired by the rolling
+  // checkpoints; cache eviction and the governor may still reclaim them.
+  // Zero disables the grid (SPLASH_GDN_CHECKPOINT_TOKENS).
+  uint32_t retainedCheckpointTokens = 0;
   double resourceWaitTimeoutMilliseconds = kResourceWaitTimeoutMilliseconds;
   // Host growth admission, supplied by the runtime governor. Queried while
   // resident lanes drain after a suspension, and when a boundary's state
@@ -120,6 +124,18 @@ plannedCheckpoints(uint32_t resumeBoundary, uint32_t replayBoundary, uint32_t in
            (uint64_t{resumeBoundary} + chunk + interval - 1) / interval * interval;
        boundary + chunk <= replayBoundary; boundary += interval)
     checkpoints.push_back(static_cast<uint32_t>(boundary));
+  return checkpoints;
+}
+
+// Every grid point crossed, including a short append across a point. Unlike
+// rolling checkpoints, retained states have no near-end exclusion.
+[[nodiscard]] inline std::vector<uint32_t>
+retainedCheckpoints(uint32_t resumeBoundary, uint32_t replayBoundary, uint32_t interval) {
+  std::vector<uint32_t> checkpoints;
+  if (interval)
+    for (uint64_t boundary = (uint64_t{resumeBoundary} / interval + 1) * interval; boundary <= replayBoundary;
+         boundary += interval)
+      checkpoints.push_back(static_cast<uint32_t>(boundary));
   return checkpoints;
 }
 

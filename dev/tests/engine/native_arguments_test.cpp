@@ -251,6 +251,14 @@ void testStreamedMemoryAndSpill() {
 
 // A command line the server never writes is refused with what is wrong.
 void testRefusals() {
+  require(engine::parseRetainedCheckpointTokens("0") == 0 &&
+              engine::parseRetainedCheckpointTokens("4096") == 4096 &&
+              engine::parseRetainedCheckpointTokens("8192") == 8192 &&
+              engine::parseRetainedCheckpointTokens("16384") == 16384,
+          "the retained checkpoint grid was not parsed");
+  for (const char *grid : {"", "-1", "2048", "8193", "4294967296", "8K", "8192x", " 8192"})
+    rejects([&] { static_cast<void>(engine::parseRetainedCheckpointTokens(grid)); },
+            "SPLASH_GDN_CHECKPOINT_TOKENS requires", "an invalid retained checkpoint grid was accepted");
   const ModelDirectory model;
   const auto refuses = [&](const std::vector<std::string> &arguments,
                            std::string_view expected) {

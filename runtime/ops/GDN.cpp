@@ -151,6 +151,9 @@ void GDN::addPrefill(metal::CommandGraph &graph, const metal::MetalBackend &back
       stateKernel(kernelName(kernel, "prefill_gdn_scan", "prefill_gdn_scan_vh32", false), state);
   metal::MetalBuffer convolution = buffers.convolutionIn;
   metal::MetalBuffer recurrent = buffers.recurrentIn;
+  // A capture splits the scan: fp32 stores and reloads the same state bits;
+  // bf16 rounds at every split, so an enabled retained grid can change its
+  // state numerics at those additional capture boundaries.
   uint32_t begin = 0;
   for (size_t index = 0; index <= captures.size(); ++index) {
     const bool last = index == captures.size();

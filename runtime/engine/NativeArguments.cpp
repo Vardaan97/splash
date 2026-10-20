@@ -105,6 +105,15 @@ std::filesystem::path requireModelRoot(std::string_view argument) {
 
 } // namespace
 
+uint32_t parseRetainedCheckpointTokens(std::string_view value) {
+  if (value == "0") return 0;
+  uint32_t result = 0;
+  constexpr uint32_t chunk = model::ExecutionLimits::prefillTokenBudget;
+  if (!parsePositive(value, result) || result < 2 * chunk || result % chunk)
+    throw UsageError("SPLASH_GDN_CHECKPOINT_TOKENS requires 0 or a multiple of 2048 at least 4096");
+  return result;
+}
+
 NativeArguments parseNativeArguments(int argc, const char *const *argv) {
   if (argc < 5 || std::string_view(argv[1]) != "serve-native") {
     throw UsageError("expected the serve-native command");
