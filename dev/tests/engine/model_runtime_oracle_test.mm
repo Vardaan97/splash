@@ -3680,6 +3680,10 @@ int main(int argc, char **argv) {
       return 0;
     }
     model::Runtime &executor = *runtime;
+    // These checks compare repeated runs and reordered lanes, and count
+    // verified proposals. Verify every row up to each lane's retention limit
+    // so a MoE target's verify budget does not change their rows between runs.
+    executor.verifyEveryRow(true);
     // Warmup runs on the KV runway and never allocates: without it, after
     // actual state activation, warmupPrefill fails and cleans up.
     pages.releaseExtent(0);
@@ -4044,12 +4048,12 @@ int main(int argc, char **argv) {
 
     // Every decode executes an anchor plus seven proposal rows. Compare each
     // budgeted commit with a constrained cycle that retains the same prefix,
-    // rejecting the next proposal unless all eight rows are retained. The
-    // constrained request has a larger budget, so both acceptance paths agree on
-    // the GDN cell, the retained rows and the exact draft ring. Kernel tests
-    // cover the recurrence's FP64 accuracy; this check does not mix prefill and
-    // decode summation orders, whose tiny differences can amplify through the
-    // full model.
+    // rejecting the next proposal unless all budgeted rows are retained. Both
+    // requests have the same verify cap, so their MoE rows take the same tiles
+    // and both acceptance paths agree on the GDN cell, the retained rows and
+    // the exact draft ring. Kernel tests cover the recurrence's FP64 accuracy;
+    // this check does not mix prefill and decode summation orders, whose tiny
+    // differences can amplify through the full model.
     std::string comparedCounts;
     for (uint32_t outputLimit = 2; outputLimit <= 8; ++outputLimit) {
       uint64_t id = 10 + outputLimit;
@@ -4062,12 +4066,12 @@ int main(int argc, char **argv) {
                        std::span<const uint32_t>(prompt129).subspan(128, 1),
                        pageTable),
           id, 129, pageTable);
-      require(result.draftedTokens == 7,
-              "oracle prompt ended right after prefill; no cycle to test");
+      require(result.draftedTokens == outputLimit - 1,
+              "budgeted decode did not verify every proposal within its output limit");
       require(!result.outputTokens.empty() &&
                   result.outputTokens.size() <= outputLimit,
               "fixed DFlash-8 decode exceeded its output limit");
-      require(result.acceptedDraftTokens <= 7,
+      require(result.acceptedDraftTokens <= result.draftedTokens,
               "fixed DFlash-8 acceptance accounting mismatch");
       const size_t stored =
           result.outputTokens.size() - result.outputTokensWithoutKv;
@@ -4080,8 +4084,7 @@ int main(int argc, char **argv) {
       // Composite snapshots exclude KV: share sealed history and give the
       // comparison its own writable page for the speculative suffix.
       replayPages[4] = 80;
-      EngineRequest replayRequest =
-          makeRequest(replayId, prompt129, static_cast<uint32_t>(stored + 2));
+      EngineRequest replayRequest = makeRequest(replayId, prompt129, outputLimit);
       replayRequest.constraint = ConstraintMode::TokenMask;
       beginCold(executor, replayRequest, 1);
       restoreActivePrefix(executor, replayId, prompt129.size(), 128,
@@ -4113,6 +4116,7 @@ int main(int argc, char **argv) {
       provideMask(executor, replayId, singletonMasks(maskTokens));
       const auto replayed = finishMaskedDecode(std::move(pending));
       require(replayed.size() == 1 &&
+                  replayed[0].draftedTokens == outputLimit - 1 &&
                   replayed[0].acceptedDraftTokens == stored - 1 &&
                   replayed[0].outputTokens.size() -
                           replayed[0].outputTokensWithoutKv == stored &&
@@ -4397,21 +4401,22 @@ int main(int argc, char **argv) {
     auto constrainedResults = finishMaskedDecode(std::move(verify));
     require(constrainedResults.size() == 1,
             "constrained overlap returned the wrong batch width");
-    // The rejected proposal makes the masked successor the next anchor; as
-    // the last budgeted token it is emitted at once, without a KV row.
+    // The two-token budget verifies one proposal. Its rejection makes the
+    // masked successor the next anchor; as the last budgeted token it is
+    // emitted at once, without a KV row.
     ModelStepResult constrainedFirst = std::move(constrainedResults[0]);
     require(constrainedFirst.nextDecodeStage == DecodeStage::Regular &&
                 constrainedFirst.outputTokens ==
                     std::vector<uint32_t>{anchorA, nextB} &&
                 constrainedFirst.outputTokensWithoutKv == 1 &&
                 !constrainedFirst.finished &&
-                constrainedFirst.draftedTokens == 7 &&
+                constrainedFirst.draftedTokens == 1 &&
                 constrainedFirst.acceptedDraftTokens == 0,
             "constrained verify mask offset is incorrect");
     executor.end(40);
 
-    // Accept two of seven proposals and reject the third. The draft work is
-    // always seven rows and is counted only after target verification.
+    // A four-token budget verifies three proposals. Accept two and reject
+    // the third; only verified proposals count as drafted.
     EngineRequest perfectConstraint = makeRequest(44, prompt129, 4);
     perfectConstraint.constraint = ConstraintMode::TokenMask;
     beginCold(executor, perfectConstraint, 0);
@@ -4452,9 +4457,9 @@ int main(int argc, char **argv) {
     require(perfectResult.nextDecodeStage == DecodeStage::Regular &&
                 perfectResult.outputTokens.size() == 4 &&
                 perfectResult.outputTokensWithoutKv == 1 &&
-                perfectResult.draftedTokens == 7 &&
+                perfectResult.draftedTokens == 3 &&
                 perfectResult.acceptedDraftTokens == 2,
-            "constrained acceptance did not report two of seven");
+            "constrained acceptance did not report two of three");
     executor.end(44);
 
     EngineRequest alternateConstraint = makeRequest(41, prompt129, 1);
@@ -4536,7 +4541,7 @@ int main(int argc, char **argv) {
                 crossInitial[1].nextDecodeStage == DecodeStage::Regular,
             "a B2 plan did not select both lanes' first tokens");
     // Each lane's first cycle keeps its anchor; the masked successor that
-    // rejects the second proposal becomes its next anchor.
+    // rejects the first proposal becomes its next anchor.
     std::array<uint32_t, 2> crossNext{};
     for (uint32_t lane = 0; lane < 2; ++lane) {
       const uint64_t id = 42 + lane;
@@ -4582,6 +4587,7 @@ int main(int argc, char **argv) {
                   singletonMasks(crossVerify[lane]));
     }
     auto crossResults = finishMaskedDecode(std::move(crossPending));
+    // Each lane has two tokens left, so it verifies one proposal.
     require(crossResults.size() == 2 &&
                 crossResults[0].outputTokens ==
                     std::vector<uint32_t>{crossNext[0], crossVerify[0][1]} &&
@@ -4589,8 +4595,8 @@ int main(int argc, char **argv) {
                     std::vector<uint32_t>{crossNext[1], crossVerify[1][1]} &&
                 crossResults[0].outputTokensWithoutKv == 1 &&
                 crossResults[1].outputTokensWithoutKv == 1 &&
-                crossResults[0].draftedTokens == 7 &&
-                crossResults[1].draftedTokens == 7 &&
+                crossResults[0].draftedTokens == 1 &&
+                crossResults[1].draftedTokens == 1 &&
                 crossResults[0].acceptedDraftTokens == 0 &&
                 crossResults[1].acceptedDraftTokens == 0,
             "B2 constrained overlap corrupted a lane");
