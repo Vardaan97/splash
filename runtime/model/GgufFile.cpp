@@ -280,8 +280,12 @@ void GgufFile::parse(WeightSource &source, uint32_t file) {
   }
   const uint64_t headerEnd = reader.position();
   const uint64_t padding = (alignment - headerEnd % alignment) % alignment;
-  if (padding > source.bytes() - headerEnd) throw GgufError("GGUF data section is truncated");
-  source.setDataOffset(headerEnd + padding);
+  if (padding > source.bytes() - headerEnd) {
+    if (tensorCount) throw GgufError("GGUF data section is truncated");
+    source.setDataOffset(source.bytes());
+  } else {
+    source.setDataOffset(headerEnd + padding);
+  }
   const uint64_t dataBytes = source.bytes() - source.dataOffset();
   for (size_t i = firstTensor; i < tensors_.size(); ++i) {
     const GgufTensor &tensor = tensors_[i];

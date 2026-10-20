@@ -125,6 +125,23 @@ int main() {
     require(source.dataOffset() + weight.offset + weight.bytes == source.bytes(),
             "valid data must end exactly at EOF");
 
+    auto metadataOnly = gguf::file({gguf::stringKey("general.architecture", "fixture")}, {});
+    const uint64_t padding = (gguf::kAlignment - metadataOnly.size() % gguf::kAlignment) % gguf::kAlignment;
+    require(padding != 0, "metadata-only fixture must need padding");
+    for (uint64_t i = 0; i <= padding; ++i) {
+      splash::test::writeFile(path, metadataOnly);
+      splash::model::WeightSource emptySource(path);
+      splash::model::GgufFile empty(emptySource);
+      require(empty.tensors().empty() && empty.metadata().architecture() == "fixture",
+              "metadata-only file changed");
+      require(emptySource.bytes() - emptySource.dataOffset() == 0,
+              "metadata-only file must have no tensor data");
+      metadataOnly.push_back(0);
+    }
+    auto tensorHeader = model({256, 1});
+    tensorHeader.resize(24 + 8 + std::string_view("weight").size() + 4 + 2 * 8 + 4 + 8);
+    rejects("tensor header without padding", tensorHeader, "GGUF data section is truncated");
+
     constexpr std::string_view overflow = "GGUF size overflows", pastEnd = "runs past the end of the file";
     rejects("shape overflow", model({256, uint64_t{1} << 60}), overflow);
     rejects("row product overflow", model({256, uint64_t{1} << 63, 2}), overflow);

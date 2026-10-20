@@ -50,6 +50,17 @@ class GgufMetadataTests(unittest.TestCase):
     def metadata(self, values):
         return gguf.Metadata(write_gguf(self.root / "model.gguf", values))
 
+    def test_reader_accepts_metadata_only_part_without_padding(self):
+        values = {"general.architecture": "fixture", "split.no": 0, "split.count": 2}
+        path = write_gguf(self.root / "model-00001-of-00002.gguf", values)
+        self.assertNotEqual(path.stat().st_size % fixture_files.GGUF_ALIGNMENT, 0)
+        for tensors in (False, True):
+            with self.subTest(tensors=tensors), path.open("rb") as stream:
+                metadata = gguf.Metadata(stream, tensors=tensors)
+                self.assertEqual(metadata.values, values)
+                self.assertEqual(metadata.tensors, {})
+                self.assertEqual(stream.tell(), path.stat().st_size)
+
     def test_reader_stops_before_weights_and_checks_bounds(self):
         path = write_gguf(self.root / "small.gguf", {"key": "value"})
         expected = path.stat().st_size
