@@ -482,8 +482,8 @@ struct Runtime::Impl {
                        geometry.target.stopTokens[0],
                        geometry.target.stopTokens[1], penalties);
     if (contextLookupConfig.enabled)
-      graph.add("draft_context_lookup", {decodeArena->batchSlice(DecodeTensor::ProposedTokens, 2)},
-                DraftContextLookupParams{}, {2, 1, 1}, {kDraftProposalTokens, 1, 1});
+      ops::DraftSelector::addContextLookup(graph, decodeArena->batchSlice(DecodeTensor::ProposedTokens, 2),
+                                           DraftContextLookupParams{}, 2);
     backend.preparePipelines(graph.dispatches());
   }
 
@@ -1960,8 +1960,7 @@ struct Runtime::Impl {
         any |= entry.lookupProposals != 0;
       }
       if (any)
-        graph.add("draft_context_lookup", {d(DecodeTensor::ProposedTokens)},
-                  lookup, {lanes, 1, 1}, {kDraftProposalTokens, 1, 1});
+        ops::DraftSelector::addContextLookup(graph, d(DecodeTensor::ProposedTokens), lookup, lanes);
     }
     sampling.addThinkingDrafts(graph, std::span(policies).first(lanes),
                                d(DecodeTensor::ProposedTokens));

@@ -3,6 +3,7 @@
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/Sampling.h"
+#include "metal/abi/DraftContextLookup.h"
 #include "ops/Sampling.hpp"
 
 #include <array>
@@ -73,6 +74,10 @@ public:
   void add(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers,
            const DraftCodebooks &codebooks, std::span<const uint32_t> anchors,
            std::span<const SamplingPolicy> policies) const;
+  // After selection and row budgeting: replace a greedy lane's planned
+  // prefix without changing the row allowance or sampled probability tables.
+  static void addContextLookup(metal::CommandGraph &graph, const metal::MetalBuffer &proposals,
+                               const DraftContextLookupParams &params, uint32_t lanes);
   // After add: each lane's verify rows (a uint32 per lane in `verifyRows`) by
   // `model` from its confidences, at most maximumRows[lane] of them.
   static void addVerifyRows(metal::CommandGraph &graph, const metal::MetalBuffer &confidence,

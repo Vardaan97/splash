@@ -92,6 +92,17 @@ void DraftSelector::add(metal::CommandGraph &graph,
             params, {lanes, 1, 1}, {1, 1, 1});
 }
 
+void DraftSelector::addContextLookup(metal::CommandGraph &graph, const metal::MetalBuffer &proposals,
+                                      const DraftContextLookupParams &params, uint32_t lanes) {
+  if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
+    throw std::invalid_argument("invalid context lookup batch");
+  for (uint32_t lane = 0; lane < lanes; ++lane)
+    if (params.lane[lane].count > kPositions)
+      throw std::invalid_argument("invalid context lookup prefix");
+  requireBytes(proposals, uint64_t{lanes} * kPositions * sizeof(uint32_t), "lookup proposals");
+  graph.add("draft_context_lookup", {proposals}, params, {lanes, 1, 1}, {kPositions, 1, 1});
+}
+
 void DraftSelector::addVerifyRows(metal::CommandGraph &graph, const metal::MetalBuffer &confidence,
                                   const metal::MetalBuffer &verifyRows, const VerifyRowsModel &model,
                                   std::span<const uint32_t> maximumRows) {
