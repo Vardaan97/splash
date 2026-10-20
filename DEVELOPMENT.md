@@ -37,6 +37,11 @@ repositories need no login; private or gated ones need `HF_TOKEN` or `hf auth lo
 stops serving, and a second Ctrl+C stops the engine at once; stop before
 upgrading.
 
+The [DFlash2 experiment notes](docs/dflash2-experiments.md) describe the
+additional preparation, identity and validation work for af8g64 draft
+projections, and a speculative PLE prefetch design. Use `--verify-rows all`
+to compare against verifying every row.
+
 ### Engine restarts and sleep
 
 An engine that fails is restarted at once. If it fails again within 60 s of
