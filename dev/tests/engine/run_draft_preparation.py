@@ -79,7 +79,9 @@ def draft_fixture(root, extremes=False):
         if extremes:
             raw = bytearray(tensors[name + ".weight"][2])
             # Stored BF16 preparation must preserve values outside F16 range.
-            struct.pack_into("<8H", raw, 0, 1, 0x8001, 0x0080, 0x7F7F, 0xFF7F, 0x8000, 0, 0x3F81)
+            struct.pack_into(
+                "<8H", raw, 0, 1, 0x8001, 0x0080, 0x7F7F, 0xFF7F, 0x8000, 0, 0x3F81
+            )
             tensors[name + ".weight"] = ([rows, columns], "BF16", bytes(raw))
         else:
             for bits, directory in ((4, "expected"), (8, "expected-af8g64")):
@@ -88,8 +90,16 @@ def draft_fixture(root, extremes=False):
                     for start in range(0, len(weights), 64)
                 )
                 block_bytes = 4 + 64 * bits // 8
-                expected[directory][name] = ([rows, columns // 64 * block_bytes], "U8", native)
-        expected["expected-bf16"][name] = ([rows, 2 * columns], "U8", tensors[name + ".weight"][2])
+                expected[directory][name] = (
+                    [rows, columns // 64 * block_bytes],
+                    "U8",
+                    native,
+                )
+        expected["expected-bf16"][name] = (
+            [rows, 2 * columns],
+            "U8",
+            tensors[name + ".weight"][2],
+        )
 
     for layer in range(2):
         p = f"layers.{layer}."
