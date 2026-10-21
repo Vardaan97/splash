@@ -63,8 +63,8 @@ commit. Lookup adds no verify rows, no second target pass and no host wait.
 The adaptive budget still chooses rows from the neural confidence and
 measured cycle costs; a lane with a replacement supplies no neural
 acceptance labels. This preserves the budget but does not calibrate it for
-lookup, so a match may receive few verify rows. `SPLASH_VERIFY_EVERY_ROW=1`
-remains available for a separate controlled arm. Sampled cycles and cycles
+lookup, so a match may receive few verify rows. `--verify-rows all` remains
+available for a separate controlled arm. Sampled cycles and cycles
 with a thinking cutoff keep their neural proposals and probabilities.
 Greedy target correction remains authoritative; this does not promise
 identical floating-point output across different speculative inputs.
